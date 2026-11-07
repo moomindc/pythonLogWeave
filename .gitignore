@@ -1,0 +1,40 @@
+# Generated test corpus — reproducible from tools/gen_corpus.py, never committed.
+tests/corpus/
+corpus/
+*.lwi
+
+# Benchmark output. The committed baseline is tools/bench_baseline.json;
+# per-run results are not committed.
+bench-results/
+bench-*.json
+!tools/bench_baseline.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+
+# Editors / OS
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# OneDrive / Dropbox sync artefacts
+*.sync-conflict-*
+~$*

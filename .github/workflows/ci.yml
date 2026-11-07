@@ -1,0 +1,97 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # The engine suite runs with numpy and pytest ONLY -- no PySide6 anywhere on
+  # the machine. That is the enforcement mechanism for SPEC 1's rule that layers
+  # 1-4 stay Qt-free, and for NFR-18's requirement that nothing blocks Linux.
+  engine:
+    name: engine / ${{ matrix.os }} / py${{ matrix.python }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+        python: ["3.12", "3.14"]
+        include:
+          - os: windows-latest
+            python: "3.13"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Install engine dependencies only
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install "numpy>=2.0" "pytest>=8.0"
+
+      - name: Assert Qt is absent
+        shell: bash
+        run: |
+          if python -c "import PySide6" 2>/dev/null; then
+            echo "PySide6 must not be installed for the engine job"; exit 1
+          fi
+          echo "ok: no Qt present"
+
+      - name: Generate corpus
+        run: python tools/gen_corpus.py --out tests/corpus
+
+      - name: Run tests
+        run: python -m pytest tests -q
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      - run: python -m pip install ruff
+      - run: ruff check .
+      - run: ruff format --check --diff .
+        continue-on-error: true
+
+  # Informational, not a gate. Shared runners vary by far more than any
+  # meaningful regression, so the real performance gate is a local
+  # `python tools/bench.py --gate`. This job exists to catch an order-of-
+  # magnitude collapse and to keep a public record of the numbers.
+  bench:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      - run: python -m pip install "numpy>=2.0"
+      - name: Benchmark
+        run: |
+          python tools/bench.py --chunk-mb 16 --reps 2 \
+            --merge-rows 500000 --json bench-results/ci.json \
+            --tolerance 0.60 | tee bench-results/ci.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bench-${{ github.sha }}
+          path: bench-results/
+
+  packaging:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      - run: python -m pip install build twine
+      - run: python -m build
+      - run: python -m twine check dist/*

@@ -1,0 +1,67 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "logweave"
+version = "0.0.1"
+description = "Merge many log files into one time-ordered, live-following, syntax-highlighted view"
+readme = "README.md"
+requires-python = ">=3.12"
+license = "MIT"
+license-files = ["LICENSE", "NOTICE"]
+authors = [{ name = "Dan" }]
+keywords = ["log", "logs", "merge", "tail", "viewer", "logmerger"]
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Environment :: X11 Applications :: Qt",
+    "Intended Audience :: Developers",
+    "Intended Audience :: System Administrators",
+    "Operating System :: Microsoft :: Windows",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: System :: Logging",
+]
+
+# SPEC 1: layers 1-4 (source, index, merge, session) must not import Qt.
+# Keeping numpy as the only hard runtime dependency of the engine is what makes
+# that rule testable -- tests/test_architecture.py enforces it, and the `core`
+# CI job installs this set alone and runs the engine suite without Qt present.
+dependencies = [
+    "numpy>=2.0",
+]
+
+[project.optional-dependencies]
+# The GUI (layer 5). Separated so the engine stays installable and testable
+# without a 150MB Qt download; see SPEC 16.
+gui = ["PySide6>=6.10.1", "tomlkit>=0.13", "watchdog>=4.0", "keyring>=25.0"]
+# Remote sources (FR-7 / D14).
+ssh = ["paramiko>=3.4"]
+dev = ["pytest>=8.0", "ruff>=0.6"]
+all = ["logweave[gui,ssh,dev]"]
+
+[project.urls]
+Homepage = "https://github.com/moomindc/pythonLogWeave"
+Issues = "https://github.com/moomindc/pythonLogWeave/issues"
+
+[project.scripts]
+logweave = "logweave.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["logweave*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q --strict-markers"
+markers = [
+    "perf: benchmark-grade tests; need a generated perf corpus (deselect with '-m \"not perf\"')",
+    "windows: Windows-only behaviour",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "C4", "NPY"]
