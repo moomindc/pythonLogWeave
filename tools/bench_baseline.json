@@ -1,5 +1,5 @@
 {
- "generated_utc": "2026-11-07T16:52:49Z",
+ "generated_utc": "2026-11-07T20:28:40Z",
  "source": "synthetic 64MB",
  "python": "3.14.5",
  "numpy": "2.5.0",
@@ -13,102 +13,112 @@
  "severity_offset": 27,
  "results": {
   "split_lines": {
-   "value": 712.9230773039368,
+   "value": 732.6665099575093,
    "unit": "MB/s",
    "higher_is_better": true
   },
   "split_lines_lone_cr": {
-   "value": 544.246185100324,
+   "value": 551.4301547636575,
    "unit": "MB/s",
    "higher_is_better": true
   },
+  "detect_format": {
+   "value": 33587.59998809546,
+   "unit": "us/call",
+   "higher_is_better": false
+  },
   "extract_vectorised": {
-   "value": 186.87166323590236,
+   "value": 163.82766636428084,
    "unit": "MB/s",
    "higher_is_better": true
   },
   "extract_vectorised_rows": {
-   "value": 2.926747264464085,
+   "value": 2.6202895703645925,
    "unit": "Mrow/s",
    "higher_is_better": true
   },
+  "extract_vectorised_m0_hardcoded": {
+   "value": 192.0143418746446,
+   "unit": "MB/s",
+   "higher_is_better": true
+  },
   "extract_scalar_regex": {
-   "value": 16.569669703697244,
+   "value": 6.822956405021839,
    "unit": "MB/s",
    "higher_is_better": true
   },
   "extract_scalar_strptime": {
-   "value": 4.665861110272309,
+   "value": 4.654520184655603,
    "unit": "MB/s",
    "higher_is_better": true
   },
   "severity_fixed_offset": {
-   "value": 336.2649569912751,
+   "value": 266.25798085250034,
    "unit": "MB/s",
    "higher_is_better": true
   },
   "severity_regex_insensitive": {
-   "value": 8.13107503394987,
-   "unit": "MB/s",
-   "higher_is_better": true
-  },
-  "severity_regex_sensitive": {
-   "value": 9.34615574715076,
-   "unit": "MB/s",
-   "higher_is_better": true
-  },
-  "severity_fold_maxat": {
-   "value": 8.16885289795418,
+   "value": 4.942451663440632,
    "unit": "MB/s",
    "higher_is_better": true
   },
   "histogram": {
-   "value": 49.88662768275076,
+   "value": 50.79529731592681,
    "unit": "Mrow/s",
    "higher_is_better": true
   },
   "build_cumulative": {
-   "value": 8375.199977308512,
+   "value": 7400.1000029966235,
    "unit": "us/call",
    "higher_is_better": false
   },
   "strip_repaint_800px": {
-   "value": 72.4999699741602,
+   "value": 73.90003884211183,
    "unit": "us/call",
    "higher_is_better": false
   },
   "INDEX_TOTAL": {
-   "value": 101.10765190347465,
+   "value": 93.80658655561582,
    "unit": "MB/s",
    "higher_is_better": true
   },
   "INDEX_TOTAL_regex_fallback": {
-   "value": 7.728886759353914,
+   "value": 4.765086025710086,
    "unit": "MB/s",
    "higher_is_better": true
   },
   "merge_build_checkpoints": {
-   "value": 8.258640809831293,
+   "value": 7.7156296678736025,
    "unit": "Mrow/s",
    "higher_is_better": true
   },
   "merge_time_to_row": {
-   "value": 25.83609998691827,
+   "value": 26.577150012599304,
    "unit": "us/call",
    "higher_is_better": false
   },
-  "merge_row_at": {
-   "value": 1215.056600049138,
+  "merge_row_at_cold": {
+   "value": 2990.567499946337,
+   "unit": "us/call",
+   "higher_is_better": false
+  },
+  "merge_row_at_warm": {
+   "value": 8.194000110961497,
    "unit": "us/call",
    "higher_is_better": false
   },
   "merge_block_4096": {
-   "value": 3916.6150000528432,
+   "value": 4809.904999856371,
    "unit": "us/call",
    "higher_is_better": false
   },
-  "merge_paint_60rows": {
-   "value": 1466.540299996268,
+  "merge_paint_60rows_scrolling": {
+   "value": 49.40214997623116,
+   "unit": "us/call",
+   "higher_is_better": false
+  },
+  "merge_paint_60rows_random": {
+   "value": 2766.9513000000734,
    "unit": "us/call",
    "higher_is_better": false
   },
@@ -116,6 +126,11 @@
    "value": 0.01956,
    "unit": "MB/1M",
    "higher_is_better": false
+  },
+  "merge_cache_hit_rate_scrolling": {
+   "value": 0.985207100591716,
+   "unit": "ratio",
+   "higher_is_better": true
   }
  }
 }

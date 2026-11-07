@@ -745,9 +745,34 @@ directly, so single-row stepping stays exact regardless of scale.
 
 A `QAbstractScrollArea` subclass with custom painting, rather than
 `QTableView`/`QTreeView`. The reasons: per-run styling inside a line (FR-30),
-multi-line entries with variable height, the source-lane gutter, row counts beyond
-what an item model handles comfortably, and full control of the frame budget
-(NFR-5).
+multi-line entries, the source-lane gutter, row counts beyond what an item model
+handles comfortably, and full control of the frame budget (NFR-5).
+
+The row-count reason is concrete rather than aesthetic: `QModelIndex.row()` is a
+C++ `int`, and NFR-15's ceiling of 2×10⁹ rows is inside int32 by about 7%. That is
+no margin for a view that also does arithmetic on row numbers.
+
+**Three decisions taken during M3, with the reasoning, because each looks like a
+shortcut and is not:**
+
+- **Rows are a uniform height.** This section originally anticipated variable
+  heights for multi-line entries. Implementing that needs a prefix sum of row
+  heights to answer "which row is at pixel *y*" — 8 bytes a row, which is
+  precisely the structure the checkpointed merge exists to avoid (§6.1: 16 GB at
+  the row ceiling). So a multi-line entry paints its first line with a marker and
+  expanding one is a per-entry affordance, never a global layout mode. Row-to-pixel
+  mapping stays O(1) at any file size.
+- **The vertical scrollbar is scaled past 10⁹ rows.** Qt scrollbars are `int`, so
+  a 1:1 row mapping would run out at the row ceiling. Below the cap one unit is
+  one row; above it the mapping is done in Python ints. A scaled bar can only put
+  the top row on a multiple of the scale, so the guarantee a seek offers is *the
+  target row is on screen*, not *the target row is at the top*. The maximum is
+  rounded **up**: flooring it leaves the last `(total − page) % scale` rows
+  unreachable, which during M3 meant you could scroll to within seven rows of the
+  end of an eight-billion-row merge and no further.
+- **The message is sliced to the visible character window before being drawn**,
+  which bounds paint cost by window width instead of line length. Only valid
+  because the font is fixed-pitch. §14.1b has the measurement that forced it.
 
 `paintEvent` paints only the visible rows — about 60 at a typical window size:
 
@@ -764,6 +789,14 @@ Per-frame work is bounded by the window size, not the data size. Decoded and sty
 rows are held in a small LRU keyed by `(source_id, entry_index)` so re-paints
 during selection and resize are free.
 
+**Scrolling does not repaint the screen.** `scrollContentsBy` blits the viewport
+and lets Qt damage only the newly exposed band, so `paintEvent` honours
+`event.rect()` and a three-row wheel step paints three rows. Measured at 0.98 ms
+against 13.6 ms for the full frame (§14.1b) — a 14× difference, and the reason
+scrolling has headroom while a seek does not. The blit is skipped when a scrollbar
+unit is not one row, or the jump is bigger than a screen, since there is then
+nothing worth preserving.
+
 ### 9.2 Source lanes (FR-28)
 
 A fixed-width gutter on the right, `k` lanes of 4–12px. A row fills its own
@@ -777,10 +810,88 @@ cue.
 
 Target < 16ms (NFR-5). Measures taken: no per-frame allocation of large objects;
 glyph widths precomputed from the monospace metrics; styled-run construction
-memoised; `QPainter` state changes batched by style. If `drawText` per run proves
-too slow at high row counts, the fallback is to cache each 4096-row block as a
-pre-rendered `QImage` strip — but this is deliberately *not* done first, since it
-complicates selection and is likely unnecessary.
+memoised; `QPainter` state changes batched by style.
+
+M3 measured this and the results are in §14.1b. Two of the measures above turned
+out to be irrelevant and one guess here was wrong, so, for the record:
+
+- **Batching `QPainter` state changes by style buys nothing.** Drawing a row in
+  one `drawText` call measured 14.94 ms against 15.03 ms for two. The cost is per
+  *glyph*, not per call, so there is no batching win.
+- The two things that did work are not in the list above: honouring
+  `event.rect()` with a viewport blit (§9.1), and slicing the message to the
+  visible character window.
+- The `QImage`-strip fallback suggested here is still the right shape of idea —
+  cache rasterised output rather than re-rasterising — but at the wrong
+  granularity. Caching 4096-row strips means re-rendering a strip whenever
+  anything in it changes, and it does complicate selection as predicted. A
+  **per-glyph atlas** gets the same saving at a granularity that nothing
+  invalidates, because the glyphs for a fixed-pitch font never change. §14.2
+  item 4.
+
+### 9.4 Opening files (FR-1, FR-19)
+
+Dropping one or more files on the window opens and merges them; so does the open
+dialog, and so do paths on the command line. All three go through one call,
+`Session.add_files`, which indexes the batch and rebuilds the merge **once** —
+dropping twelve files costs one checkpoint build, not twelve.
+
+Two behaviours that are easy to get wrong:
+
+- **A dropped directory is filtered to things that look like logs; a dropped file
+  never is.** Dragging a single file is a decision about that file, and
+  second-guessing it would make an unusual extension impossible to open. Dragging
+  a folder is a bulk action, where pulling in every `README` and `.json` beside
+  the logs is noise. Directory expansion is one level deep, because recursing a
+  log tree can mean thousands of files with no way to take it back. The suffix set
+  includes the empty suffix, since `syslog`, `messages` and `dmesg` have no
+  extension and are exactly what someone drops a `/var/log` at.
+- **Failures are reported in the status bar, never a modal dialog.** Dropping a
+  folder of fifty logs where three are locked by another process is ordinary, and
+  a modal that must be dismissed before the other forty-seven can be read is worse
+  than useless. The detail goes in a tooltip. (A modal here also deadlocked the
+  test suite, which is a fair indication of how it behaves for a user.)
+
+A file whose format is not recognised still opens, and says so. "We could not
+parse this" is information to show next to the data, not a reason to refuse the
+file.
+
+### 9.5 The timestamp column, and the duplicate it creates
+
+The view shows the parsed `wall_us` in its own column. For most of the catalogue
+the timestamp also *leads the line*, so without care the same value is printed
+twice on every row — once parsed, once as the first thing in the message. On a
+merged view of several files that is a column of noise down the middle of the
+screen.
+
+**Three rules, which together mean a row always shows its time exactly once:**
+
+1. **The column is grey**, and a greyer grey when the timestamp was inferred
+   rather than read (§4.5). It is the same value on every row, differing only in
+   its last digits, so at full contrast it competes with the text being scanned.
+   A guess and a fact should also not look identical.
+2. **A leading timestamp is trimmed from the message.** `FileIndex.message_offset`
+   records how much of the line the timestamp accounts for, computed from the
+   proven layout at index time, and `Row.msg_from` carries it to the view.
+   `Row.text` stays verbatim and the trim is applied by whoever displays it, so
+   nothing is lost. A timestamp that is *not* at the front — an access log, where
+   the leading field is the client address — is never trimmed, because the text
+   in front of it is content rather than a repetition. The threshold is four
+   characters of slack, enough for a level prefix and no more.
+3. **The column can be hidden** (`Ctrl+T`), which is worth doing when every line
+   carries a consistent timestamp of its own and the width is better spent on
+   the message.
+
+Rules 2 and 3 are interlocked: **hiding the column turns the trimming off.**
+Trimming only ever removes a *duplicate*, so it must stop the moment the column
+holding the other copy goes away. Without the interlock, hiding a redundant
+column would delete the timestamp from the row altogether — the one outcome the
+feature exists to prevent. `test_the_time_is_always_visible_one_way_or_the_other`
+states that property directly.
+
+The same reasoning applies to copy and export: the `annotated` preset prints a
+timestamp column of its own, so it trims by the same rule (§11.3). `plain` prints
+no timestamp, so it trims nothing and emits the line verbatim.
 
 ---
 
@@ -1182,8 +1293,18 @@ that the prototype skipped. Same machine, same 64MB chunk, measured in one run:
 | Line split | 963 MB/s | **962 MB/s** | unchanged; promoted verbatim |
 | Timestamp extract | 275 MB/s | **229 MB/s** | −17%, buys generality + validation |
 | Severity, fixed offset | 433 MB/s | **422 MB/s** | −3% while carrying 2.4× the words |
-| **Full index pipeline** | 98–101 MB/s | **128 MB/s one core** | |
-| **Projected aggregate** | ~820 MB/s | **~716 MB/s** | 8 cores at 70% (conservative count) |
+| **Full index pipeline** | 98–101 MB/s | **128 MB/s one core** | 76-byte lines |
+
+The stage comparisons above are within one run on identical bytes, which is the
+only way they mean anything. The **committed gate** (`tools/bench.py`, baseline
+in `tools/bench_baseline.json`) uses its own synthetic corpus at ~67 bytes/line
+and reports **90 MB/s single-core, ~758 MB/s projected aggregate**. The two
+headline figures differ because MB/s is sensitive to line length — shorter lines
+mean more lines per megabyte and so more per-line work — not because anything
+changed. Treat the gate's number as the one to compare future runs against, and
+never compare across workloads: `bench.py` enforces this with a
+`same_workload` guard that refuses a baseline recorded at a different chunk size
+or source count.
 
 The 17% given up on extraction is a deliberate trade: a generic kernel means a
 new format costs a regex and no new code, and the validation is what lets
@@ -1195,6 +1316,112 @@ severity ruleset cost 41% of that stage; §10.3's prefilter and lazy gathers
 recovered it. Without the M0 benchmark harness to localise the cost, a 41%
 regression inside a stage that is itself only a third of the pipeline would
 simply have been absorbed and never noticed.
+
+#### Merge engine result
+
+Same machine, 2M rows across 8 sources, measured against the shipped
+`MergeIndex`:
+
+| Operation | Measured | Budget | Note |
+|---|---|---|---|
+| `time_to_row` (seek by time) | **26.6 µs** | NFR-6: 50 ms | no replay at all — ~1900× margin |
+| 60 rows while scrolling | **49.4 µs** | NFR-5: 16 ms frame | the number that decides whether scrolling is smooth |
+| 60 rows after a random jump | 2.77 ms | NFR-5: 16 ms frame | honest worst case: one full block replay |
+| `row_at`, working set cached | **8.2 µs** | — | |
+| `row_at`, cache cleared | 2.99 ms | — | **365× worse than warm** |
+| Block cache hit rate, scrolling | **98.5%** | — | |
+| Checkpoint build | 7.7 M rows/s | — | serial; SPEC 6.3 parallelises it |
+| Checkpoint memory | **0.0196 MB / 1M rows** | vs 8 MB/1M materialised | **409× smaller** |
+
+Two things worth drawing out. The **365× gap between a warm and a cold
+`row_at`** is the entire justification for the block cache in SPEC 6.2 — without
+it, every paint during a scroll would pay the 3 ms replay, and 60 fps would be
+impossible. And a **cold jump costs 2.77 ms**, which fits a frame but is 56×
+a scroll step, so the view should prefetch adjacent blocks after a seek rather
+than assume a jump is as cheap as a scroll.
+
+Both numbers took a corrected benchmark to see. The first attempt rebuilt the
+whole index per probe, so "cold seek" actually measured 250 ms of checkpoint
+construction; the second reused random probes for the warm case, which miss a
+64-block cache almost every time and so measured the cold path twice under two
+names.
+
+### 14.1b Measured — M3 result (the paint budget)
+
+Run `python tools/bench_ui.py`. Windows 11, Cascadia Mono 10pt, 8×17px cell,
+1400px-wide window, one source, 20 000 entries.
+
+Two measurement traps had to be removed before any of these numbers meant
+anything, and both had produced optimistic figures:
+
+- **The offscreen Qt platform has no font database.** Every family resolves to
+  the empty string, `fixedPitch()` is False, and every glyph measures 13×13. Text
+  timings taken there are a fallback renderer's and were out by roughly 2×. The
+  bench opens a real window, parked off-screen.
+- **`resize()` on a widget that was never shown does not reach the viewport.**
+  The row count came back as 28 at every window height while the frame time still
+  grew, which is how it was caught. The bench now shows the window and asserts
+  the viewport actually grew.
+
+A top-level window is also clamped to the physical screen, so heights above the
+display cannot be measured this way and the bench says when it was clamped.
+
+| Operation | Measured | Budget | Verdict |
+|---|---|---|---|
+| **Scroll step** (3 rows, ordinary lines) | **0.97 ms** | 16 ms | **16× under** |
+| **Scroll step** (3 rows, long lines) | **1.27 ms** | 16 ms | **13× under** |
+| Full repaint, 48 rows, ordinary lines | 13.6 ms (284 µs/row) | 16 ms | inside |
+| Full repaint, 48 rows, long lines | **18.5 ms** (385 µs/row) | 16 ms | **over** |
+| `session.rows(56)` | 0.63 ms | — | 4% of a frame |
+| `format_wall_us` | 2.58 µs | — | 0.15 ms for 60 rows |
+
+**The scroll step is the number that matters**, and it is comfortable. It is also
+not free: it costs 1 ms instead of 14 ms because of two deliberate choices.
+
+1. **`scrollContentsBy` blits the viewport** and lets Qt damage only the newly
+   exposed band, so `paintEvent` honours `event.rect()` and paints three rows for
+   a three-row wheel step instead of a screenful.
+2. **The message is sliced to the visible character window** before being drawn.
+   This is legitimate only because the font is fixed-pitch, and it is what makes
+   paint cost independent of line length: a 4000-character stack trace measured
+   **61 ms** a frame drawn whole against **5.6 ms** sliced. Stack traces and SQL
+   are entirely ordinary log content, so without this the budget is missed by 4×
+   on real data rather than in theory.
+
+Painting in passes -- one per clip region rather than one per row -- and
+freezing the timestamp column (FR-36a, which narrows the scrolling area and so
+the glyph count) took long lines from 20.6 ms to 18.5 ms. Still over.
+
+**The residual breach is a full repaint of long lines.** A full repaint happens on
+a seek, a resize or a filter change — never on a scroll. Its cost is linear in
+visible rows, so it crosses 16 ms somewhere around 40–55 rows depending on line
+length, and a larger display makes it worse.
+
+The cause is Qt's raster text path at roughly **1.8 µs a glyph**, and it is not
+addressable by tuning. Measured and rejected:
+
+| Attempt | Result |
+|---|---|
+| One `drawText` a row instead of two | 14.94 ms vs 15.03 ms — **no change** |
+| `PreferNoHinting` | 16.7 ms — worse |
+| `NoSubpixelAntialias` | 15.9 ms — worse |
+| `NoAntialias` | 19.6 ms — much worse |
+| Consolas instead of Cascadia Mono | 15.2 ms — noise |
+| `ARGB32` vs premultiplied vs `RGB32` | identical |
+| `QStaticText`, cached across frames | 1.86× faster **on a cache hit only** |
+
+Merging two draw calls into one changing nothing is the decisive result: the cost
+is per *glyph*, not per call, so there is no batching win to be had. `QStaticText`
+is the only real speedup and it only helps re-display — a seek misses the cache by
+definition, which is exactly the case that is over budget.
+
+So the fix, when it is needed, is to stop asking Qt to shape and rasterise text
+every frame: a **fixed-pitch glyph atlas**, each ASCII glyph rastered once and
+blitted per character, which is what terminal emulators do. That is ADR-4's
+native-accelerator question, which now has a concrete trigger (>40 visible rows
+of long lines) and a concrete target (1.8 µs a glyph). It may not need native
+code at all — blitting from an atlas into the backing store is expressible in
+NumPy.
 
 ### 14.2 Remaining performance work
 
@@ -1210,9 +1437,16 @@ In priority order. Native code stays off the table until these are exhausted (D8
 3. **`merge_row_at` is 1.2ms cold** because it replays up to 4096 rows. Harmless
    with the BlockCache (§6.2) that the prototype lacks, but worth confirming once
    the cache exists — a 60-row paint must stay well inside the 16ms frame.
-4. Only then: an isolated native accelerator (Rust via PyO3, or Cython) behind a
+4. **A fixed-pitch glyph atlas** for the merged view, replacing `drawText` in
+   `paintEvent`. The only remaining budget breach after M3 (§14.1b): a full
+   repaint of long lines costs 18.5 ms against a 16 ms frame, at ~1.8 µs a glyph,
+   and no Qt-level tuning moves it. Scrolling is unaffected, so this is a seek-
+   and-resize problem rather than a smoothness one, which is why it sits here and
+   not above item 1.
+5. Only then: an isolated native accelerator (Rust via PyO3, or Cython) behind a
    feature flag, with the pure-Python path retained as the reference implementation
-   and the two cross-checked against the corpus in tests.
+   and the two cross-checked against the corpus in tests. Items 1 and 4 are the
+   two candidates; item 4 may well be achievable in NumPy alone.
 
 ## 15. Testing
 
@@ -1251,7 +1485,7 @@ logmerger's own test fixtures (`tests/log1_ooo_*.txt`, `log0_no_timestamps.txt`,
 | Integration | Open → index → merge → read, headless, no Qt. Append, rotate, truncate via `tools/rotate_sim.py`. Disconnecting a share. Vanishing files |
 | Rotation matrix | Copy-truncate, rename-create, move-to-dated-name, delete-recreate, writer holding an exclusive lock, antivirus-induced sharing violations |
 | Performance | §14, in CI, with regression gates |
-| GUI | `pytest-qt` for the view's row arithmetic, selection, keyboard navigation, and drag-and-drop; a small set of screenshot comparisons for the strips |
+| GUI | Plain `pytest` with a module-scoped `QApplication` fixture, on the offscreen platform, covering the view's row arithmetic, damage regions, selection, keyboard navigation, copy, and drag-and-drop. `pytest-qt` is not used — nothing here needs to wait on a signal or pump an event loop, so it would be a dependency for the sake of it. A small set of screenshot comparisons follows for the strips (M5). Two cautions, both learned the hard way: the offscreen platform has **no fonts**, so it cannot measure text (§14.1b), and a `QDropEvent` holds a **non-owning** pointer to its `QMimeData` — letting that fall out of scope in a test is an access violation that takes the interpreter down rather than an exception |
 
 CI runs every non-GUI test on both Windows and Linux from the first commit (NFR-18).
 
@@ -1289,8 +1523,9 @@ dependency may be added without an ADR.
 |---|---|---|
 | **M0** ✅ | Corpus generator, bench harness, CI on Windows + Linux | The ground truth and the performance gate exist before the code they judge. **Done.** Retired risk R1 ahead of schedule and rewrote §4.4, §8.1–8.2, §10.3 and §4.3 on the evidence (§14.1) |
 | **M1** ✅ | Format detection + vectorised extraction + `FileIndex`, headless; plus the whole source layer (§3, §7.1.1) | **Retires risk R4.** All 15 catalogue formats detect and index with `wall_us`, `line_no` and `byte_off` matching corpus ground truth exactly, at 21.0 bytes/entry. 128 MB/s single-core (§14.1). **Done.** |
-| **M2** | Sidecar cache, parallel indexer, `MergeIndex` with checkpoints, headless | Merge correctness by property test; NFR-4 and NFR-6 measured |
-| **M3** | Qt shell: `MergedLogView`, scrolling, timestamp and message columns, drag-and-drop | NFR-1, NFR-2, NFR-5 measured. First genuinely usable build |
+| **M2a** ✅ | `MergeIndex` with checkpoints and a block cache, headless | **NFR-6 measured at 26.6 µs**, merged order matches corpus ground truth row for row, 409× memory saving confirmed (§14.1). **Done.** |
+| **M2b** | Sidecar cache, parallel indexer | NFR-4. Deferred behind M3: both are pure speedups with no design risk, whereas the UI's frame budget is the biggest remaining unknown |
+| **M3** ✅ | Qt shell: `MergedLogView`, scrolling, timestamp and message columns, drag-and-drop, source lanes, source dock, copy with attribution | **NFR-5 measured (§14.1b): a scroll step is 0.98 ms, 16× under the frame budget.** First genuinely usable build. Found and fixed an unreachable-last-rows scrollbar bug and an unbounded paint cost on long lines; left one measured breach, a full repaint of long lines at 18.5 ms, with the fix scoped in §14.2 item 4. **Done.** |
 | **M4** | Highlighting, severity classes, source lanes, aliases | FR-28 to FR-31 |
 | **M5** | Both strips (D4) | FR-32 to FR-34; confirms risk R3 is contained |
 | **M6** | Follow engine, rotation matrix green | FR-21 to FR-26, NFR-8, NFR-20. **Retires risk R5** |
@@ -1312,7 +1547,10 @@ Each gets a short `docs/ADR/NNN-*.md` when it is taken:
 2. The qualitative source-lane palette, validated for 6px width, both themes, and
    colour-vision deficiency.
 3. Whether tier-2 filter results are cached to disk per predicate.
-4. Native accelerator: whether, and Rust/PyO3 vs Cython (gated on M1).
+4. Native accelerator: whether, and Rust/PyO3 vs Cython (gated on M1). M3 added a
+   second candidate alongside the severity matcher — a fixed-pitch glyph atlas for
+   the view (§14.1b) — and the atlas may be achievable in NumPy, which would
+   settle this ADR without any native code.
 5. A readable-message-plus-detail-pane treatment for CSV and JSONL, post-v1 — the
    enhancement D17 defers.
 6. Whether a VSS snapshot read (§7.1.1 rung 4) may be re-taken periodically to

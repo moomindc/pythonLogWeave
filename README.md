@@ -59,15 +59,117 @@ than the README alone.
 
 ## Quickstart
 
-Requires Python 3.12+. The engine needs only NumPy; Qt arrives with M3.
+Requires Python 3.12 or newer.
+
+### 1. Create a virtual environment
+
+**Windows (PowerShell)**
+
+```powershell
+cd path\to\pythonLogWeave
+py -3.13 -m venv .venv
+py -m venv .venv
+.\.venv\Scripts\Activate.ps1
+.\.venv\Scripts\Activate
+python -m pip install --upgrade pip
+```
+
+If PowerShell refuses to run the activate script, allow it for your user once:
+`Set-ExecutionPolicy -Scope CurrentUser RemoteSigned`. Or use
+`.\.venv\Scripts\activate.bat` from `cmd`, which needs no policy change.
+
+**Linux / macOS**
 
 ```bash
-python -m pip install "numpy>=2.0" "pytest>=8.0"
-
-python tools/gen_corpus.py --out tests/corpus     # generate corpus + ground truth
-python -m pytest tests -q                         # run the suite
-python tools/bench.py                             # measure the kernels
+cd path/to/pythonLogWeave
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
 ```
+
+### 2. Install dependencies
+
+```bash
+python -m pip install -r requirements-dev.txt    # app + tests + lint
+```
+
+| File | Installs | For |
+|---|---|---|
+| `requirements.txt` | numpy, PySide6 | running the GUI |
+| `requirements-dev.txt` | the above, plus pytest and ruff | working on it |
+| `python -m pip install "numpy>=2.0"` | numpy alone | the engine, headless, no Qt |
+
+That last row is not a curiosity. Layers 1–4 never import Qt (SPEC §1), a CI job
+installs no Qt to prove it, and the whole engine is usable from a script or a
+notebook with NumPy as its only dependency.
+
+`pyproject.toml` remains the source of truth; the requirements files exist so a
+checkout you are editing works without installing the package. To install it as
+a package instead: `python -m pip install -e ".[gui,dev]"`, which also puts a
+`logweave` command on your PATH.
+
+### 3. Run it
+
+```bash
+python -m logweave                 # empty window; drag files onto it
+```
+
+### 4. Make yourself some logs to try it on
+
+```bash
+python tools/make_test_logs.py     # writes C:\temp\logweave-logs
+python -m logweave C:/temp/logweave-logs
+```
+
+Seven files telling one incident from six different angles — a slow dependency
+backs up a connection pool, the breaker opens, requests fail, an operator
+restarts a worker, it recovers. The causal order is only visible once they are
+interleaved, which is the whole point of the program. Deliberately included:
+six timestamp formats, differing sub-second precision, multi-line stack traces,
+3000-character SQL lines, a UTF-16 file with a BOM, and a rotated pair that has
+to sort back into one stream. `--help` for the options.
+
+This is **not** the test corpus: `tools/gen_corpus.py` writes machine-checkable
+ground truth that the suite asserts against, while these files exist to be
+looked at.
+
+### 5. Tests and benchmarks
+
+```bash
+python tools/gen_corpus.py --out tests/corpus     # corpus + ground truth
+python -m pytest                                  # the suite
+python tools/bench.py                             # engine kernels
+python tools/bench_ui.py                          # the paint budget
+```
+
+### Using the GUI
+
+Drag one or more files onto the window, or a folder to open the logs inside it.
+A named file is always opened as named; a folder is filtered to things that look
+like logs, one level deep.
+
+| | |
+|---|---|
+| Left dock | Each source with its lane colour, entry count and detected format. Untick one to hide its rows without closing the file; hover for the encoding and detection confidence |
+| Right gutter | One lane per source, so you can see at a glance which file a run of rows came from |
+| Left edge | A severity bar, so errors are findable without reading the level word |
+| Ctrl+C | Copy the selected rows with `app.log:1` attribution |
+| Ctrl+A | Select all (a copy past 200 000 rows is refused rather than truncated) |
+| Ctrl+T | Hide the timestamp column — see below |
+| Arrows, PgUp/PgDn, Home/End | Move; hold Shift to extend the selection |
+| Scrollbar at the bottom | Scrolls the message only; timestamp and lanes stay put |
+
+**The timestamp column.** LogWeave shows the timestamp it parsed in its own
+column, in grey, and greyer still when it had to infer the value rather than
+read it. Because that column is already showing the time, a timestamp that
+*led* the line is trimmed off the front of the message instead of being printed
+twice. A timestamp *inside* the line — an access log, where the first field is
+the client address — is left exactly where it is.
+
+Ctrl+T hides the column, which is worth doing when every line carries its own
+timestamp anyway. Hiding it also stops the trimming, so the time never
+disappears from the row entirely: you are choosing which copy to keep, not
+whether to have one.
 
 Larger corpora, generated on demand and never committed:
 
@@ -94,9 +196,10 @@ living record — updated as each lands.
 | M | Deliverable | Status |
 |---|---|---|
 | **M0** | Corpus generator, benchmark harness, CI on Windows + Linux | ✅ **done** |
-| **M1** | Format detection, vectorised extraction, `FileIndex`, headless | ⬜ next |
-| **M2** | Sidecar cache, parallel indexer, checkpointed `MergeIndex` | ⬜ |
-| **M3** | Qt shell: merged view, scrolling, drag-and-drop | ⬜ |
+| **M1** | Format detection, vectorised extraction, `FileIndex`, headless — plus the whole source layer | ✅ **done** |
+| **M2a** | Checkpointed `MergeIndex` with a block cache | ✅ **done** |
+| **M3** | Qt shell: merged view, scrolling, drag-and-drop | ✅ **done** |
+| **M2b** | Sidecar cache, parallel indexer | ⬜ next |
 | **M4** | Highlighting, severity classes, source lanes, aliases | ⬜ |
 | **M5** | Minimap and timeline strips | ⬜ |
 | **M6** | Follow engine; rotation matrix green | ⬜ |
@@ -172,21 +275,182 @@ work is embarrassingly parallel.
 
 ---
 
+## M1 — what it delivers and what it found
+
+A headless engine that reads a log file and tells you, for every entry, exactly
+when it happened. All 15 catalogue formats, verified entry by entry against the
+corpus manifest — not just timestamps but **line numbers and byte offsets too**,
+because a test that checks only timestamps passes with completely broken copy
+attribution.
+
+### Risk R4 is retired: the engine checks itself
+
+R4 was "auto-detection silently picks a wrong format and mis-orders a file". The
+word that matters is *silently* — it parses, the timestamps look plausible, and
+the file is simply in the wrong order. A test suite catches that only for the
+formats somebody thought to test.
+
+So the check is in the engine, not just the tests. Detection measures a format's
+real byte positions from a sample, synthesises a vectorised layout, and then
+**proves that layout against an independently written per-line regex parser on
+the same sample**, discarding it on any disagreement. Two parsers written
+differently agreeing is evidence; one clever parser nobody checks is a
+liability. A file that fails the check still opens — it just takes the slow,
+correct path.
+
+### Layouts are measured, not declared
+
+A format's regex says what *may* appear; a file says what *does*. `\d{1,9}`
+fractional digits means the field width is not knowable from the pattern, so it
+is measured. One generic kernel is then driven by the result, which is why
+adding a format costs a regex and no new code — and why an Apache access log,
+whose timestamp sits after a variable-length IP address, still runs vectorised.
+
+### The logmerger New Year bug, fixed
+
+syslog writes no year; strace writes no date. logmerger infers *forwards* from
+the file's creation time, which dates every December line of a file spanning New
+Year with January's year — eleven months in the future, scattered to the far end
+of the merged view. LogWeave anchors at the **tail**, from `mtime`, and walks
+backwards. A rollover is only believed on a jump of six months (or twelve
+hours), so two entries logged a little out of order can't shift a whole year.
+
+### Three bugs found by building it
+
+- **In the contract I wrote myself.** Rotation detection compared file-head
+  hashes taken over different prefix lengths, so *every append to any log under
+  64 KB* read as a truncate-and-rewrite — a full re-index of every young log,
+  forever.
+- **A units bug at the mtime boundary.** `st_mtime` is a UTC epoch; everything
+  inside the engine is naive local (D1). syslog passed by luck and would have
+  mis-yeared at New Year. The parameter is now called `mtime_wall_us`.
+- **The corpus was never reproducible.** `hash(str)` is salted per process, so
+  `--seed` reproduced nothing. Now byte-identical across hash seeds.
+
+Measured throughput is in [`docs/SPEC.md` §14.1](docs/SPEC.md). The gate now
+benchmarks the shipped modules, keeping the M0 prototypes as reference rows so
+the cost of the shipped kernel's generality stays visible instead of becoming
+the new normal.
+
+---
+
+## M3 — what it delivers and what it found
+
+A window you drag log files onto. Merged, time-ordered, severity-coloured, with a
+source lane per file, a source dock, keyboard navigation, and copy with
+`file:line` attribution. The engine layers stay Qt-free and a CI job installs no
+Qt to prove it.
+
+### Scrolling is 16× under budget; a seek is not
+
+Full numbers in [`docs/SPEC.md` §14.1b](docs/SPEC.md).
+
+| Operation | Measured | Budget |
+|---|---|---|
+| Scroll step, 3 rows | **0.97 ms** | 16 ms |
+| Scroll step, 3 rows of long lines | **1.27 ms** | 16 ms |
+| Full repaint, 48 rows | 13.6 ms | 16 ms |
+| Full repaint, 48 rows of long lines | **18.5 ms** | 16 ms — **over** |
+
+Scrolling is cheap because of two choices. The view **blits the viewport** and
+repaints only the band Qt reports as damaged, so a three-row wheel step paints
+three rows rather than a screenful. And the message is **sliced to the visible
+character window** before being drawn, which makes paint cost depend on window
+width instead of line length: a 4000-character stack trace measured **61 ms** a
+frame drawn whole against **5.6 ms** sliced. Stack traces and SQL are ordinary log
+content, so that was a 4× budget miss on real data, not a theoretical one.
+
+A full repaint — a seek, a resize, a filter change, never a scroll — is still over
+budget on long lines, and that is recorded rather than smoothed over. The cost is
+Qt's raster text path at ~1.8 µs a glyph and no tuning touches it: hinting,
+antialiasing, image format and font all measured as noise or worse, and drawing a
+row in **one** `drawText` call instead of two changed nothing, which proves the
+cost is per glyph rather than per call. The fix is a fixed-pitch glyph atlas,
+scoped in §14.2 item 4 — possibly without native code.
+
+### Two measurement traps, both flattering
+
+Both produced *better* numbers than the truth, which is the dangerous direction.
+
+- **Qt's offscreen platform has no font database.** Every family resolves empty,
+  `fixedPitch()` is False, every glyph measures 13×13. Text timings taken there
+  were out by roughly 2×. The paint bench now opens a real window, parked
+  off-screen.
+- **`resize()` on a never-shown widget does not reach the viewport.** The row
+  count came back as 28 at every window height while the frame time still grew —
+  the benchmark was dividing real work by a fictional row count.
+
+### Three bugs found by building it
+
+- **The last rows of a huge file were unreachable.** The scrollbar maximum was
+  floored by the row-space scale, so you could scroll to within seven rows of the
+  end of an eight-billion-row merge and no further. Found by a test that asked for
+  the plain user-facing property — is the last row reachable — across the scale
+  boundary.
+- **Hiding a source un-hid itself.** Visibility was derived from `follow`, which
+  is about tailing, so every merge rebuild silently showed everything again.
+  They are now separate attributes.
+- **Copy mangled multi-line entries.** Each row was emitted as one line, so a
+  stack trace interleaved annotations with Java frames. The spec already said
+  what to do; the implementation hadn't.
+
+### One thing deliberately pulled forward
+
+Copy with attribution belongs to M7, and M3 implements the `annotated` preset
+anyway: a log viewer you cannot copy a line out of is not a usable build, and
+attribution was an explicit requirement from the start. It lives at layer 4, so
+M7 extends it rather than replacing it.
+
+---
+
 ## Layout
 
 ```
 docs/          PRD.md, SPEC.md
-logweave/      the application (M1 onward)
+requirements.txt      numpy + PySide6, to run it
+requirements-dev.txt  the above + pytest + ruff, to work on it
+logweave/
+  source/      layer 1: bytes in, however they are stored
+    base.py          the LogSource contract everything else codes against
+    winfile.py       CreateFileW with FILE_SHARE_DELETE; the SPEC 7.1.1 ladder
+    encoding.py      BOM / UTF-16 / UTF-8 / ANSI detection, decode on demand
+    file.py          local and UNC files, mmap or buffered
+    gzipped.py       .gz decompressed once into the cache (D12)
+  index/       layer 2: bytes to timestamps, headless and Qt-free
+    layouts.py       the 15-format catalogue and the layout model
+    detect.py        sampled detection, layout synthesis, oracle cross-check
+    extract.py       the one vectorised kernel, plus the scalar oracle
+    civil.py         calendar arithmetic and local-zone conversion
+    severity.py      severity classification, fast path and fallback
+    lines.py         line splitting and entry grouping
+    indexer.py       chunked build and rollover inference
+    fileindex.py     the four parallel arrays, 21 bytes an entry
+  merge/       layer 3: k-way merge over the indexes, Qt-free
+    mergeindex.py    checkpointed cursors, block cache, random access by row
+  session/     layer 4: what the UI asks for, still Qt-free
+    session.py       open files, rebuild the merge, hand out decoded rows
+    rowformat.py     copy and export formatting, with attribution (D9)
+    palette.py       severity ramp and source-lane colours
+  ui/          layer 5: the only layer allowed to import Qt
+    mergedview.py    QAbstractScrollArea, custom paint, int64 row space
+    mainwindow.py    drag-and-drop, source dock, status reporting
+    theme.py         fonts, chrome colours, stylesheet
+    app.py           QApplication entry point
+  highlight/   layer 5: M4
 tools/
-  gen_corpus.py      corpus + ground truth generator
-  bench.py           benchmark harness and regression gate
-  _prototypes.py     candidate kernels, measured before M1 commits to them
+  gen_corpus.py      corpus + ground truth generator, with ground truth
+  make_test_logs.py  realistic logs to try the GUI on, written to C:	emp
+  bench.py           benchmark harness and regression gate (no Qt, by test)
+  bench_ui.py        the paint budget; the one tool that needs Qt
+  _prototypes.py     M0 kernels kept only as reference rows in the gate
   bench_baseline.json
 tests/
-  conftest.py        session-scoped corpus fixture
+  conftest.py        corpus fixture and an in-memory LogSource stub
   test_corpus.py     the ground truth is internally consistent
-  test_prototypes.py the kernels match the ground truth
+  test_prototypes.py the M0 kernels match the ground truth
   test_architecture.py  SPEC §1: engine layers stay Qt-free
+  unit/              the shipped engine modules, against ground truth
+  ui/                the Qt shell; skipped entirely when Qt is absent
 .github/workflows/ci.yml
 ```
 

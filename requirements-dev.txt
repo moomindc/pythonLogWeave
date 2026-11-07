@@ -1,0 +1,8 @@
+# Development: the runtime set plus the test and lint tools.
+#
+#     python -m pip install -r requirements-dev.txt
+
+-r requirements.txt
+
+pytest>=8.0
+ruff>=0.6

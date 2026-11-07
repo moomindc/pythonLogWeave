@@ -38,22 +38,55 @@ PARALLEL_EFFICIENCY = 0.70
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+# The shipped modules. From M1 the gate measures the code that actually runs;
+# before that it measured prototypes, which is no longer honest now that real
+# ones exist.
+# Still only in the prototype, and deliberately so:
+#   * extract_fixed_iso    -- M0's hardcoded-ISO kernel, kept as a reference row
+#                             so the cost of the shipped kernel's generality and
+#                             field validation stays visible instead of becoming
+#                             the new normal.
+#   * extract_scalar_strptime -- what logmerger does today. There is no shipped
+#                             equivalent and there should not be.
+#   * histogram/cumulative/strip -- overview strips are M5; the prototype is
+#                             still the only implementation.
 from _prototypes import (  # noqa: E402
-    SEV_RE_INSENSITIVE,
-    SEV_RE_SENSITIVE,
-    MergePrototype,
     build_cumulative,
-    detect_severity_offset,
-    entries_from,
     extract_fixed_iso,
-    extract_scalar_regex,
     extract_scalar_strptime,
     histogram,
-    severity_at_offset,
-    severity_scan,
-    split_lines,
     strip_aggregate,
 )
+
+from logweave.index import extract as _ex  # noqa: E402
+from logweave.index.detect import detect  # noqa: E402
+from logweave.index.fileindex import FileIndex  # noqa: E402
+from logweave.index.lines import group_entries, split_lines  # noqa: E402
+from logweave.index.severity import (  # noqa: E402
+    severity_at_offset,
+    severity_scan,
+)
+from logweave.merge import MergeIndex, merge_of  # noqa: E402
+
+
+def fake_index(ts: np.ndarray) -> FileIndex:
+    """
+    A `FileIndex` carrying only what the merge reads.
+
+    The merge benches run on synthetic timestamp arrays rather than real indexed
+    files, so that row counts can be set independently of how much log text
+    would be needed to produce them -- two million rows is the interesting scale
+    and generating two million real lines per run is not.
+    """
+    n = int(ts.size)
+    return FileIndex(
+        ts=np.ascontiguousarray(ts, dtype=np.int64),
+        off=np.arange(n + 1, dtype=np.uint64) * 100,
+        flags=np.zeros(n, dtype=np.uint8),
+        line_no=np.arange(n, dtype=np.uint32) + 1,
+    )
 
 SEV_WORDS = ["INFO", "INFO", "INFO", "DEBUG", "INFO", "WARN", "INFO",
              "DEBUG", "ERROR", "INFO", "TRACE", "INFO", "WARN", "INFO",
@@ -161,42 +194,62 @@ def run_index_benches(b: Bench, chunk: bytes) -> dict:
     starts, lens = split_lines(buf, lone_cr=False)
     n = starts.size
 
-    b.throughput("extract_vectorised", lambda: extract_fixed_iso(buf, starts, lens), nbytes,
-                 note="SPEC 4.4 fast path")
-    ts, valid = extract_fixed_iso(buf, starts, lens)
-    b.rowrate("extract_vectorised_rows", lambda: extract_fixed_iso(buf, starts, lens), n)
+    # Detection runs once per file, so it is not on the throughput path -- but it
+    # decides which path everything else takes, so its own cost is reported and
+    # the layout it produces is what the kernels below are measured against.
+    b.latency("detect_format", lambda: detect(chunk, buf, starts, lens), 1,
+              note="once per file, over the whole bench chunk; the indexer "
+                   "samples only DETECT_BYTES, so this is an upper bound")
+    det = detect(chunk, buf, starts, lens)
+    if det.layout is None:
+        raise SystemExit(
+            f"benchmark chunk did not reach the vectorised path: {det.describe()}\n"
+            f"notes: {det.notes}"
+        )
+
+    b.throughput("extract_vectorised", lambda: _ex.extract(buf, starts, lens, det.layout),
+                 nbytes, note=f"SPEC 4.4 fast path, {det.layout.describe()}")
+    res = _ex.extract(buf, starts, lens, det.layout)
+    valid = res.valid
+    b.rowrate("extract_vectorised_rows",
+              lambda: _ex.extract(buf, starts, lens, det.layout), n)
+
+    # M0's hardcoded-ISO kernel, for reference only. The shipped kernel is
+    # layout-driven and range-validates its fields, which costs ~17%; keeping
+    # this row means that trade stays visible rather than becoming invisible.
+    b.throughput("extract_vectorised_m0_hardcoded",
+                 lambda: extract_fixed_iso(buf, starts, lens), nbytes,
+                 note="M0 prototype, one format, no field validation")
 
     # Scalar comparisons, on a capped slice, reported at the same scale.
     cap = min(SCALAR_CAP, n)
     cap_starts = starts[:cap]
+    cap_lens = lens[:cap]
     cap_bytes = int(starts[cap] if cap < n else nbytes)
     b.throughput("extract_scalar_regex",
-                 lambda: extract_scalar_regex(chunk, cap_starts), cap_bytes, reps=1,
-                 note=f"per-line regex, {cap} lines extrapolated")
+                 lambda: _ex.extract_scalar(chunk, cap_starts, cap_lens,
+                                            det.fmt, det.pattern),
+                 cap_bytes, reps=1,
+                 note=f"shipped fallback + oracle, {cap} lines extrapolated")
     b.throughput("extract_scalar_strptime",
                  lambda: extract_scalar_strptime(chunk, cap_starts), cap_bytes, reps=1,
                  note="what logmerger does today")
 
     # Severity: the fixed-offset fast path versus the general regex fallback.
-    sev_off = detect_severity_offset(chunk, starts, lens)
+    sev_off = det.severity_offset
     if sev_off is not None:
         b.throughput("severity_fixed_offset",
                      lambda: severity_at_offset(buf, starts, lens, sev_off), nbytes,
                      note=f"vectorised, level word at offset {sev_off}")
     b.throughput("severity_regex_insensitive",
-                 lambda: severity_scan(chunk, starts, n, pattern=SEV_RE_INSENSITIVE), nbytes,
-                 reps=1, note="fallback: regex over every byte")
-    b.throughput("severity_regex_sensitive",
-                 lambda: severity_scan(chunk, starts, n, pattern=SEV_RE_SENSITIVE), nbytes,
-                 reps=1, note="fallback, case-sensitive")
-    b.throughput("severity_fold_maxat",
-                 lambda: severity_scan(chunk, starts, n, method="maxat"), nbytes, reps=1,
-                 note="np.maximum.at fold instead of lexsort")
+                 lambda: severity_scan(chunk, starts, n), nbytes,
+                 reps=1, note="fallback: regex over every byte (risk R11)")
 
     sev = (severity_at_offset(buf, starts, lens, sev_off) if sev_off is not None
            else severity_scan(chunk, starts, n))
-    line_no, offs, ets = entries_from(ts, valid, starts)
-    esev = sev[np.flatnonzero(valid)]
+    opens, _spans = group_entries(valid)
+    ets = res.ts[opens]
+    esev = sev[opens]
     nent = ets.size
 
     if nent > 1:
@@ -217,11 +270,11 @@ def run_index_benches(b: Bench, chunk: bytes) -> dict:
     def full_pipeline():
         bb = np.frombuffer(chunk, np.uint8)
         st, ln = split_lines(bb, lone_cr=False)
-        t, v = extract_fixed_iso(bb, st, ln)
+        r = _ex.extract(bb, st, ln, det.layout)
         sv = (severity_at_offset(bb, st, ln, sev_off) if sev_off is not None
               else severity_scan(chunk, st, st.size))
-        _, _, e = entries_from(t, v, st)
-        return e.size, sv.size
+        o, _ = group_entries(r.valid)
+        return o.size, sv.size
 
     b.throughput("INDEX_TOTAL", full_pipeline, nbytes,
                  note="NFR-3 gate: split + extract + severity + entries")
@@ -229,10 +282,10 @@ def run_index_benches(b: Bench, chunk: bytes) -> dict:
     def full_pipeline_fallback():
         bb = np.frombuffer(chunk, np.uint8)
         st, ln = split_lines(bb, lone_cr=False)
-        t, v = extract_fixed_iso(bb, st, ln)
+        r = _ex.extract(bb, st, ln, det.layout)
         sv = severity_scan(chunk, st, st.size)
-        _, _, e = entries_from(t, v, st)
-        return e.size, sv.size
+        o, _ = group_entries(r.valid)
+        return o.size, sv.size
 
     b.throughput("INDEX_TOTAL_regex_fallback", full_pipeline_fallback, nbytes, reps=1,
                  note="worst case: unpredictable severity position")
@@ -249,12 +302,14 @@ def run_merge_benches(b: Bench, rows: int, k: int, seed: int = 7) -> None:
         arrays.append(np.cumsum(steps) + 1_791_500_000_000_000)
     total = sum(a.size for a in arrays)
 
-    b.rowrate("merge_build_checkpoints",
-              lambda: MergePrototype(arrays).build_checkpoints(), total, reps=1,
+    def fresh() -> MergeIndex:
+        return merge_of([fake_index(a) for a in arrays])
+
+    # Construction builds the checkpoints, so this measures SPEC 6.3 end to end.
+    b.rowrate("merge_build_checkpoints", fresh, total, reps=1,
               note=f"SPEC 6.3, {k} sources x {per} rows")
 
-    m = MergePrototype(arrays)
-    m.build_checkpoints()
+    m = fresh()
     lo, hi = int(min(a[0] for a in arrays)), int(max(a[-1] for a in arrays))
     probes = rng.integers(lo, hi, size=2000, dtype=np.int64).tolist()
 
@@ -262,23 +317,61 @@ def run_merge_benches(b: Bench, rows: int, k: int, seed: int = 7) -> None:
               lambda: [m.time_to_row(t) for t in probes], len(probes),
               note="NFR-6 seek; O(k log n), no replay")
 
-    rowprobes = rng.integers(0, total, size=500, dtype=np.int64).tolist()
-    b.latency("merge_row_at", lambda: [m.row_at(int(i)) for i in rowprobes], len(rowprobes),
-              note="cold: worst case within a checkpoint")
+    # Cold: clear the block cache before each probe, so every seek pays a full
+    # replay from its preceding checkpoint. Rebuilding the index instead would
+    # measure checkpoint construction, which is ~250ms and has nothing to do
+    # with the cost of a seek.
+    rowprobes = rng.integers(0, total, size=200, dtype=np.int64).tolist()
+
+    def cold_seeks():
+        for i in rowprobes:
+            m.clear_cache()
+            m.row_at(int(i))
+
+    b.latency("merge_row_at_cold", cold_seeks, len(rowprobes),
+              note="cold: full replay from the preceding checkpoint")
+
+    # Warm: a working set small enough to stay cached, which is what a user
+    # reading one region of the file actually does. Reusing the random probes
+    # here would measure misses again -- 200 probes over 488 blocks miss a
+    # 64-block cache almost every time, which is the cold case under a new name.
+    nearby = (rng.integers(0, max(1, total - 60), size=8, dtype=np.int64).tolist() * 25)
+    for i in nearby[:8]:
+        m.row_at(int(i))
+
+    b.latency("merge_row_at_warm",
+              lambda: [m.row_at(int(i)) for i in nearby], len(nearby),
+              note="warm: working set resident in the block cache")
 
     blocks = rng.integers(0, max(1, total - 4096), size=200, dtype=np.int64).tolist()
     b.latency("merge_block_4096",
-              lambda: [m.block(int(i), 4096) for i in blocks], len(blocks),
-              note="one block replay; the engine caches these")
+              lambda: [m.rows(int(i), 4096) for i in blocks], len(blocks),
+              note="one block replay; the cache absorbs repeats")
+
+    # The number that actually decides whether scrolling is smooth: 60 rows at a
+    # time, walking forward, which is what a real scroll does.
+    seq = list(range(0, min(total - 60, 120_000), 60))
+    scroll = fresh()
+
+    def scroll_pass():
+        for s in seq:
+            scroll.rows(s, 60)
+
+    b.latency("merge_paint_60rows_scrolling", scroll_pass, len(seq), reps=1,
+              note="NFR-5: one frame of rows, sequential; must fit 16ms")
 
     starts = rng.integers(0, max(1, total - 64), size=2000, dtype=np.int64).tolist()
-    b.latency("merge_paint_60rows",
-              lambda: [m.block(int(i), 60) for i in starts], len(starts),
-              note="NFR-5: rows for one frame")
+    b.latency("merge_paint_60rows_random",
+              lambda: [m.rows(int(i), 60) for i in starts], len(starts),
+              note="NFR-5: worst case, jumping around")
 
-    cp = m.checkpoint_bytes()
-    b.results.append(Result("checkpoint_bytes_per_1M_rows", "MB/1M", cp / 1e6 / (total / 1e6),
-                            0.0, False, f"vs 8 MB/1M if materialised ({cp / 1e6:.2f}MB total)"))
+    cp = m.checkpoint_bytes
+    b.results.append(Result("checkpoint_bytes_per_1M_rows", "MB/1M",
+                            m.stats.mb_per_1m_rows, 0.0, False,
+                            f"vs 8 MB/1M if materialised ({cp / 1e6:.2f}MB total)"))
+    b.results.append(Result("merge_cache_hit_rate_scrolling", "ratio",
+                            scroll.stats.hit_rate, 0.0, True,
+                            "SPEC 6.2 block cache, during a sequential scroll"))
 
 
 # ---------------------------------------------------------------------------

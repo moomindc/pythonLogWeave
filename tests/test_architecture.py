@@ -62,14 +62,42 @@ def test_ui_layer_is_the_only_qt_consumer():
     assert not offenders, "only logweave/ui may import Qt\n" + "\n".join(offenders)
 
 
+# The paint benchmark measures Qt, so it cannot avoid importing it. It is named
+# explicitly rather than matched by a pattern, so adding a second Qt-dependent
+# tool is a deliberate edit to this list and not an accident.
+QT_TOOLS = {"bench_ui.py"}
+
+
 def test_tools_do_not_import_qt():
-    """The corpus generator and bench harness must run without Qt installed."""
+    """
+    The corpus generator and the engine bench must run without Qt installed.
+
+    `tools/bench.py` is the performance gate and runs in the engine CI job, which
+    installs numpy and pytest and nothing else. A stray Qt import there would
+    make the gate unrunnable in exactly the environment it exists to protect.
+    """
     offenders = []
     for path in sorted((ROOT / "tools").glob("*.py")):
+        if path.name in QT_TOOLS:
+            continue
         bad = _imported_roots(path) & FORBIDDEN_ROOTS
         if bad:
             offenders.append(f"{path.name} imports {sorted(bad)}")
     assert not offenders, "\n".join(offenders)
+
+
+def test_the_qt_dependent_tools_are_the_ones_we_think():
+    """
+    Guards the exemption above: a tool that stops needing Qt should leave the
+    list, and the list should never quietly grow to cover `bench.py`.
+    """
+    assert "bench.py" not in QT_TOOLS
+    for name in QT_TOOLS:
+        path = ROOT / "tools" / name
+        assert path.exists(), f"{name} is exempted but does not exist"
+        assert _imported_roots(path) & FORBIDDEN_ROOTS, (
+            f"{name} no longer imports Qt; remove it from QT_TOOLS"
+        )
 
 
 def test_docs_are_present():

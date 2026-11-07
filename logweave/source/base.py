@@ -73,7 +73,8 @@ class SourceMeta:
     colour: str = ""                  # source lane colour, FR-28
     skew_us: int = 0                  # D2 / FR-18, added at merge time
     encoding: str = ""                # resolved by the source, FR-5
-    follow: bool = True               # FR-24
+    follow: bool = True               # FR-24, whether to tail it
+    enabled: bool = True              # FR-9, whether it is in the merge
 
 
 @dataclass(frozen=True)

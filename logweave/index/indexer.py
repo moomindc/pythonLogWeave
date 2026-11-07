@@ -83,6 +83,38 @@ class _Carry:
 # rollover inference (SPEC 4.5)
 # ---------------------------------------------------------------------------
 
+MESSAGE_OFFSET_SLACK = 4
+"""
+How far into a line a timestamp may start and still count as leading it.
+
+Covers a level prefix or a stray marker before the stamp. Beyond this the text
+in front is content, not punctuation, and trimming it would throw information
+away rather than remove a repetition.
+"""
+
+
+def message_offset(detection) -> int:
+    """
+    Where the message begins, for a format whose timestamp leads the line.
+
+    The view shows the parsed timestamp in its own column, so for a format like
+    `iso_space_dot` the same timestamp would otherwise appear twice on the row.
+    This says how much of the line the timestamp accounts for, and the view
+    trims that much when it is showing the column (SPEC 9.5).
+
+    Returns 0 when there is nothing to trim -- no format, or an anchored format
+    like an Apache access log where the timestamp sits inside the line and the
+    text in front of it is the client address, which is not a repetition of
+    anything.
+    """
+    layout = getattr(detection, "layout", None)
+    if layout is None or layout.is_anchored:
+        return 0
+    if layout.ts_offset > MESSAGE_OFFSET_SLACK:
+        return 0
+    return int(layout.ts_offset + layout.ts_width)
+
+
 def infer_years(
     month: np.ndarray, day: np.ndarray, anchor_wall_us: int
 ) -> tuple[np.ndarray, int]:
@@ -191,6 +223,7 @@ def build_index(
     idx.confidence = detection.confidence
     idx.stats.notes = list(detection.notes)
     idx.stats.used_fast_path = detection.fast_path
+    idx.message_offset = message_offset(detection)
 
     if not detection.ok:
         # FR-19: a file with no recognisable format is still listed, still

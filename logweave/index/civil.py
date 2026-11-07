@@ -164,3 +164,52 @@ def wall_us_to_datetime(wall: int) -> datetime:
     h, rem2 = divmod(secs, 3600)
     mi, s = divmod(rem2, 60)
     return datetime(int(y[0]), int(m[0]), int(d[0]), int(h), int(mi), int(s), int(us))
+
+def civil_from_days_scalar(z: int) -> tuple[int, int, int]:
+    """Scalar inverse of `days_from_civil_scalar`. No NumPy."""
+    z = int(z) + 719_468
+    era = (z if z >= 0 else z - 146_096) // 146_097
+    doe = z - era * 146_097
+    yoe = (doe - doe // 1460 + doe // 36_524 - doe // 146_096) // 365
+    y = yoe + era * 400
+    doy = doe - (365 * yoe + yoe // 4 - yoe // 100)
+    mp = (5 * doy + 2) // 153
+    d = doy - (153 * mp + 2) // 5 + 1
+    m = mp + 3 if mp < 10 else mp - 9
+    return (y + (1 if m <= 2 else 0), m, d)
+
+
+_DATE_CACHE: dict[int, str] = {}
+
+
+def format_wall_us(wall: int, *, micros: bool = True) -> str:
+    """
+    Format `wall_us` for display, without `datetime` and without NumPy.
+
+    Called for every visible row on every frame, so it is on the 16 ms budget
+    (NFR-5). Two things keep it cheap, and the first was found by measuring:
+
+    * **No NumPy.** The obvious implementation calls the vectorised
+      `civil_from_days` on a one-element array. That measured **56 µs** a call --
+      3.4 ms for a 60-row frame, a fifth of the whole budget -- because array
+      construction dwarfs the arithmetic. The scalar form has no such overhead.
+    * **A date cache.** Consecutive rows in a log almost always fall on the same
+      day, so the calendar conversion is done once per distinct date and the
+      time-of-day is all that is formatted per row.
+    """
+    wall = int(wall)
+    days, rem = divmod(wall, US_PER_DAY)
+    date = _DATE_CACHE.get(days)
+    if date is None:
+        y, m, d = civil_from_days_scalar(days)
+        date = f"{y:04d}-{m:02d}-{d:02d}"
+        if len(_DATE_CACHE) > 512:
+            _DATE_CACHE.clear()
+        _DATE_CACHE[days] = date
+    secs, us = divmod(rem, US_PER_SEC)
+    h, rest = divmod(secs, 3600)
+    mi, sec = divmod(rest, 60)
+    if micros:
+        return f"{date} {h:02d}:{mi:02d}:{sec:02d}.{us:06d}"
+    return f"{date} {h:02d}:{mi:02d}:{sec:02d}"
+

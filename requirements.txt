@@ -1,0 +1,13 @@
+# Everything needed to run the GUI.
+#
+# pyproject.toml is the source of truth for dependencies; this file exists so
+# that `pip install -r requirements.txt` works without installing the package,
+# which is what you want for a checkout you are editing.
+#
+# To run the engine ALONE, with no Qt -- which is the supported configuration
+# for scripting, CI and the indexing workers (SPEC 1) -- install numpy only:
+#
+#     python -m pip install "numpy>=2.0"
+
+numpy>=2.0
+PySide6>=6.10.1

@@ -157,22 +157,37 @@ def test_read_range_is_repeatable(log, use_mmap):
         assert first[2] == BODY[500:537]
 
 
-def test_read_range_inside_the_known_extent_costs_no_syscall(log, monkeypatch):
+def test_read_range_inside_the_known_extent_costs_no_syscall(log):
     """
     SPEC 3.1: "for a local file it should not cost a syscall".
 
-    Asserted by making ``os.fstat`` explode after the extent is known: a read
-    inside it must not touch the filesystem at all.
+    ``os.fstat`` is counted, not replaced with something that raises, and the
+    patch covers only the two calls being measured. Patching it process-wide for
+    the length of the test -- which is how this was first written -- also catches
+    whatever the test runner itself does in that window: under pytest 9 it is
+    pytest's own capture machinery that trips it, and the test then fails while
+    reporting a fault in code that made no syscall at all.
     """
     with FileSource(log) as source:
         size = source.size()
 
-        def forbidden(*args, **kwargs):
-            raise AssertionError("read_range re-stat-ed a range already in the extent")
+        real = os.fstat
+        calls = []
 
-        monkeypatch.setattr(os, "fstat", forbidden)
-        assert source.read_range(0, 100) == BODY[:100]
-        assert source.read_range(size - 1, size) == BODY[-1:]
+        def counted(*args, **kwargs):
+            calls.append(args)
+            return real(*args, **kwargs)
+
+        os.fstat = counted
+        try:
+            head = source.read_range(0, 100)
+            tail = source.read_range(size - 1, size)
+        finally:
+            os.fstat = real
+
+        assert not calls, f"read_range re-stat-ed a range already in the extent: {calls}"
+        assert head == BODY[:100]
+        assert tail == BODY[-1:]
 
 
 # -- the awkward files -----------------------------------------------------

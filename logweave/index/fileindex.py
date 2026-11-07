@@ -120,6 +120,20 @@ class FileIndex:
     encoding: str = ""
     stats: IndexStats = field(default_factory=IndexStats)
 
+    message_offset: int = 0
+    """
+    Characters to skip to get past a line-leading timestamp (SPEC 9.5).
+
+    Zero when there is nothing to skip: no format detected, or the timestamp
+    sits inside the line rather than at the front of it, as in an Apache or IIS
+    access log. Recorded here because it is a property of the proven layout, and
+    the layout does not survive past indexing.
+
+    Characters, not bytes. The two agree for every timestamp in the catalogue
+    because they are all ASCII, and the scan buffer a UTF-16 file is narrowed
+    into (SPEC 3.3) is one byte per character over that subset.
+    """
+
     off: np.ndarray = field(default_factory=lambda: np.zeros(1, dtype=np.uint64))
     ts: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=np.int64))
     flags: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=np.uint8))
