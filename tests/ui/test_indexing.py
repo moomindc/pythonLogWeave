@@ -39,8 +39,11 @@ def window(app, tmp_path):
     w = MainWindow(Session(cache_root=tmp_path / "cache"))
     w.resize(1000, 700)
     yield w
+    # Joined, not just cancelled: a QThread destroyed while running aborts the
+    # process, and the window owns it.
     w.cancel_indexing()
     settle(w)
+    w._join_thread()
     w.session.close()
     w.deleteLater()
 

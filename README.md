@@ -137,10 +137,17 @@ looked at.
 
 ```bash
 python tools/gen_corpus.py --out tests/corpus     # corpus + ground truth
-python -m pytest                                  # the suite
+python -m pytest                                  # the suite: 744 tests
+python -m pytest --ignore=tests/ui                # the engine only, no Qt needed
+python -m ruff check .                            # lint
 python tools/bench.py                             # engine kernels
-python tools/bench_ui.py                          # the paint budget
+python tools/bench_ui.py                          # the paint budget, needs a real window
 ```
+
+The corpus is generated, never committed, so a stale or hand-edited one cannot
+make a test pass. The GUI tests skip themselves entirely when Qt is absent,
+which is what lets the engine CI job install numpy and pytest and nothing else;
+`tests/test_architecture.py` is what stops Qt creeping below the UI layer.
 
 ### Using the GUI
 
@@ -154,10 +161,17 @@ like logs, one level deep.
 | Right gutter | One lane per source, so you can see at a glance which file a run of rows came from |
 | Left edge | A severity bar, so errors are findable without reading the level word |
 | Ctrl+C | Copy the selected rows with `app.log:1` attribution |
+| Ctrl+Shift+C | Copy the same rows verbatim — no attribution, no timestamp column |
 | Ctrl+A | Select all (a copy past 200 000 rows is refused rather than truncated) |
 | Ctrl+T | Hide the timestamp column — see below |
+| Ctrl++ / Ctrl+- / Ctrl+0 | Text size, also Ctrl+wheel; remembered between runs |
 | Arrows, PgUp/PgDn, Home/End | Move; hold Shift to extend the selection |
-| Scrollbar at the bottom | Scrolls the message only; timestamp and lanes stay put |
+| Scrollbar at the bottom | Scrolls the message only; the line number, timestamp, alias and lanes stay put |
+| View ▸ Source Alias Column | The short name of each row's file, as words rather than a colour |
+| View ▸ Line Number Column | Each entry's line number *within its own file*, in a gutter on the left |
+| View ▸ Lane Width | 4–12px per lane |
+| View ▸ Highlighting | Which of the shipped rule sets are in force — see below |
+| Double-click a dock row | Rename that source; clear the name to go back to the default |
 | File ▸ Clear Index Cache | Delete the saved indexes — see below |
 
 **The index cache.** The first open of a large log has to read all of it; after
@@ -177,6 +191,57 @@ already open keep working.
 Indexing happens in worker processes while the window stays usable, with
 progress and a Cancel in the status bar. Cancelling keeps whatever had already
 finished — those files are in the cache, so they cost nothing to open.
+
+**Copying.** Two modes, because they are wanted for different things. **Ctrl+C**
+carries the file and line each row came from — `app.log:1`, `SOA.log:7` — which
+is the whole reason to merge files in the first place, and is evidence when it is
+pasted into a ticket. **Ctrl+Shift+C** gives the lines exactly as they appear in
+their own files, which is what you want when pasting into a parser, a diff, or a
+search box that would choke on the prefix. The attribution names the *file*, not
+the alias, so a renamed source is still cited by something a colleague can find.
+
+**Text size.** Ctrl+wheel, Ctrl+plus and Ctrl+minus between 6 and 32 point, and
+the size is remembered — set it once when you move the window to a different
+monitor, not once a session. Ctrl+0 returns to the shipped 10pt. Zooming keeps
+the row you were reading at the top of the window rather than the scroll
+position, because fewer rows fit at a larger size.
+
+A highlight rule may ask for bold or italic, and LogWeave uses the face **only
+if it does not change the character advance**. Spans are positioned
+arithmetically from one glyph width — the single reason painting is independent
+of line length — so a bold face a fraction wider would displace every span after
+the first by a growing fraction of a character. Most monospace families keep the
+advance; the ones that do not get the colour and no weight.
+
+**Highlighting.** Three rule sets ship. *Severity* colours the level words.
+*Shapes* picks out the things a stack trace is made of — the exception class
+name, Java and Python frames, `Caused by:` — as spans inside the line rather
+than colouring the whole row. *Syslog* reads `<0>`–`<7>` priorities and is off
+by default, because that prefix is rare outside a raw capture and a rule that
+never fires still costs a branch in the one regex every row is scanned with.
+Which sets are on is remembered.
+
+All the enabled rules compile into **one** alternation regex, so a row is
+scanned once however many rules there are, and the result is memoised by the
+row's text. Colouring an ordinary file is lost in the run-to-run noise; a file
+that is all stack traces, six highlighted spans to a row, costs about 3 ms a
+frame (see M4 below).
+
+**The line-number gutter.** Each entry's line number *within its own file*,
+not its position in the merged view — which is a number about the viewer rather
+than about the log. It sits on the left, before the timestamp, where an editor
+gutter and `grep -n` put it. Right-aligned, so six figures line up with three
+and the column reads as numbers. The value is always in the index and always
+goes out with an annotated copy, so turning the column on reveals it rather than
+enabling it.
+
+**Which file a row came from.** Three answers, in increasing width. The lanes on
+the right are a colour. **View ▸ Source Alias Column** adds the short name as
+words, which is the one that survives a screenshot printed in grey. The alias
+itself is the shortest *distinguishing* part of the path: one file is `app`, but
+open `prod/service.log` beside `staging/service.log` and both grow a directory,
+because `service` would tell you nothing. Double-click a dock row to rename a
+source; a name you type is never recomputed when another file arrives.
 
 **The timestamp column.** LogWeave shows the timestamp it parsed in its own
 column, in grey, and greyer still when it had to infer the value rather than
@@ -219,11 +284,11 @@ living record — updated as each lands.
 | **M2a** | Checkpointed `MergeIndex` with a block cache | ✅ **done** |
 | **M3** | Qt shell: merged view, scrolling, drag-and-drop | ✅ **done** |
 | **M2b** | Sidecar cache, parallel indexer, indexing off the UI thread | ✅ **done** |
-| **M4** | Highlighting, severity classes, source lanes, aliases | ⬜ next |
-| **M5** | Minimap and timeline strips | ⬜ |
+| **M4** | Highlighting, severity classes, source lanes, aliases, text size, copy with and without attribution | ✅ **done** |
+| **M5** | Minimap and timeline strips | ⬜ next |
 | **M6** | Follow engine; rotation matrix green | ⬜ |
 | **M7** | Search, filters, selection, copy, export | ⬜ |
-| **M8** | Profiles, settings, file association | ⬜ |
+| **M8** | Profiles, settings, file association — plus the highlight-rule editor and ruleset import/export that complete FR-31 | ⬜ |
 | **M9** | Packaging, signing, cold-start tuning — **v1.0** | ⬜ |
 
 Then: phase 2 Windows Event Log, phase 3 syslog listener.
@@ -510,6 +575,176 @@ worker.
 
 ---
 
+## M4 — what it delivers and what it found
+
+Highlighting (FR-30, FR-31), the alias and line-number columns (FR-29, FR-29a),
+a configurable lane width (FR-28), a user-settable and remembered text size
+(FR-38), and copy in two modes (D9, FR-46a).
+
+The rule engine is in `logweave/highlight/`, which is **Qt-free and enforced as
+such** — it is the fifth layer `tests/test_architecture.py` checks, although
+SPEC §1 numbers it with the UI. The rules decide that a run of text is "error
+red"; only the view knows what a `QColor` is. That split is what lets the whole
+engine be tested headlessly, and what will let the same rules drive the HTML
+export (FR-47) without the exporter importing a widget toolkit.
+
+### Highlighting is free on ordinary lines and costs ~3 ms on stack traces
+
+`python tools/bench_ui.py`, Cascadia Mono 10pt, 48 visible rows, four runs.
+**These figures are the ones taken after bug 6 below** — everything measured
+before it was drawn in a proportional 9pt UI face and is not comparable.
+
+| Case | Rules off | Rules on | Delta | Spans a row |
+|---|---|---|---|---|
+| Ordinary lines | 10.85 ms | 10.94 ms | **+0.09 ms** | 0 |
+| Long lines | 17.63 ms | 18.12 ms | **+0.46 ms** | 0 |
+| Exception spans | 20.09 ms | 23.14 ms | **+3.09 ms** | 6 |
+
+The ordinary-lines delta is **smaller than the run-to-run spread**, which was
+−0.12 ms to +0.11 ms across the four runs — so the honest statement is that
+highlighting an ordinary log is not measurable here, not that it costs 0.09 ms.
+
+The scroll step — the number that actually decides whether the window feels
+right — is **1.48 ms at worst, 11× under the 16 ms budget**, because a wheel
+step still repaints three rows rather than a screenful.
+
+**The exception-spans full repaint is over budget at 23.1 ms, and the honest
+reading is that highlighting is not why.** It was already 20.1 ms with every
+rule off. That is M3's measured breach — Qt's raster text at ~1.8 µs a glyph on
+a full repaint of long lines (SPEC §14.1b) — and it dominates. A full repaint is
+a seek or a resize, never a scroll. The fix is still SPEC §14.2 item 4, the glyph
+atlas, which this makes slightly more urgent without changing what it is.
+
+### The span cost was 4× larger before two changes
+
+The first working version drew the whole line, then drew each styled span over
+the top. It was correct, and it cost **four times** what the shipped version
+does on the span-heavy case. Two changes closed it:
+
+| Change | Span-heavy frame |
+|---|---|
+| Draw the line, then overdraw each span | +10.60 ms |
+| Draw each character exactly once, as segments | +4.02 ms |
+| …skip the background pass when no span has a background, and set the pen and font only when they change | **+2.56 ms** |
+
+Those three absolute figures were taken **before** the painter-font fix, so they
+are in the wrong face and only the ratios between them carry over; the shipped
+version re-measures at +3.09 ms. Rerunning the two superseded implementations to
+restate them in the right font would mean reimplementing both, which is not
+worth it for a number whose conclusion does not change.
+
+Overdrawing was the big one, and it is the same lesson as M3: the cost is per
+*glyph*. Painting a 200-character line with six spans over it drew roughly 240
+glyphs where 200 were needed. Cutting the row into runs that cover the visible
+window exactly once draws 200.
+
+### One regex, one pass — and what that forbids
+
+All the enabled rules compile into one alternation with generated group names, so
+a row is scanned once however many rules there are, and the styled result is
+memoised by text (1024 rows). Per-rule case sensitivity rides along as a scoped
+inline flag, `(?i:...)`, rather than a second pattern.
+
+The consequence is a real limitation and it is worth stating plainly:
+**`finditer` over one alternation returns non-overlapping matches, so a span
+nested inside another span cannot both match.** Whichever alternative matches at
+the earliest position consumes the text, and there is no second pass to recover
+the inner one. Two passes would be the fix, and two passes is the cost this
+design exists to avoid, so `tests/unit/test_highlight.py` asserts the behaviour
+rather than wishing it away.
+
+That makes *which* alternative wins at a given position the whole of overlap
+resolution, so the alternatives are emitted in `(-priority, list order)` order at
+compile time. SPEC §10.1 said "overlaps resolve by priority, then by rule
+order", and before this they resolved by rule order alone — `priority` was being
+read for the line-scope winner and ignored for spans.
+
+### Five bugs found by building it
+
+1. **The line-scope winner sentinel compared backwards.** The "nothing has won
+   yet" value was `(-(1<<30), 1<<30)` where the comparison wanted
+   `(1<<30, 1<<30)`, so no rule ever beat it and no row was ever styled by a line
+   rule. The tests that would have caught it were the ones asserting a
+   *particular* rule won, not that any did.
+2. **The built-in severity rules contributed nothing to the index.** They were
+   regexes, for the word boundary; the vectorised index-time classifier (SPEC
+   §10.3) compares fixed byte columns and skips regexes by necessity. So the
+   paint was right and the minimap would have been uncoloured. Fixed by giving a
+   rule a `word_boundary` flag, so the shipped severity rules stay literals and
+   still do not match `DEBUGGER` or `INFORMATIONAL`.
+3. **A rename edited the row's entry count.** `QListWidgetItem` keeps
+   `DisplayRole` and `EditRole` in the same place, so double-clicking "app 504"
+   handed all of that to the editor and whatever was left behind became the name.
+   A `QStyledItemDelegate` is the supported way to separate them.
+4. **The lane-width menu could not select the shipped width.** It offered 4, 6,
+   8, 10 and 12 px against a default of 7, so nothing was ticked when the window
+   opened and the default was unreachable from the menu. Found by a test
+   asserting that exactly one item is ticked; the menu now offers every width in
+   the range.
+5. **The alias algorithm grew every name to full depth** chasing two paths it
+   could never separate. The same file opened twice never distinguishes however
+   deep you look, so `app` and `app` became `var/log/app` and `var/log/app~2`,
+   widening the column for every other source to no purpose. It now takes the
+   shallowest depth that tells as many of them apart as any depth can, and falls
+   back to a numeric suffix for the genuinely indistinguishable. A name the user
+   has typed is never recomputed, but it does take part in deciding how much of
+   the path the automatic ones need to show.
+
+### Two more found in use, which the tests could not see
+
+Both reported after the suite was green, and worth recording because of *why* it
+was green.
+
+6. **The merged view was drawing in the wrong font entirely.** A `QPainter`
+   constructed on a widget does not inherit that widget's font — it starts at
+   the application default, a 9pt proportional UI face on Windows. So every
+   message was drawn proportionally while every width in `paintEvent` was
+   computed from the monospace metrics, and a zoom grew the row height and the
+   character cell without changing a single glyph. That last part is how it
+   surfaced: *"ctrl + just makes the gaps around the text bigger but the font
+   size does not increase."*
+
+   There was a second half. A scroll area's viewport inherits the font when it
+   is created and then stops — with a style sheet on the window, Qt treats the
+   viewport's font as its own and later propagation is ignored — so
+   `self.setFont()` reached nothing that paints. Both are now explicit.
+
+   **The GUI suite could not have caught this**, and that is the lesson rather
+   than an excuse. The offscreen platform has no font database: every family
+   resolves empty and every glyph is 13×13 whatever the point size, which is
+   exactly why §14.1b moved all text measurement to `tools/bench_ui.py` and a
+   real window. The fix is tested by spying on the painter — asserting it is
+   handed a font at the current point size before anything is drawn — which
+   works on any backend, and the ink was verified against the real font stack
+   separately: painted width now tracks `len(text) × char_w` to within 2% at
+   10, 16 and 24pt, having been invariant before.
+
+7. **The line-number column was built on the right**, beside the alias, because
+   both were specified together as things that say where a row came from. They
+   are not the same kind of thing: the alias answers *which file*, the line
+   number is a coordinate within the row, and it belongs at the start of it
+   where an editor gutter puts it. Moved to the left, before the timestamp.
+
+   Every test still passed after the move, which is the tell: they asserted the
+   column took width *from the message*, true on either side. They now assert
+   the side.
+
+### Preferences, and keeping the real registry out of it
+
+Text size, lane width, the two columns, the timestamp column and which rule sets
+are on persist through `QSettings`. Everything read back is clamped or
+intersected with what exists: a hand-edited store cannot produce a 900-point
+font, and a rule set removed in a later version cannot come back as a name
+nothing answers to.
+
+`QSettings` never fails — it quietly returns whatever somebody else put there —
+so the GUI suite points it at a temporary ini file per test. Without that, a test
+could be handed a font size left behind by the last run, and *running the tests
+would change the application's appearance for the person who ran them*. It is the
+same failure the sidecar cache had at M2b, in a place that is easier to miss.
+
+---
+
 ## Layout
 
 ```
@@ -542,13 +777,17 @@ logweave/
     prepare.py       warm the cache in worker processes, before opening
     rowformat.py     copy and export formatting, with attribution (D9)
     palette.py       severity ramp and source-lane colours
+    aliasing.py      shortest distinguishing source names, for the column and copy
+  highlight/   layer 5 by number, Qt-free by rule: the rules, not the colours
+    rules.py         HighlightRule, Ruleset, the one-pass compiled scanner
+    builtins.py      the three shipped rulesets: severity, shapes, syslog
   ui/          layer 5: the only layer allowed to import Qt
     mergedview.py    QAbstractScrollArea, custom paint, int64 row space
-    mainwindow.py    drag-and-drop, source dock, status reporting
+    mainwindow.py    drag-and-drop, source dock, menus, status reporting
     indexing.py      the worker thread that keeps the window answering
+    settings.py      the view preferences that outlive the window
     theme.py         fonts, chrome colours, stylesheet
     app.py           QApplication entry point
-  highlight/   layer 5: M4
 tools/
   gen_corpus.py      corpus + ground truth generator, with ground truth
   make_test_logs.py  realistic logs to try the GUI on, written to C:/temp
@@ -563,6 +802,7 @@ tests/
   test_architecture.py  SPEC §1: engine layers stay Qt-free
   unit/              the shipped engine modules, against ground truth
   ui/                the Qt shell; skipped entirely when Qt is absent
+    conftest.py      points QSettings at a temp file, never the real store
 .github/workflows/ci.yml
 ```
 

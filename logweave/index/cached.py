@@ -99,8 +99,12 @@ def open_index(
             return False
         return source.read_range(offset - 1, offset) in (b"\n", b"\r")
 
+    # The digest of the words the flags would be computed with, so a sidecar
+    # built under different ones is not served (SPEC 5.4).
+    ruleset_sha = ruleset.fingerprint()
     found = sidecar.lookup(path, size=size, mtime_ns=mtime_ns, head=head,
-                           terminator_at=terminator_at, root=root)
+                           terminator_at=terminator_at, root=root,
+                           ruleset_sha=ruleset_sha)
 
     if found.full:
         return CacheOutcome(index=found.index, status="hit", reason=found.reason,
@@ -112,7 +116,7 @@ def open_index(
         if outcome is not None:
             if write_back:
                 outcome.wrote = _write(outcome.index, path, size, mtime_ns,
-                                       head, root)
+                                       head, root, ruleset_sha)
             return outcome
 
     idx = build_index(source, mtime_wall_us=mtime_wall_us, ruleset=ruleset,
@@ -120,12 +124,12 @@ def open_index(
     out = CacheOutcome(index=idx, status="miss", reason=found.reason,
                        indexed_bytes=idx.stats.bytes_indexed)
     if write_back:
-        out.wrote = _write(idx, path, size, mtime_ns, head, root)
+        out.wrote = _write(idx, path, size, mtime_ns, head, root, ruleset_sha)
     return out
 
 
 def _write(index: FileIndex, path: Path, size: int, mtime_ns: int,
-           head: bytes, root: Path | None) -> bool:
+           head: bytes, root: Path | None, ruleset_sha: str = "") -> bool:
     """
     Write a sidecar, and treat failure as unimportant.
 
@@ -137,7 +141,7 @@ def _write(index: FileIndex, path: Path, size: int, mtime_ns: int,
         return False
     try:
         sidecar.write(index, path=path, size=size, mtime_ns=mtime_ns,
-                      head=head, root=root)
+                      head=head, root=root, ruleset_sha=ruleset_sha)
     except (OSError, ValueError):
         return False
     return True

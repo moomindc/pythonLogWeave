@@ -183,6 +183,7 @@ class Session:
             except (SourceError, OSError) as exc:
                 result.failed.append((str(path), str(exc)))
 
+        self._assign_aliases()
         self._rebuild()
         return result
 
@@ -200,6 +201,7 @@ class Session:
         index = outcome.index
         meta = src.meta
         meta.alias = meta.alias or path.stem
+        meta.origin = meta.origin or str(path)
         meta.colour = meta.colour or palette.lane_colour(order)
 
         self.sources.append(SessionSource(source=src, index=index, meta=meta,
@@ -211,6 +213,60 @@ class Session:
             result.no_format.append(str(path))
         elif index.confidence < LOW_CONFIDENCE:
             result.low_confidence.append((str(path), index.confidence))
+
+    def _assign_aliases(self) -> None:
+        """
+        Give every source the shortest name that tells it from the others
+        (FR-29).
+
+        Recomputed for the whole set on every open, because adding a file can
+        change what distinguishes the files already open: `service` has to
+        become `prod/service` the moment `staging/service.log` arrives. A name
+        the user typed is never recomputed -- they have said what they want it
+        called, and silently widening it would undo that.
+        """
+        from .aliasing import distinguishing_aliases
+
+        if not self.sources:
+            return
+        # Computed over *every* path, including the renamed ones, then applied
+        # only to the rest. A name the user typed is not up for recomputation,
+        # but the automatic ones still have to stay distinguishable from it --
+        # and from the file behind it, which is what decides how much of the
+        # path the others need to show.
+        paths = [Path(s.meta.origin or s.alias) for s in self.sources]
+        computed = distinguishing_aliases(paths)
+        taken = {s.meta.alias for s in self.sources if s.meta.alias_custom}
+
+        for source, alias in zip(self.sources, computed, strict=True):
+            if source.meta.alias_custom:
+                continue
+            if alias in taken:
+                # A user has already claimed this exact name for another file.
+                alias = f"{alias}~{len(taken)}"
+            taken.add(alias)
+            source.meta.alias = alias
+
+    def set_alias(self, source: int, alias: str) -> str:
+        """
+        Rename a source (FR-29). An empty name hands it back to the default.
+
+        Returns the alias in force afterwards, which is not always what was
+        asked for: clearing one recomputes it from the paths.
+        """
+        meta = self.sources[source].meta
+        alias = alias.strip()
+        if alias:
+            meta.alias = alias
+            meta.alias_custom = True
+        else:
+            meta.alias_custom = False
+            self._assign_aliases()
+        if self._merge is not None:
+            # The merge carries source names for diagnostics, so it has to be
+            # told; nothing about the order or the index changes.
+            self._rebuild()
+        return self.sources[source].alias
 
     def _rebuild(self) -> None:
         from ..merge import MergeIndex, MergeSource

@@ -75,6 +75,7 @@ class SourceMeta:
     encoding: str = ""                # resolved by the source, FR-5
     follow: bool = True               # FR-24, whether to tail it
     enabled: bool = True              # FR-9, whether it is in the merge
+    alias_custom: bool = False        # the user named it; do not recompute
 
 
 @dataclass(frozen=True)

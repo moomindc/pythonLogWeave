@@ -155,7 +155,7 @@ class Reuse:
 # ---------------------------------------------------------------------------
 
 def _header(index: FileIndex, *, path: Path, size: int, mtime_ns: int,
-            head: bytes) -> dict:
+            head: bytes, ruleset_sha: str = "") -> dict:
     arrays = []
     offset = PAGE
     for name, dtype in _ARRAYS:
@@ -174,6 +174,7 @@ def _header(index: FileIndex, *, path: Path, size: int, mtime_ns: int,
         "source": {"path": str(path), "size": size, "mtime_ns": mtime_ns},
         "head_sha": hash_bytes(head),
         "head_len": len(head),
+        "ruleset_sha": ruleset_sha,
         "source_id": index.source_id,
         "ts_format": index.format_name,
         "confidence": index.confidence,
@@ -202,7 +203,8 @@ def _align(offset: int) -> int:
 
 
 def write(index: FileIndex, *, path: Path, size: int, mtime_ns: int,
-          head: bytes, root: Path | None = None) -> Path:
+          head: bytes, root: Path | None = None,
+          ruleset_sha: str = "") -> Path:
     """
     Write a sidecar for `index`, atomically.
 
@@ -216,7 +218,7 @@ def write(index: FileIndex, *, path: Path, size: int, mtime_ns: int,
     target = root / cache_name(path, size, mtime_ns)
 
     header = _header(index, path=Path(path), size=size, mtime_ns=mtime_ns,
-                     head=head[:HEAD_SAMPLE])
+                     head=head[:HEAD_SAMPLE], ruleset_sha=ruleset_sha)
     blob = json.dumps(header, separators=(",", ":")).encode("utf-8")
     if len(blob) + len(MAGIC) + HEADER_LEN.size > PAGE:
         # The header is a few hundred bytes of fixed fields plus detection
@@ -305,7 +307,7 @@ def _load(sidecar: Path, header: dict) -> FileIndex:
 
 def lookup(path: Path, *, size: int, mtime_ns: int, head: bytes,
            terminator_at: Callable[[int], bool] | None = None,
-           root: Path | None = None) -> Reuse:
+           root: Path | None = None, ruleset_sha: str = "") -> Reuse:
     """
     Decide what, if anything, may be reused for this file (SPEC 5.4).
 
@@ -321,7 +323,7 @@ def lookup(path: Path, *, size: int, mtime_ns: int, head: bytes,
     exact = root / cache_name(path, size, mtime_ns)
     header = read_header(exact)
     if header is not None:
-        bad = _incompatible(header, head)
+        bad = _incompatible(header, head, ruleset_sha)
         if bad:
             return Reuse(reason=bad)
         try:
@@ -350,7 +352,7 @@ def lookup(path: Path, *, size: int, mtime_ns: int, head: bytes,
         # is possible, and cheap to get wrong, so this is not reused.
         return Reuse(reason="mtime changed without growth")
 
-    bad = _incompatible(header, head)
+    bad = _incompatible(header, head, ruleset_sha)
     if bad:
         return Reuse(reason=bad)
 
@@ -368,18 +370,25 @@ def lookup(path: Path, *, size: int, mtime_ns: int, head: bytes,
                  reason=f"reusing {indexed_to:,} of {size:,} bytes")
 
 
-def _incompatible(header: dict, head: bytes) -> str:
+def _incompatible(header: dict, head: bytes, ruleset_sha: str = "") -> str:
     """
     Why this sidecar may not be used, or "" if it may.
 
     The head is re-hashed over however many bytes the sidecar hashed, not over
     a fixed window: a file that has grown since still matches on the prefix
     that was recorded, which is the whole basis of the append path.
+
+    The severity ruleset is checked for the same reason `parser_version` is --
+    it changes what the arrays say without changing anything about the file. A
+    sidecar written before the field existed carries no digest, and is taken to
+    have been built with the shipped words, because it was.
     """
     if header.get("format_version") != FORMAT_VERSION:
         return "sidecar format version differs"
     if header.get("parser_version") != PARSER_VERSION:
         return "parser version differs"
+    if ruleset_sha and header.get("ruleset_sha", "") != ruleset_sha:
+        return "severity ruleset changed"
     want = int(header.get("head_len", HEAD_SAMPLE))
     if len(head) < want:
         return "file is shorter than the hashed head"

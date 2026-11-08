@@ -12,7 +12,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QAction, QColor, QKeySequence, QPixmap
+from PySide6.QtGui import QAction, QActionGroup, QColor, QKeySequence, QPixmap
 from PySide6.QtWidgets import (
     QDockWidget,
     QFileDialog,
@@ -23,12 +23,14 @@ from PySide6.QtWidgets import (
     QProgressBar,
     QPushButton,
     QStatusBar,
+    QStyledItemDelegate,
 )
 
+from ..highlight import default_group
 from ..index import sidecar
 from ..index.civil import format_wall_us
 from ..session import Session
-from . import theme
+from . import settings, theme
 from .indexing import IndexWorker, start
 from .mergedview import MergedLogView
 
@@ -68,6 +70,30 @@ def expand(paths: list[Path]) -> list[Path]:
     return out
 
 
+class AliasDelegate(QStyledItemDelegate):
+    """
+    Lets a dock row be renamed without offering its entry count for editing.
+
+    `QListWidgetItem` stores `DisplayRole` and `EditRole` in the same place, so
+    a row reading "app   1,125" hands all of that to the editor and whatever
+    the user leaves behind becomes the name. A delegate is the supported way to
+    separate the two: it fills the editor from the alias and sends what comes
+    back to the session, leaving the model's display string alone -- the window
+    rebuilds the row afterwards, so the count reappears with the new name.
+    """
+
+    def __init__(self, parent, *, alias_of, rename):
+        super().__init__(parent)
+        self._alias_of = alias_of
+        self._rename = rename
+
+    def setEditorData(self, editor, index) -> None:  # noqa: N802  (Qt naming)
+        editor.setText(self._alias_of(index.row()))
+
+    def setModelData(self, editor, model, index) -> None:  # noqa: N802
+        self._rename(index.row(), editor.text())
+
+
 class MainWindow(QMainWindow):
     """One window, one session. Multiple windows are independent (FR-33)."""
 
@@ -89,11 +115,23 @@ class MainWindow(QMainWindow):
         self.setStyleSheet(theme.QSS)
         self.setAcceptDrops(True)
 
+        self.highlight_group = default_group()
+        """
+        The three shipped rulesets and which are on (SPEC 10.1).
+
+        Held here rather than in the view because it is a preference, not a
+        drawing detail: the view is handed the flattened result and knows
+        nothing about where the rules came from.
+        """
+
         self.view = MergedLogView(self.session)
         self.setCentralWidget(self.view)
         self.view.currentRowChanged.connect(self._update_position)
         self.view.copied.connect(self._report_copied)
         self.view.copyRefused.connect(self._report_copy_refused)
+        self.view.fontPointChanged.connect(
+            lambda pt: settings.write(settings.FONT_POINT, pt))
+        self._restore_preferences()
 
         self._worker: IndexWorker | None = None
         self._thread = None
@@ -104,6 +142,49 @@ class MainWindow(QMainWindow):
         self._build_menus()
         self._build_status()
         self.refresh()
+
+    # ------------------------------------------------------------------
+    # preferences (FR-38)
+    # ------------------------------------------------------------------
+
+    def _restore_preferences(self) -> None:
+        """
+        Put the view back the way it was last time.
+
+        Applied straight to the view rather than through the menu actions,
+        because the menus are built afterwards and read their checked state
+        from here -- one direction only, so there is no moment where the menu
+        and the view disagree.
+        """
+        self.view.set_font_point(settings.font_point())
+        self.view.set_lane_width(settings.lane_width())
+        self.view.set_show_timestamp(settings.read_bool(settings.SHOW_TIMESTAMP, True))
+        self.view.set_show_alias(settings.read_bool(settings.SHOW_ALIAS, False))
+        self.view.set_show_line_no(settings.read_bool(settings.SHOW_LINE_NO, False))
+
+        remembered = settings.store().value(settings.HIGHLIGHTS)
+        if isinstance(remembered, str):
+            wanted = {name for name in remembered.split(",") if name}
+            # Intersected with what exists: a set removed in a later version
+            # must not come back as a name nothing answers to.
+            self.highlight_group.active = wanted & set(self.highlight_group.sets)
+        self._apply_highlights()
+
+    def _apply_highlights(self) -> None:
+        """Flatten the active rulesets into the view and repaint."""
+        self.view.highlights = self.highlight_group.flatten()
+        settings.write(settings.HIGHLIGHTS, ",".join(sorted(self.highlight_group.active)))
+        self.view.viewport().update()
+
+    def _toggle_highlight_set(self, name: str, on: bool) -> None:
+        if on:
+            self.highlight_group.active.add(name)
+        else:
+            self.highlight_group.active.discard(name)
+        self._apply_highlights()
+        rules = len(self.view.highlights.rules)
+        self._status_msg.setText(
+            f"{name} highlighting {'on' if on else 'off'}, {rules} rules active")
 
     # ------------------------------------------------------------------
     # chrome
@@ -136,11 +217,23 @@ class MainWindow(QMainWindow):
         quit_act.triggered.connect(self.close)
         file_menu.addAction(quit_act)
 
+        edit_menu = self.menuBar().addMenu("&Edit")
+
         copy_act = QAction("&Copy With Attribution", self)
         copy_act.setShortcut(QKeySequence.StandardKey.Copy)
-        copy_act.triggered.connect(self.view.copy_selection)
-        edit_menu = self.menuBar().addMenu("&Edit")
+        copy_act.setStatusTip(
+            "Copy the selected rows with the file and line each came from")
+        copy_act.triggered.connect(lambda: self.view.copy_selection(annotated=True))
         edit_menu.addAction(copy_act)
+
+        copy_plain_act = QAction("Copy &Plain Text", self)
+        copy_plain_act.setShortcut("Ctrl+Shift+C")
+        copy_plain_act.setStatusTip(
+            "Copy the selected rows exactly as they appear in their own files, "
+            "with no timestamp column and no attribution")
+        copy_plain_act.triggered.connect(self.view.copy_selection_plain)
+        edit_menu.addAction(copy_plain_act)
+        self.copy_act, self.copy_plain_act = copy_act, copy_plain_act
 
         view_menu = self.menuBar().addMenu("&View")
         view_menu.addAction(self.sources_dock.toggleViewAction())
@@ -153,8 +246,108 @@ class MainWindow(QMainWindow):
             "Hide the parsed timestamp column when every line already carries "
             "its own; the message then keeps its leading timestamp"
         )
-        self.timestamp_act.toggled.connect(self.view.set_show_timestamp)
+        self.timestamp_act.toggled.connect(self._timestamp_toggled)
         view_menu.addAction(self.timestamp_act)
+
+        self.alias_act = QAction("Source &Alias Column", self)
+        self.alias_act.setCheckable(True)
+        self.alias_act.setChecked(self.view.show_alias)
+        self.alias_act.setStatusTip(
+            "Show each row's source as a short name beside the lanes (FR-29)")
+        self.alias_act.toggled.connect(self._alias_toggled)
+        view_menu.addAction(self.alias_act)
+
+        self.line_no_act = QAction("&Line Number Column", self)
+        self.line_no_act.setCheckable(True)
+        self.line_no_act.setChecked(self.view.show_line_no)
+        self.line_no_act.setStatusTip(
+            "Show each entry's line number within its own file, not its "
+            "position in the merged view")
+        self.line_no_act.toggled.connect(self._line_no_toggled)
+        view_menu.addAction(self.line_no_act)
+
+        view_menu.addSeparator()
+        self._build_zoom_menu(view_menu)
+        view_menu.addSeparator()
+        self._build_lane_menu(view_menu)
+        self._build_highlight_menu(view_menu)
+
+    def _build_zoom_menu(self, view_menu) -> None:
+        """
+        Text size (FR-38), remembered between runs.
+
+        Three shortcuts rather than a dialog, plus Ctrl+wheel in the view: this
+        is something people reach for while reading, often because they have
+        just moved the window to a different monitor.
+        """
+        bigger = QAction("Zoom &In", self)
+        bigger.setShortcuts([QKeySequence.StandardKey.ZoomIn, QKeySequence("Ctrl+=")])
+        bigger.triggered.connect(lambda: self.view.zoom(1))
+        view_menu.addAction(bigger)
+
+        smaller = QAction("Zoom &Out", self)
+        smaller.setShortcut(QKeySequence.StandardKey.ZoomOut)
+        smaller.triggered.connect(lambda: self.view.zoom(-1))
+        view_menu.addAction(smaller)
+
+        reset = QAction("&Reset Text Size", self)
+        reset.setShortcut("Ctrl+0")
+        reset.triggered.connect(self.view.reset_font)
+        view_menu.addAction(reset)
+        self.zoom_in_act, self.zoom_out_act, self.zoom_reset_act = \
+            bigger, smaller, reset
+
+    def _build_lane_menu(self, view_menu) -> None:
+        """
+        FR-28: the lanes are configurable between 4 and 12 pixels.
+
+        Every width in the range, not every other one. Stepping by two left the
+        shipped default of seven unreachable from the menu and nothing ticked,
+        so the menu disagreed with the view the moment the window opened -- and
+        a width restored from the store had the same problem.
+        """
+        menu = view_menu.addMenu("Lane &Width")
+        self.lane_acts = []
+        group = QActionGroup(self)
+        group.setExclusive(True)
+        for px in range(theme.LANE_WIDTH_MIN, theme.LANE_WIDTH_MAX + 1):
+            act = QAction(f"{px} px", self)
+            act.setCheckable(True)
+            act.setChecked(px == self.view.lane_width)
+            act.triggered.connect(lambda _=False, w=px: self._set_lane_width(w))
+            group.addAction(act)
+            menu.addAction(act)
+            self.lane_acts.append(act)
+
+    def _build_highlight_menu(self, view_menu) -> None:
+        """FR-30/FR-31: which shipped rulesets are in force."""
+        menu = view_menu.addMenu("&Highlighting")
+        self.highlight_acts = {}
+        for name in sorted(self.highlight_group.sets):
+            act = QAction(name.capitalize(), self)
+            act.setCheckable(True)
+            act.setChecked(name in self.highlight_group.active)
+            act.setStatusTip(f"Apply the {name} highlight rules")
+            act.toggled.connect(
+                lambda on, n=name: self._toggle_highlight_set(n, on))
+            menu.addAction(act)
+            self.highlight_acts[name] = act
+
+    def _timestamp_toggled(self, on: bool) -> None:
+        self.view.set_show_timestamp(on)
+        settings.write(settings.SHOW_TIMESTAMP, on)
+
+    def _alias_toggled(self, on: bool) -> None:
+        self.view.set_show_alias(on)
+        settings.write(settings.SHOW_ALIAS, on)
+
+    def _line_no_toggled(self, on: bool) -> None:
+        self.view.set_show_line_no(on)
+        settings.write(settings.SHOW_LINE_NO, on)
+
+    def _set_lane_width(self, px: int) -> None:
+        self.view.set_lane_width(px)
+        settings.write(settings.LANE_WIDTH, px)
 
     def _build_status(self) -> None:
         bar = QStatusBar()
@@ -188,6 +381,15 @@ class MainWindow(QMainWindow):
             Qt.DockWidgetArea.LeftDockWidgetArea | Qt.DockWidgetArea.RightDockWidgetArea
         )
         self.source_list = QListWidget()
+        self.source_list.setEditTriggers(
+            QListWidget.EditTrigger.DoubleClicked
+            | QListWidget.EditTrigger.EditKeyPressed
+        )
+        self.source_list.setItemDelegate(AliasDelegate(
+            self.source_list,
+            alias_of=self._alias_of_row,
+            rename=self.rename_source,
+        ))
         self.source_list.itemChanged.connect(self._source_toggled)
         self.sources_dock.setWidget(self.source_list)
         self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, self.sources_dock)
@@ -268,7 +470,7 @@ class MainWindow(QMainWindow):
 
     def _indexing_finished(self, result) -> None:
         self._worker = None
-        self._thread = None
+        self._join_thread()
         self._progress.hide()
         self._cancel_btn.hide()
 
@@ -288,6 +490,31 @@ class MainWindow(QMainWindow):
         queued, self._queued = self._queued, []
         if queued:
             self._begin_indexing(queued)
+
+    def _join_thread(self, timeout_ms: int = 5000) -> None:
+        """
+        Wait for the indexing thread to actually exit, then forget it.
+
+        Dropping the reference is not enough. The `QThread` is a child of this
+        window, so when the window is destroyed Qt destroys the thread too -- and
+        destroying a `QThread` that is still running aborts the process rather
+        than raising. It showed up as an intermittent crash *after* a test run
+        had passed, which is exactly how a user would meet it: a window that
+        crashes as it closes, having done everything right until then.
+
+        The wait is bounded and, in practice, instantaneous: by the time this
+        runs the worker has already returned from `run()`, so `quit()` only has
+        to let an idle event loop notice.
+        """
+        thread, self._thread = self._thread, None
+        if thread is None:
+            return
+        thread.quit()
+        if not thread.wait(timeout_ms):
+            # It did not stop. Saying so is better than either hanging on it or
+            # tearing it down underneath itself.
+            self._status_msg.setText(
+                "indexing did not stop cleanly; the window may close slowly")
 
     def cancel_indexing(self) -> None:
         self._queued.clear()
@@ -395,19 +622,48 @@ class MainWindow(QMainWindow):
             pix = QPixmap(SWATCH, SWATCH)
             pix.fill(QColor(s.colour))
             item.setIcon(pix)
-            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable
+                          | Qt.ItemFlag.ItemIsEditable)
             item.setCheckState(
                 Qt.CheckState.Checked if s.meta.enabled else Qt.CheckState.Unchecked
             )
             item.setData(Qt.ItemDataRole.UserRole, i)
             fmt = s.index.format_name or "no format"
+            custom = "  (renamed)" if s.meta.alias_custom else ""
             item.setToolTip(
                 f"{s.meta.origin or s.alias}\n"
                 f"{s.index.n:,} entries, {fmt}, {s.index.encoding}\n"
-                f"confidence {s.index.confidence:.0%}"
+                f"confidence {s.index.confidence:.0%}\n"
+                f"alias: {s.alias}{custom} -- double-click to rename, "
+                f"clear it to go back to the default"
             )
             self.source_list.addItem(item)
         self.source_list.blockSignals(False)
+
+    def _alias_of_row(self, row: int) -> str:
+        if 0 <= row < len(self.session.sources):
+            return self.session.sources[row].alias
+        return ""
+
+    def rename_source(self, source: int, alias: str) -> None:
+        """
+        FR-29: the alias is user-editable. An empty name restores the default.
+
+        The whole dock is rebuilt afterwards rather than the one row patched,
+        because a rename can change more than the row it happened on: clearing
+        one puts it back under the shortest-unique rule, which may lengthen or
+        shorten every other automatic alias in the set.
+        """
+        if not 0 <= source < len(self.session.sources):
+            return
+        before = self.session.sources[source].alias
+        now = self.session.set_alias(source, alias)
+        if now == before:
+            return
+        self.refresh()
+        self._status_msg.setText(
+            f"{before} renamed to {now}" if alias.strip()
+            else f"alias reset to {now}")
 
     def _source_toggled(self, item: QListWidgetItem) -> None:
         idx = item.data(Qt.ItemDataRole.UserRole)
@@ -453,5 +709,15 @@ class MainWindow(QMainWindow):
         )
 
     def closeEvent(self, event) -> None:  # noqa: N802
+        """
+        Stop indexing before the session goes away.
+
+        The worker shares no object with the session, but it is still writing
+        sidecars for files this window asked about, and a half-written one must
+        not be left behind -- which is why it is cancelled and joined rather
+        than abandoned.
+        """
+        self.cancel_indexing()
+        self._join_thread()
         self.session.close()
         super().closeEvent(event)

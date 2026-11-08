@@ -18,7 +18,15 @@ import pytest
 
 ROOT = Path(__file__).resolve().parent.parent
 PACKAGE = ROOT / "logweave"
-ENGINE_LAYERS = ["source", "index", "merge", "session"]
+ENGINE_LAYERS = ["source", "index", "merge", "session", "highlight"]
+"""
+`highlight` is here although SPEC 1 numbers it with the UI.
+
+The rules decide that a run of text is "error red"; only the view knows what a
+`QColor` is. Keeping the engine side of that line Qt-free is what lets the rule
+engine be tested headlessly, and what will let the same rules drive an HTML
+export (FR-47) without the exporter importing a widget toolkit.
+"""
 FORBIDDEN_ROOTS = {"PySide6", "PyQt6", "PyQt5", "shiboken6"}
 
 

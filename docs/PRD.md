@@ -205,10 +205,10 @@ Priority: **M** = must (v1), **S** = should (v1 if it fits), **C** = could (post
 
 | ID | Pri | Requirement |
 |---|---|---|
-| FR-27 | M | Read-only, virtualised, monospace merged view. Column order, left to right: marks gutter, timestamp, message, **source lanes (slim, right)**, row-minimap, timeline. |
+| FR-27 | M | Read-only, virtualised, monospace merged view. Column order, left to right: marks gutter, original line number (FR-29a), timestamp, message, source alias (FR-29), **source lanes (slim, right)**, row-minimap, timeline. *Amended at M4: the line number moved to the left of the row. It was first built on the right beside the alias, because FR-29 and FR-29a both describe where a row came from, but the alias answers which file while a line number is a coordinate within the row and belongs at the start of it.* |
 | FR-28 | M | **Source lanes:** one narrow (configurable 4–12px) vertical lane per file on the right, each with a stable distinct colour; a row's lane is filled to show its origin. Scales to ~20 files in ~120px. |
 | FR-29 | M | An optional short **source alias** text column. The alias defaults to the shortest unique distinguishing part of the filename and is user-editable. |
-| FR-29a | S | An optional **original line number** column, showing each entry's line position within its own source file (not its merged-view position). Off by default; the underlying value is always available for copy and export (FR-46a). |
+| FR-29a | S | An optional **original line number** gutter on the **left**, before the timestamp, showing each entry's line position within its own source file (not its merged-view position). Right-aligned so the digits line up. Off by default; the underlying value is always available for copy and export (FR-46a). |
 | FR-30 | M | Keyword and regex **syntax highlighting** of lines and spans. Built-in default rules for ERROR/FATAL/CRITICAL/SEVERE, WARN/WARNING, INFO, DEBUG/TRACE, plus exception and stack-trace shapes. |
 | FR-31 | M | Highlight rules are user-editable: pattern (literal or regex), case sensitivity, whole-line vs matched-span styling, foreground / background / bold, priority, enable / disable. Saved per profile and globally. |
 | FR-32 | M | **Row-proportional minimap** (Sublime-style): compressed overview of the whole merged stream showing severity colours, search-hit marks, bookmarks, and the current viewport box. Click and drag to navigate. Drives the scrollbar. |
@@ -218,7 +218,7 @@ Priority: **M** = must (v1), **S** = should (v1 if it fits), **C** = could (post
 | FR-36 | S | Line wrapping, toggleable, with correct virtualised scrolling when enabled. |
 | FR-36a | M | **Horizontal scrolling** of the message column, by scrollbar, keyboard, and shift+wheel, with the timestamp, marks gutter, source lanes and both strips staying frozen in place. Promoted to a must by D17: a raw JSONL record is routinely wider than the window. |
 | FR-37 | S | Bookmarks on rows, navigable, shown in both strips, saved in the profile. |
-| FR-38 | S | Font family and size selection; zoom by keyboard and Ctrl+wheel. |
+| FR-38 | **M** | Font family and size selection; zoom by keyboard and Ctrl+wheel. *Promoted from should to must and partly delivered at M4: size between 6 and 32 point, by Ctrl+wheel and Ctrl+plus / Ctrl+minus / Ctrl+0, remembered between runs. Family selection is not built; the view uses the configured monospace family. A requested weight or slant is honoured only when the face keeps the character advance, because span positions are arithmetic from one glyph width (SPEC §9.3).* |
 | FR-39 | S | A light and a dark theme. |
 | FR-40 | C | Split the view into two independently scrolled panes over the same merged stream. |
 
@@ -232,7 +232,7 @@ Priority: **M** = must (v1), **S** = should (v1 if it fits), **C** = could (post
 | FR-44 | M | Incremental find (literal and regex, case toggle) across the merged stream, with hit count, next / previous, and all hits marked in both strips. |
 | FR-45 | M | **Filter** mode: show only rows matching a predicate — severity set, source-file set, text / regex include and exclude, time window — composable, and reversible without re-indexing. |
 | FR-46 | M | Row selection: click, shift-click range, Ctrl+A. |
-| FR-46a | M | **Copied rows are attributed to their origin: source file and original line number within that file** (S6), e.g. `app.log:1`, `SOA.log:7`. Attribution is on by default. |
+| FR-46a | M | **Copied rows are attributed to their origin: source file and original line number within that file** (S6), e.g. `app.log:1`, `SOA.log:7`. Attribution is on by default, and copying **without** it is a separate command rather than a setting to go and change — Ctrl+C annotated, Ctrl+Shift+C verbatim — because the two are wanted for different things in the same session: one is evidence for a ticket, the other is input for a parser or a search box. The attribution names the *file*, not the alias (FR-46b), so a renamed source is still cited by something a colleague can find. |
 | FR-46b | M | Copy output format is selectable — annotated (default), as-displayed/aligned, message-only, Markdown table, CSV — plus a user-defined template over `{source}`, `{alias}`, `{path}`, `{line}`, `{timestamp}`, `{severity}`, `{message}`. The source name may render as basename (default), alias, or full path. |
 | FR-47 | S | Export the current view (filtered or whole) to text, CSV, or Markdown, using the same attribution and format options as FR-46a/FR-46b. |
 | FR-48 | S | Select a time range directly on the timeline strip to set the time filter. |
@@ -302,22 +302,31 @@ Acceptance criteria, measured on a mid-range 2024-era laptop (NVMe SSD, 8 cores,
 │ File  View  Sources  Filter  Profile  Help                                   │
 ├──────────────────────────────────────────────────────────────────────────────┤
 │ [Follow ●] [Filter: ERROR,WARN ×] [Find: timeout      ] 14/312  ‹ ›   [≡][◫] │
-├─┬────────────────────────┬──────────────────────────────────┬────┬──┬────────┤
-│ │ 14:22:08.113           │ Connection pool exhausted        │█   │  │ ▏      │
-│●│ 14:22:08.117           │ WARN  retry 1/3 scheduled        │ █  │▐█│ ▏      │
-│ │ 14:22:08.120           │ ERROR upstream timeout after 30s │█   │▐█│ ▏      │
-│ │ 14:22:08.120           │   at Gateway.forward(Gw.java:88) │█   │▐█│ ▏      │
-│ │ 14:22:08.204           │ GET /api/v2/order 502 30011      │   █│▐█│▐█  ←now│
-│ │ 14:22:09.001           │ INFO  pool resized 32 → 64       │  █ │▐█│ ▏      │
-│ │                        │                                  │    │▐█│ ▏      │
-│ │                        │                                  │    │  │ ▏      │
-├─┴────────────────────────┴──────────────────────────────────┴────┴──┴────────┤
+├─┬───────┬────────────────┬──────────────────────────────────┬────┬──┬────────┤
+│ │      1│ 14:22:08.113   │ Connection pool exhausted        │█   │  │ ▏      │
+│●│      7│ 14:22:08.117   │ WARN  retry 1/3 scheduled        │ █  │▐█│ ▏      │
+│ │      2│ 14:22:08.120   │ ERROR upstream timeout after 30s │█   │▐█│ ▏      │
+│ │       │                │   at Gateway.forward(Gw.java:88) │█   │▐█│ ▏      │
+│ │  88412│ 14:22:08.204   │ GET /api/v2/order 502 30011      │   █│▐█│▐█  ←now│
+│ │      3│ 14:22:09.001   │ INFO  pool resized 32 → 64       │  █ │▐█│ ▏      │
+│ │       │                │                                  │    │▐█│ ▏      │
+│ │       │                │                                  │    │  │ ▏      │
+├─┴───────┴────────────────┴──────────────────────────────────┴────┴──┴────────┤
 │ gateway.log ▸ YMDHMSdotF · 2.1GB · following   │  6 sources · 41.8M rows     │
 └──────────────────────────────────────────────────────────────────────────────┘
-  ▲       ▲                          ▲                          ▲    ▲     ▲
-  marks   timestamp                  message                 source  mini  time
-  gutter  (format configurable)      (highlighted)            lanes   map   line
+ ▲    ▲           ▲                         ▲                   ▲   ▲     ▲
+marks  line    timestamp                message         source  mini  time
+gutter number  (configurable)           (highlighted)    lanes   map   line
 ```
+
+The **line-number gutter (FR-29a)** and the **source alias column (FR-29)** are
+both off by default and shown here with the line numbers on: the alias sits
+between the message and the lanes, in the room the lanes are drawn in above. The
+line number is on the left, before the timestamp, because it is a coordinate
+within the row rather than an answer to "which file" — the alias and the lanes
+answer that, which is why those two sit together on the right. Everything left of
+the message and everything right of it stays frozen when the message scrolls
+horizontally (FR-36a).
 
 ## 10. Release phases
 

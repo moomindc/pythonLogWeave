@@ -22,6 +22,31 @@ platforms fall back to a proportional font.
 """
 
 FONT_POINT = 10
+"""
+Default text size, and the one the application ships with.
+
+The user's own size is remembered in `ui.settings`; this stays the fallback and
+what "reset" returns to.
+"""
+
+LANE_WIDTH_DEFAULT = 7
+LANE_WIDTH_MIN = 4
+LANE_WIDTH_MAX = 12
+"""
+Source-lane width in pixels, FR-28's configurable 4-12.
+
+Four is the narrowest that still reads as a colour rather than a line; twelve is
+where twenty sources start taking more width than the message can spare.
+"""
+
+LANE_COMPRESS_ABOVE = 20
+LANE_WIDTH_COMPRESSED = 2
+"""
+Beyond this many sources the lanes compress and the alias column becomes the
+primary cue (SPEC 9.2). Twenty lanes at full width is already 160 pixels; at
+forty the gutter would be wider than most of the messages.
+"""
+
 ROW_PADDING = 2
 """Pixels added to the font height for the row pitch. Legibility against density."""
 

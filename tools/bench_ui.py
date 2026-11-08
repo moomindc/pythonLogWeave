@@ -39,11 +39,34 @@ from PySide6.QtCore import QPoint, QRect  # noqa: E402
 from PySide6.QtGui import QFontInfo, QImage  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
+from logweave.highlight import Ruleset  # noqa: E402
 from logweave.session import Session  # noqa: E402
 from logweave.ui.mergedview import MergedLogView  # noqa: E402
 
 BUDGET_MS = 16.0
 FMT = QImage.Format.Format_ARGB32_Premultiplied
+
+
+def synth_traces(path: Path, n: int) -> Path:
+    """
+    A log where nearly every row has styled *spans*, not just a line colour.
+
+    The span path is the one highlighting adds to the frame: each span is a
+    separate `drawText` over text already drawn. A file of exception class
+    names is the realistic worst case -- a Java service in trouble logs
+    thousands of them -- and it is the case that would hide a per-span cost if
+    the benchmark only ever measured lines that match a whole-line rule.
+    """
+    with path.open("w", encoding="utf-8") as fh:
+        for i in range(n):
+            ts = (f"2026-10-04 {14 + i // 3600 % 10:02d}:"
+                  f"{i // 60 % 60:02d}:{i % 60:02d}.{i * 977 % 1000000:06d}")
+            classes = " caused by ".join(
+                f"com.example.svc.Layer{j}TimeoutException"
+                for j in range(1 + i % 6)
+            )
+            fh.write(f"{ts} ERROR request failed: {classes}\n")
+    return path
 
 
 def synth_log(path: Path, n: int, *, long_lines: bool) -> Path:
@@ -85,8 +108,13 @@ def time_ms(fn, n: int) -> float:
     return (time.perf_counter() - t0) / n * 1000
 
 
-def bench_view(session: Session, height: int, n: int = 60) -> dict[str, float]:
+def bench_view(session: Session, height: int, n: int = 60,
+               *, highlight: bool = True) -> dict[str, float]:
     view = MergedLogView(session)
+    if not highlight:
+        # An empty ruleset still goes through `style_of`, so this measures the
+        # rules' cost rather than the cost of the code path that applies them.
+        view.highlights = Ruleset([])
     # Shown, and parked far off-screen. `resize()` on a widget that was never
     # shown does not reach the viewport -- the row count came back identical at
     # every height, which is how this was caught -- so the geometry has to be
@@ -117,7 +145,9 @@ def bench_view(session: Session, height: int, n: int = 60) -> dict[str, float]:
     actual = img.height()
     view.close()
     view.deleteLater()
-    return {"rows": rows, "full": full, "step": step_ms,
+    spans = max((len(view.highlights.style_of(t).spans)
+                 for t in (r.message for r in session.rows(0, 40))), default=0)
+    return {"rows": rows, "full": full, "step": step_ms, "spans": spans,
             "per_row": full / rows * 1000, "viewport": actual,
             # A top-level window cannot exceed the physical screen, so a 2160px
             # request on a 1080p display silently measures a 1080p window.
@@ -149,6 +179,7 @@ def main(argv: list[str] | None = None) -> int:
                                      long_lines=False)),
         ("long lines", synth_log(out / "long.log", args.entries,
                                  long_lines=True)),
+        ("exception spans", synth_traces(out / "traces.log", args.entries)),
     ]
 
     print(f"\n{'case':<24} {'viewport':>9} {'rows':>6} "
@@ -156,6 +187,7 @@ def main(argv: list[str] | None = None) -> int:
     print("-" * 78)
 
     worst_step = 0.0
+    highlight_cost = []
     for label, path in cases:
         session = Session()
         session.add_files([path])
@@ -168,8 +200,23 @@ def main(argv: list[str] | None = None) -> int:
                   f"{r['rows']:>5.0f} {r['full']:>10.2f} ms "
                   f"{r['per_row']:>7.0f} us {r['step']:>9.2f} ms{flag}")
             worst_step = max(worst_step, r["step"])
+
+        # The same frame with the rules removed, so the cost of highlighting is
+        # attributable rather than buried in the total (FR-30 vs NFR-5).
+        on = bench_view(session, 900)
+        off = bench_view(session, 900, highlight=False)
+        highlight_cost.append((label, on, off))
         session.close()
         print()
+
+    print(f"{'highlighting':<24} {'rules on':>10} {'rules off':>10} "
+          f"{'delta':>9} {'spans/row':>10}")
+    print("-" * 68)
+    for label, on, off in highlight_cost:
+        delta = on["full"] - off["full"]
+        print(f"{label:<24} {on['full']:>7.2f} ms {off['full']:>7.2f} ms "
+              f"{delta:>+7.2f} ms {on['spans']:>10.0f}")
+    print()
 
     print(f"budget {BUDGET_MS:.0f} ms a frame (NFR-5).")
     print(f"worst scroll step {worst_step:.2f} ms "

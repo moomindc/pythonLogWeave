@@ -77,6 +77,28 @@ class SeverityRuleset:
     words: dict[int, tuple[str, ...]]
     case_sensitive: bool = False
 
+    def fingerprint(self) -> str:
+        """
+        A digest of the words, for the sidecar header (SPEC 5.4).
+
+        `flags` holds the severity class of every entry, computed with *these*
+        words at index time. Change the words and a cached index silently
+        disagrees with the rules now in force -- a row the user has told the
+        application to call an error still reads as INFO, and no size, mtime or
+        head check can see it, because nothing about the file changed. So the
+        digest travels with the index and a mismatch invalidates it.
+
+        Case sensitivity is in the digest too: the same words matched case
+        sensitively produce different flags.
+        """
+        import hashlib
+
+        parts = [f"{int(level)}:{','.join(sorted(w.upper() for w in words))}"
+                 for level, words in sorted(self.words.items())]
+        parts.append(f"case={int(self.case_sensitive)}")
+        return hashlib.blake2b(";".join(parts).encode("utf-8"),
+                               digest_size=8).hexdigest()
+
     def __post_init__(self) -> None:
         unknown = set(self.words) - set(Severity)
         if unknown:

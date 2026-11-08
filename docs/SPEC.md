@@ -45,41 +45,79 @@ headlessly on Linux CI (NFR-18) and keeps Qt out of worker processes.
 
 ### 1.1 Repository layout
 
+The plan, with **what exists after M4 marked**. Unmarked entries are still
+designed and unbuilt; nothing has been built that is not in this list.
+
 ```
 logweave/
-  __main__.py            CLI launcher: logweave [files...] [--profile P]
+  __main__.py            CLI launcher: logweave [files...] [--profile P]        M3
   source/                layer 1
-    base.py              LogSource ABC, SourceId, SourceMeta
-    file.py  gzip.py  csv.py  jsonl.py  ssh.py
+    base.py              LogSource ABC, SourceId, SourceMeta, SourceIdentity   M1
+    file.py                                                                    M1
+    gzipped.py           .gz decompressed once into the cache (D12)            M1
+    csv.py  jsonl.py  ssh.py
     watcher.py           LocalWatcher (ReadDirectoryChangesW) / PollWatcher
-    winfile.py           CreateFileW wrapper with FILE_SHARE_DELETE (§7.1)
-    encoding.py
+    winfile.py           CreateFileW wrapper with FILE_SHARE_DELETE (§7.1)      M1
+    encoding.py                                                                M1
   index/                 layer 2
-    detect.py            FormatDetector, TimestampFormat registry
-    extract.py           vectorised + scalar timestamp extractors
-    severity.py          vectorised severity scan
-    indexer.py           chunked parallel index build
-    fileindex.py         FileIndex: the memmapped arrays
-    sidecar.py           on-disk cache format, validation, LRU
+    layouts.py           the 15-format catalogue and the layout model          M1
+    detect.py            FormatDetector, TimestampFormat registry              M1
+    extract.py           vectorised + scalar timestamp extractors              M1
+    civil.py             calendar arithmetic, local-zone conversion (§2.2)      M1
+    severity.py          vectorised severity scan                              M1
+    lines.py             line splitting and entry grouping                     M1
+    indexer.py           chunked parallel index build                          M1
+    fileindex.py         FileIndex: the memmapped arrays                       M1
+    sidecar.py           on-disk cache format, validation, LRU                 M2b
+    cached.py            hit / append / miss (§5.4)                            M2b
+    layoutio.py          the proven layout, serialised so an append reuses it  M2b
   merge/                 layer 3
-    mergeindex.py        checkpoints, row_at, time_to_row, row_to_time
-    blockcache.py
+    mergeindex.py        checkpoints, row_at, time_to_row, row_to_time         M2a
+    blockcache.py        -- built inside mergeindex.py, not split out          M2a
     overview.py          strip aggregation
   session/               layer 4
-    session.py  profile.py  filters.py  search.py  bookmarks.py  export.py
+    session.py                                                                 M3
+    prepare.py           cache warming in worker processes (§5.3)              M2b
+    rowformat.py         copy and export formatting, attribution (§11.3)       M3
+    palette.py           severity ramp and source-lane colours                 M3
+    aliasing.py          shortest distinguishing source names (FR-29)          M4
+    profile.py  filters.py  search.py  bookmarks.py  export.py
+  highlight/             layer 5 by number, Qt-free by rule (§1)
+    rules.py             HighlightRule, Ruleset, one-pass compilation          M4
+    builtins.py          the three shipped rulesets (§10.1)                    M4
   ui/                    layer 5
-    app.py  mainwindow.py  logview.py  minimap.py  timeline.py
-    sourcepanel.py  findbar.py  filterbar.py  highlight.py  dialogs.py
-    theme.py  styles.py
-  highlight/
-    rules.py  builtin.py  compiled.py
+    app.py               QApplication entry point                              M3
+    mainwindow.py        drag-and-drop, source dock, menus, status             M3
+    mergedview.py        the merged view -- `logview.py` in the original plan   M3
+    indexing.py          the worker thread that keeps the window answering     M2b
+    settings.py          view preferences, remembered between runs (FR-38)     M4
+    theme.py             fonts, chrome colours, stylesheet                     M3
+    minimap.py  timeline.py  sourcepanel.py  findbar.py  filterbar.py
+    dialogs.py  styles.py
 tests/
-  unit/  integration/  perf/  corpus/
+  conftest.py            corpus fixture and an in-memory LogSource stub        M0
+  test_architecture.py   §1: the engine layers stay Qt-free                    M0
+  test_corpus.py  test_prototypes.py                                           M0
+  unit/                  the shipped engine modules, against ground truth
+  ui/                    the Qt shell; skipped entirely when Qt is absent      M3
+  integration/  perf/
 tools/
-  gen_corpus.py  bench.py  rotate_sim.py
+  gen_corpus.py          corpus and ground-truth generator                     M0
+  bench.py               engine benchmarks and the regression gate             M0
+  bench_ui.py            the paint budget; the one tool that needs Qt          M3
+  make_test_logs.py      realistic logs to try the GUI on                      M3
+  _prototypes.py         M0 kernels, kept as reference rows in the gate        M0
+  rotate_sim.py
 docs/
   PRD.md  SPEC.md  ADR/
 ```
+
+Two deviations from the plan above, both deliberate:
+
+- **`logview.py` is `mergedview.py`.** The name says what it shows rather than
+  what it is, and there is no other log view to distinguish it from.
+- **`blockcache.py` was not split out.** The cache is forty lines and exists
+  only to serve `MergeIndex`; a module boundary there would be ceremony.
 
 ---
 
@@ -854,12 +892,41 @@ shortcut and is not:**
 3. For each row, read its bytes from the source (`mmap` slice — no I/O syscall for
    local files), decode just that entry, and apply the compiled highlight rules
    (§10) to produce styled runs.
-4. Draw: marks gutter, timestamp (pre-formatted via a per-format fast formatter),
-   message runs, then the source lanes.
+4. Draw, left to right: the marks gutter, the line-number gutter (FR-29a),
+   the timestamp (pre-formatted via a per-format fast formatter), the message
+   runs, then the alias column (FR-29) and the source lanes (FR-28).
 
-Per-frame work is bounded by the window size, not the data size. Decoded and styled
-rows are held in a small LRU keyed by `(source_id, entry_index)` so re-paints
-during selection and resize are free.
+**Column order, settled at M4.** The line number goes on the **left**, before
+the timestamp. It was first built on the right beside the alias, because FR-29
+and FR-29a both describe "where a row came from", but they are not the same kind
+of thing: the alias answers *which file*, while the line number is a coordinate
+*within* the row and belongs at the start of it — an editor gutter, `grep -n`, a
+compiler error. Everything left of the message and everything right of it is
+frozen against horizontal scroll either way (FR-36a).
+
+**`paintEvent` must set the painter's font itself.** A `QPainter` constructed on
+a widget does **not** inherit that widget's font; it starts at the application
+default, which on Windows is a 9pt proportional UI face. Without that one call,
+every message is drawn proportionally while every width in `paintEvent` is
+computed from the monospace metrics, and a text-size change moves `_row_h` and
+`_char_w` without changing a glyph. The viewport's font has to be set explicitly
+too: a scroll area's viewport inherits it at construction and then stops, because
+with a style sheet on the window Qt treats the viewport's font as its own and
+ignores later propagation. **This is invisible to the offscreen test backend**,
+which has no font database and renders every glyph 13×13 at any point size, so
+it is asserted by spying on the painter and measured for real in
+`tools/bench_ui.py` (§14.1b).
+
+Per-frame work is bounded by the window size, not the data size. Decoded and
+styled rows are held in a small LRU so re-paints during selection and resize are
+free.
+
+**The style cache is keyed by the row's text, not by `(source_id, entry_index)`
+as planned.** A log repeats itself — the same heartbeat line thousands of times —
+so keying by text makes all its copies share one scan, where keying by identity
+would scan each separately. It also means a style entry can never go stale
+against a re-indexed source, because nothing about the source is part of the
+key.
 
 **Scrolling does not repaint the screen.** `scrollContentsBy` blits the viewport
 and lets Qt damage only the newly exposed band, so `paintEvent` honours
@@ -900,6 +967,28 @@ out to be irrelevant and one guess here was wrong, so, for the record:
   **per-glyph atlas** gets the same saving at a granularity that nothing
   invalidates, because the glyphs for a fixed-pitch font never change. §14.2
   item 4.
+
+M4 added styled spans to pass 3, and the same lesson applied again for the same
+reason (§14.1c):
+
+- **A styled row is segmented, not overdrawn.** Drawing the line and then
+  drawing each span over the top is the obvious implementation, and it cost
+  **4×** what the shipped version costs at six spans a row, because it draws
+  those characters twice and the cost is per glyph. The row is instead cut into
+  runs that cover the visible window exactly once, the per-run pen and font are
+  set only when they change, and the background pass is skipped entirely when no
+  span carries one. Measured at +10.60 → +4.02 → +2.56 ms, in the proportional
+  face the painter was wrongly using at the time (see §9.1); the shipped version
+  re-measures at **+3.09 ms** (§14.1c).
+- Styling is computed **once a row a frame**, before the passes, because pass 1
+  needs the background and pass 3 the foreground. Besides saving the second
+  scan, it makes it impossible for a row to end up with one rule's background
+  under another rule's text.
+- **Bold and italic faces are used only if the character advance is unchanged.**
+  Span positions are arithmetic from one glyph width, so a wider bold face would
+  displace every span after the first by a growing fraction of a character. A
+  family whose bold is wider gets colour and no weight, which is a far better
+  failure than creeping misalignment.
 
 ### 9.4 Opening files (FR-1, FR-19)
 
@@ -993,15 +1082,59 @@ line is scanned once regardless of rule count. `scope="line"` rules style the wh
 row; `scope="match"` rules style only the matched span. Overlaps resolve by
 priority, then by rule order.
 
-**Built-in rulesets, user-extensible (D11, Q2).** Three ship as defaults: a
-severity-word set (ERROR/FATAL/CRITICAL/SEVERE, WARN/WARNING, INFO, DEBUG/TRACE,
-plus exception and stack-trace shapes), a syslog-priority set (`<0>`–`<7>`), and a
-numeric-level set.
+**As built at M4, with one limitation this design accepts.** `finditer` over a
+single alternation returns **non-overlapping** matches, so a span nested inside
+another span cannot both match: whichever alternative matches at the earliest
+position consumes the text, and there is no second pass to recover the inner one.
+Recovering it means scanning twice, which is the cost the one-regex design exists
+to avoid, so the behaviour is asserted in the tests rather than worked around.
+
+That makes *which* alternative wins at a given position the whole of overlap
+resolution. The alternatives are therefore emitted in `(-priority, list order)`
+order at compile time, which is what makes the sentence above true for spans as
+well as for the line-scope winner.
+
+Four further as-built details:
+
+- Per-rule case sensitivity is a **scoped inline flag**, `(?i:...)`, so one
+  pattern carries a mixture of case-sensitive and case-insensitive rules.
+- A rule may ask for a **word boundary** without being a regex. This matters more
+  than it looks: the shipped severity rules need the boundary to stop `DEBUGGER`
+  reading as `DEBUG`, but they must stay *literals* to feed the vectorised
+  index-time classifier (§10.3), which compares fixed byte columns and cannot run
+  a regex. As regexes they painted correctly and left the strips uncoloured.
+- Line-scope rules scan a **bounded prefix** (2048 bytes), and the styled result
+  is memoised by row text — so a 40 000-character JSON record costs no more than
+  an ordinary line, and a repeated line costs one scan between all its copies.
+- Generated group names are prefixed, so a user pattern carrying its own named
+  group cannot collide with the compiler's.
+
+**Built-in rulesets, user-extensible (D11, Q2).** Three ship as defaults. **As
+built at M4 the three are: severity words, exception and stack-trace *shapes*,
+and syslog priorities (`<0>`–`<7>`)** — which is a different cut from the one
+planned above, for two reasons. The shapes were split out of the severity set
+because they are the only `scope="match"` rules among the built-ins: they colour
+the exception class name or a `at com.acme.Gateway(...)` frame *inside* the line,
+where the severity words colour the whole row, and someone who wants one does not
+necessarily want the other. The planned numeric-level set was dropped: a bare
+integer has no reliable meaning across formats, and the syslog set already covers
+the one convention that does.
+
+Severity is on, shapes are on, **syslog is off by default** — `<3>` at the start
+of a line is rare outside a raw capture, and a rule that never fires still costs
+a branch in the one regex every row is scanned with.
 
 Users may add, edit, reorder, disable and delete rules freely, and may point any
-rule at any severity class. Rulesets are importable and exportable as TOML
-fragments so a team can share one. Built-ins are never silently overwritten: a
-user edit to a built-in rule shadows it, and "reset to default" restores it.
+rule at any severity class; a rule the engine cannot compile is reported in
+`Ruleset.rejected` rather than discarded or raised, so one bad pattern in an
+imported set does not take the rest down with it. Built-ins are never silently
+overwritten: a user edit to a built-in rule shadows it (clearing its `builtin`
+flag), while merely *disabling* one does not.
+
+**Still unbuilt after M4**, and both needed before FR-31 is complete: the rule
+editing dialog — the engine supports per-rule editing, the UI exposes only the
+three set switches — and TOML import and export of rulesets, which is what makes
+a team able to share one. Those are M8 with the rest of the settings work.
 
 The eight severity **classes** (§10.2) are fixed, because they are three bits in
 `flags` and their order is what lets `np.maximum` fold severities and the strips
@@ -1159,6 +1292,20 @@ there is exactly one implementation of attribution:
 | `csv` | RFC4180-quoted, one row per entry, same columns |
 | `template` | A user string over `{source} {alias} {path} {line} {timestamp} {severity} {message} {row}` |
 
+**Built at M3 and M4: `annotated` and `plain`.** The other four extend this
+module at M7; the interface is shaped for them now so that attribution has
+exactly one implementation, as this section requires. M4 bound the two to
+separate commands rather than to a preference — **Ctrl+C** annotated, **Ctrl+Shift+C**
+plain — because they are wanted for different things within one session: the
+first is evidence to paste into a ticket, the second is input for a parser, a
+diff, or a search box that would choke on the prefix. A preference would mean
+visiting a dialog between those two acts.
+
+The row cap is on the *selection*, not on the preset, so dropping the
+attribution is not a way around it; it is a refusal rather than a silent
+truncation, because FR-47's export is the right tool for a whole view and it
+streams.
+
 **Rules that fall out of the data model:**
 
 - **Source naming** renders as basename (default, matching `app.log` / `SOA.log`),
@@ -1282,6 +1429,30 @@ survive the file having grown, rotated, or been re-indexed.
 `%APPDATA%\LogWeave\settings.toml` holds the global highlight rules, default
 theme and font, cache cap, poll intervals, default copy format, and recent lists
 (FR-54). A profile may inherit or override.
+
+**As built at M4, the view preferences live in `QSettings`, not in that file.**
+Text size (FR-38), lane width (FR-28), the alias and line-number columns (FR-29,
+FR-29a), the timestamp column and which highlight sets are active persist through
+the platform store — the registry on Windows, a plist on macOS, an ini on Linux.
+`settings.toml` arrives with the profile work at M8 and will hold the things a
+*team* shares, which is a different problem from where one person left a window:
+a TOML file under version control is the wrong place for "this user's font is
+13pt", and the registry is the wrong place for a ruleset a team wants to review
+in a pull request.
+
+Two rules that the store itself cannot enforce, so the reader does:
+
+- **Everything read back is clamped or intersected with what exists.** The store
+  is a registry key or a text file someone may edit, so a font size outside
+  6–32 point is clamped rather than honoured, and a highlight set named in the
+  store but absent from this version is dropped rather than looked up. A
+  preference file must not be able to produce a window that cannot be used to
+  fix itself.
+- **`QSettings` never fails.** It returns whatever is there, or a default, and
+  reports nothing — so a test that touches it is reading and writing the real
+  user's preferences by default. The GUI suite points it at a temporary file per
+  test (§15.2). This is the same class of defect the sidecar cache had at M2b,
+  and harder to notice, because there is no error to miss.
 
 **No secrets, anywhere.** Neither a profile nor the settings file ever contains a
 password or passphrase (NFR-26). Credentials live in the Windows Credential
@@ -1495,6 +1666,38 @@ of long lines) and a concrete target (1.8 µs a glyph). It may not need native
 code at all — blitting from an atlas into the backing store is expressible in
 NumPy.
 
+### 14.1c Measured — M4 result (highlighting in the frame)
+
+`python tools/bench_ui.py`, same machine, font and method as §14.1b, 48 visible
+rows, four runs. The "exception spans" case is a synthetic trace corpus
+averaging six highlighted spans a row.
+
+**Taken after the painter-font defect in §9.1 was fixed.** Everything measured
+during M4 before that point — including the span-cost progression in §9.3 — was
+drawn in a 9pt proportional UI face, not the monospace one, and is not
+comparable with §14.1b or with these.
+
+| Case | Rules off | Rules on | Delta | Verdict |
+|---|---|---|---|---|
+| Full repaint, ordinary lines | 10.85 ms | 10.94 ms | **+0.09 ms** | inside |
+| Full repaint, long lines | 17.63 ms | 18.12 ms | **+0.46 ms** | over, as at M3 |
+| Full repaint, exception spans | 20.09 ms | 23.14 ms | **+3.09 ms** | over |
+| **Scroll step** (worst case) | — | **1.48 ms** | — | **11× under** |
+
+The ordinary-lines delta is inside the run-to-run spread, which was −0.12 ms to
++0.11 ms over the four runs. The claim that holds is "not measurable at this
+resolution", not "+0.09 ms".
+
+**The exception-spans breach is not caused by highlighting.** It was already
+20.1 ms with every rule off, which is §14.1b's residual breach — Qt's raster
+text at ~1.8 µs a glyph on a full repaint of long content — and it dominates the
+3.09 ms the rules add. The conclusion of §14.1b is unchanged and item 4 below is
+still the fix; M4 makes it slightly more urgent without changing its shape.
+
+Getting the span cost there took two changes, described in §9.3, from a starting
+point 4× higher. The headline is the same as M3's: the cost is per glyph, so the
+win came from not drawing any character twice, not from batching calls.
+
 ### 14.2 Remaining performance work
 
 In priority order. Native code stays off the table until these are exhausted (D8).
@@ -1514,7 +1717,9 @@ In priority order. Native code stays off the table until these are exhausted (D8
    repaint of long lines costs 18.5 ms against a 16 ms frame, at ~1.8 µs a glyph,
    and no Qt-level tuning moves it. Scrolling is unaffected, so this is a seek-
    and-resize problem rather than a smoothness one, which is why it sits here and
-   not above item 1.
+   not above item 1. M4 confirmed the diagnosis from the other direction: a
+   span-heavy full repaint is 23.1 ms, of which 20.1 ms is already there with
+   every highlight rule switched off (§14.1c).
 5. Only then: an isolated native accelerator (Rust via PyO3, or Cython) behind a
    feature flag, with the pure-Python path retained as the reference implementation
    and the two cross-checked against the corpus in tests. Items 1 and 4 are the
@@ -1557,7 +1762,7 @@ logmerger's own test fixtures (`tests/log1_ooo_*.txt`, `log0_no_timestamps.txt`,
 | Integration | Open → index → merge → read, headless, no Qt. Append, rotate, truncate via `tools/rotate_sim.py`. Disconnecting a share. Vanishing files |
 | Rotation matrix | Copy-truncate, rename-create, move-to-dated-name, delete-recreate, writer holding an exclusive lock, antivirus-induced sharing violations |
 | Performance | §14, in CI, with regression gates |
-| GUI | Plain `pytest` with a module-scoped `QApplication` fixture, on the offscreen platform, covering the view's row arithmetic, damage regions, selection, keyboard navigation, copy, and drag-and-drop. `pytest-qt` is not used — nothing here needs to wait on a signal or pump an event loop, so it would be a dependency for the sake of it. A small set of screenshot comparisons follows for the strips (M5). Two cautions, both learned the hard way: the offscreen platform has **no fonts**, so it cannot measure text (§14.1b), and a `QDropEvent` holds a **non-owning** pointer to its `QMimeData` — letting that fall out of scope in a test is an access violation that takes the interpreter down rather than an exception |
+| GUI | Plain `pytest` with a module-scoped `QApplication` fixture, on the offscreen platform, covering the view's row arithmetic, damage regions, selection, keyboard navigation, copy, and drag-and-drop. `pytest-qt` is not used — nothing here needs to wait on a signal or pump an event loop, so it would be a dependency for the sake of it. A small set of screenshot comparisons follows for the strips (M5). Four cautions, all learned the hard way. (1) The offscreen platform has **no fonts**, so it cannot measure text (§14.1b) — and it therefore cannot see a *wrong* font either, which is how the §9.1 painter defect survived a green suite; defects of that kind are asserted by spying on the painter, which works on any backend. (2) A `QDropEvent` holds a **non-owning** pointer to its `QMimeData` — letting that fall out of scope in a test is an access violation that takes the interpreter down rather than an exception. (3) `QSettings` must be redirected to a temporary file per test, or the suite reads and writes the real user's preferences (§12.3). (4) A `QThread` parented to a window and destroyed while still running **aborts** the process at interpreter shutdown rather than raising, so the window joins its indexing thread in `closeEvent` and the test fixture joins it too |
 
 CI runs every non-GUI test on both Windows and Linux from the first commit (NFR-18).
 
@@ -1598,11 +1803,11 @@ dependency may be added without an ADR.
 | **M2a** ✅ | `MergeIndex` with checkpoints and a block cache, headless | **NFR-6 measured at 26.6 µs**, merged order matches corpus ground truth row for row, 409× memory saving confirmed (§14.1). **Done.** |
 | **M2b** ✅ | Sidecar cache, parallel indexer, indexing off the UI thread | **NFR-4 met with two orders of magnitude to spare**: a warm reopen is 6.6 ms per file and does not scale with size, so a 10 GB set in 10 files reopens in 0.07 s against a 2.0 s budget (§5.4). Parallel indexing measured at 2.21x on four files, bounded by memory bandwidth rather than scheduling (§5.3). Found three cache bugs that each produced a *correct* index while silently halving or removing the speedup, and one where the test suite was being served by its own previous runs. Within-file chunk parallelism remains unbuilt and is not needed for NFR-5. **Done.** |
 | **M3** ✅ | Qt shell: `MergedLogView`, scrolling, timestamp and message columns, drag-and-drop, source lanes, source dock, copy with attribution | **NFR-5 measured (§14.1b): a scroll step is 0.98 ms, 16× under the frame budget.** First genuinely usable build. Found and fixed an unreachable-last-rows scrollbar bug and an unbounded paint cost on long lines; left one measured breach, a full repaint of long lines at 18.5 ms, with the fix scoped in §14.2 item 4. **Done.** |
-| **M4** | Highlighting, severity classes, source lanes, aliases | FR-28 to FR-31 |
+| **M4** ✅ | Highlighting, severity classes, source lanes, aliases, text size, copy in two modes | **FR-28 to FR-31, FR-38 (size and zoom) and FR-46a met.** Highlighting is not measurable on ordinary lines (within the run-to-run spread) and costs **+3.09 ms** on a synthetic corpus averaging six spans a row, against a worst scroll step of 1.48 ms — 11× under budget (§14.1c). The span-heavy full repaint is over budget at 23.1 ms, but 20.1 ms of that is M3's glyph-cost breach with every rule off, so §14.2 item 4 remains the fix and nothing new is owed. Established that one-pass alternation scanning cannot style nested spans, and documented it as a limitation rather than hiding it (§10.1); found that overlap resolution was ignoring `priority` entirely, that the shipped severity rules were contributing nothing to the index-time classifier, and that overdrawing spans cost 4× what segmenting them does. The `highlight` package is Qt-free and enforced as an engine layer. Two further defects surfaced in use rather than in the suite and are recorded in §9.1: the painter was never handed the view's font, so the merged view drew in the application's proportional UI face and a zoom changed no glyph; and the line-number column had been built on the right instead of the left. **Done.** |
 | **M5** | Both strips (D4) | FR-32 to FR-34; confirms risk R3 is contained |
 | **M6** | Follow engine, rotation matrix green | FR-21 to FR-26, NFR-8, NFR-20. **Retires risk R5** |
 | **M7** | Search, filters, selection, copy, export | FR-41 to FR-48, NFR-9, NFR-10 |
-| **M8** | Profiles, settings, file association, recent lists | FR-49 to FR-54 |
+| **M8** | Profiles, settings, file association, recent lists; the highlight-rule editing dialog and TOML ruleset import/export left over from M4 (§10.1) | FR-49 to FR-54, and FR-31 completed |
 | **M9** | Packaging, signing, cold-start tuning, docs | NFR-12, NFR-19. **v1.0** |
 
 Phase 2 (Event Log) begins with a new `LogSource` implementation and a spill file;
