@@ -160,7 +160,7 @@ def _append(source: LogSource, found: sidecar.Reuse, *, mtime_wall_us: int,
     wrong is not.
     """
     old = found.index
-    detection = _detection_for(old)
+    detection = detection_of(old)
     if detection is None:
         return None
 
@@ -172,7 +172,7 @@ def _append(source: LogSource, found: sidecar.Reuse, *, mtime_wall_us: int,
         start_at=found.resume_at, detection=detection, first_line=first_line,
         **build_kwargs,
     )
-    spliced = _splice(old, tail)
+    spliced = splice(old, tail)
     # The prefix's arrays have been copied into `spliced`, so the mapping of
     # the old sidecar is no longer needed -- and must go, because on Windows an
     # open mapping is what stops the superseded sidecar being pruned.
@@ -206,7 +206,7 @@ def _next_line_number(source: LogSource, index: FileIndex) -> int:
     return int(index.line_no[-1]) + max(1, last.count(b"\n"))
 
 
-def _detection_for(old: FileIndex) -> Detection | None:
+def detection_of(old: FileIndex) -> Detection | None:
     """
     Rebuild the detection the prefix was indexed with (SPEC 5.4).
 
@@ -231,7 +231,7 @@ def _detection_for(old: FileIndex) -> Detection | None:
     )
 
 
-def _splice(old: FileIndex, tail: FileIndex) -> FileIndex:
+def splice(old: FileIndex, tail: FileIndex, *, incremental: bool = False) -> FileIndex:
     """
     Join a mapped prefix and a freshly indexed tail into one index.
 
@@ -280,14 +280,25 @@ def _splice(old: FileIndex, tail: FileIndex) -> FileIndex:
     s.monotonic = bool(ts.size < 2 or np.all(ts[1:] >= ts[:-1]))
     out.order = None if s.monotonic else np.argsort(ts, kind="stable").astype(np.uint64)
 
-    # The overview histogram is rebuilt over the whole index rather than having
-    # the tail's counts added to the prefix's (SPEC 8.1). Adding would be
-    # cheaper and is wrong: a longer span can widen the bucket, and a tail that
-    # starts before `t0` -- which an out-of-order append does -- has no bucket
-    # to be added to. Rebuilding is one vectorised pass over timestamps already
-    # in memory, and it is the path that `invalidate` would otherwise have to
-    # be remembered on.
-    out.hist = Histogram.build(ts, out.severity) if out.n else None
+    # The overview histogram. Reopening a file rebuilds it over the whole
+    # index: one vectorised pass over timestamps already in memory, and it
+    # chooses the finest bucket the span allows.
+    #
+    # `incremental=True` is the follow path, and it extends instead. The two
+    # are not interchangeable, which is why this is a parameter and not a
+    # cleverness: `Histogram.extend` widens the grid and coarsens it in integer
+    # steps when it must, so a histogram grown by a thousand appends can end up
+    # one bucket size coarser than a rebuild would have chosen. That is a fair
+    # price for a follow tick, because rebuilding is O(entries) -- 52 ms on a
+    # 2 M-entry index against 49 us to extend it, measured -- and no price at
+    # all on reopen, where there is one pass either way.
+    if not out.n:
+        out.hist = None
+    elif incremental and old.hist is not None and old.hist.nbuckets:
+        out.hist = old.hist
+        out.hist.extend(np.asarray(tail.ts), tail.severity)
+    else:
+        out.hist = Histogram.build(ts, out.severity)
     return out
 
 

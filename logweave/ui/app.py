@@ -13,6 +13,7 @@ from pathlib import Path
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtWidgets import QApplication
 
+from ..source import poller
 from .mainwindow import MainWindow
 
 
@@ -41,7 +42,15 @@ def main(argv: list[str] | None = None) -> int:
     if paths:
         QTimer.singleShot(0, lambda: window.open_paths(paths))
 
-    return app.exec()
+    try:
+        return app.exec()
+    finally:
+        # The follow poller is a daemon thread, so the process would exit
+        # without it -- but it holds a reference to a callback that reaches
+        # into a window Qt is in the middle of tearing down, and a probe
+        # landing there during shutdown is a crash on the way out of an
+        # otherwise clean run. Stopping it explicitly is two lines.
+        poller.shutdown_default()
 
 
 if __name__ == "__main__":

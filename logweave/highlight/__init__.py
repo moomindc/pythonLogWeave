@@ -14,6 +14,7 @@ from .builtins import (
     SEVERITY_SET,
     SHAPES_SET,
     SYSLOG_SET,
+    USER_SET,
     default_group,
     default_ruleset,
 )
@@ -27,6 +28,7 @@ from .rules import (
     Span,
     Style,
 )
+from .store import dump, load
 
 __all__ = [
     "CACHE_ROWS",
@@ -34,6 +36,7 @@ __all__ = [
     "SEVERITY_SET",
     "SHAPES_SET",
     "SYSLOG_SET",
+    "USER_SET",
     "HighlightRule",
     "RowStyle",
     "Ruleset",
@@ -42,4 +45,6 @@ __all__ = [
     "Style",
     "default_group",
     "default_ruleset",
+    "dump",
+    "load",
 ]

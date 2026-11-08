@@ -102,6 +102,8 @@ class MergedLogView(QAbstractScrollArea):
     """
     copied = Signal(int)
     copyRefused = Signal(int)
+    tailingChanged = Signal(bool)
+    """FR-22: auto-scroll started or stopped following the tail."""
     timestampVisibilityChanged = Signal(bool)
     fontPointChanged = Signal(int)
 
@@ -118,6 +120,18 @@ class MergedLogView(QAbstractScrollArea):
         self._show_line_no = False
         self._lane_width = theme.LANE_WIDTH_DEFAULT
         self._lane_colours: list[QColor] = []
+        self._tailing = False
+        """FR-22: whether a follow append should drag the view to the bottom."""
+        self.verticalScrollBar().valueChanged.connect(self._user_scrolled)
+        self._self_scroll = 0
+        """
+        Depth of auto-scrolls in progress -- see `scroll_to_tail`.
+
+        FR-22 wants scrolling *up* to pause auto-scroll, and the only evidence
+        available is a scrollbar value that moved. Auto-scroll moves it too, so
+        without this counter following the tail would switch itself off on the
+        first append it handled.
+        """
         self._aliases: list[str] = []
         self._alias_w = 0
         self._line_no_w = 0
@@ -477,6 +491,91 @@ class MergedLogView(QAbstractScrollArea):
         self.verticalScrollBar().setValue(row // self._scroll_scale)
         self.viewport().update()
 
+    # ------------------------------------------------------------------
+    # FR-22: following the tail
+    # ------------------------------------------------------------------
+
+    @property
+    def tailing(self) -> bool:
+        return self._tailing
+
+    def set_tailing(self, on: bool, *, scroll: bool = True) -> None:
+        """
+        Start or stop auto-scrolling to the tail.
+
+        Turning it on scrolls there at once, because a user who asks to watch
+        the end of the log means now and not on the next line written -- a quiet
+        log would otherwise leave the request looking ignored.
+        """
+        on = bool(on)
+        if on and scroll:
+            self.scroll_to_tail()
+        if on == self._tailing:
+            return
+        self._tailing = on
+        self.tailingChanged.emit(on)
+
+    def scroll_to_tail(self) -> None:
+        """
+        Put the last row on screen, without moving the cursor.
+
+        **The only scroll that is exempt from FR-22's pause**, and the guard is
+        here rather than on `scroll_to_row` for a reason: pressing Up at the top
+        of the screen, or clicking the minimap, also scrolls programmatically,
+        and those are the user asking to look somewhere else. Exempting every
+        programmatic scroll would make auto-scroll impossible to pause by any
+        means except the scrollbar.
+        """
+        total = self.session.total_rows
+        if not total:
+            return
+        self._self_scroll += 1
+        try:
+            self.scroll_to_row(max(0, total - self.visible_rows()))
+        finally:
+            self._self_scroll -= 1
+
+    def at_tail(self) -> bool:
+        """Whether the last row is already on screen."""
+        total = self.session.total_rows
+        return not total or self.top_row() + self.visible_rows() >= total
+
+    def _user_scrolled(self, value: int) -> None:
+        """
+        A scrollbar move that this widget did not make -- FR-22.
+
+        Scrolling **up** pauses auto-scroll; scrolling back down to the bottom
+        resumes it. Resuming on arrival rather than only on `End` is what makes
+        the pause feel like a pause instead of a mode: dragging the scrollbar to
+        the end is the same gesture as pressing `End`, and a reader who does it
+        is plainly asking to watch the tail again.
+
+        Ingestion is not affected either way. FR-22 is explicit that pausing
+        auto-scroll must not stop lines arriving, which is why this touches
+        nothing but a flag -- the follow engine never consults it.
+        """
+        if self._self_scroll:
+            return
+        if self._tailing and not self.at_tail():
+            self._tailing = False
+            self.tailingChanged.emit(False)
+        elif not self._tailing and self.at_tail() and not self._selecting:
+            self._tailing = True
+            self.tailingChanged.emit(True)
+
+    @property
+    def _selecting(self) -> bool:
+        """
+        Whether a selection spanning more than one row is in hand.
+
+        Resuming auto-scroll is suppressed while one is: Shift+End, and
+        Shift+Down held to the bottom, both land at the tail, and resuming there
+        would let the next append scroll the selection the user is still making
+        off the top of the screen. Pausing on the way up is not suppressed --
+        that is the whole of FR-22 and it has to work during a selection too.
+        """
+        return self._anchor_row != self._current_row
+
     def scroll_to_time(self, wall_us: int) -> None:
         """
         NFR-6. The seek is `time_to_row`, which costs ~27 µs and no block replay,
@@ -604,6 +703,13 @@ class MergedLogView(QAbstractScrollArea):
             self.set_current_row(0, extend=extend)
         elif key == Qt.Key.Key_End:
             self.set_current_row(total - 1, extend=extend)
+            # FR-22 names `End` as the way back to the tail, so it resumes
+            # auto-scroll as well as moving the cursor -- but only on a plain
+            # press. Shift+End is a selection to the end of the log, and
+            # quietly turning following on as a side effect of selecting would
+            # then scroll the view out from under the selection being made.
+            if not extend:
+                self.set_tailing(True)
         else:
             super().keyPressEvent(event)
             return

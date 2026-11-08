@@ -26,11 +26,20 @@ import pytest
 
 from logweave.index.histogram import CLASSES
 from logweave.index.severity import Severity
-from logweave.session import Session
+from logweave.session import Session, palette
+from logweave.session.marks import MarkLayer
 from logweave.session.overview import (
+    MARK_COLUMN_PX,
+    MARK_GUTTER_MAX,
     MIN_MARK_PX,
+    UNCLASSIFIED,
     StripTheme,
+    _rgb,
+    band_widths,
+    mark_gutter,
     overlay_marks,
+    render_density_rgba,
+    render_mark_gutter,
     render_rgba,
     widths_for,
 )
@@ -370,6 +379,76 @@ def test_render_puts_the_palette_colour_where_the_class_is(needle):
     s.close()
 
 
+def test_the_bands_are_drawn_highest_severity_first(needle):
+    """
+    The strip reads left to right as CRITICAL down to NONE -- the fix for a
+    minimap that looked right-justified.
+
+    Drawn in ascending class order, `NONE` takes the left edge (it is most of
+    any real log) and the saturated classes are pushed against the right, at an
+    x that moves with the unclassified share. Reversed, every mark starts at
+    x=0, which is also where `overlay_marks` draws and which way the timeline's
+    bars run.
+    """
+    s = session_over(needle)
+    strip = s.overview.minimap(HEIGHT)
+    buf = render_rgba(strip, WIDTH, fill=True)
+    th = StripTheme()
+    lut = {th.severity[i]: i for i in range(CLASSES)}
+
+    # The pixel row holding the single ERROR has two classes in it, so it is
+    # the row that can show an order at all.
+    mixed = int(np.flatnonzero(strip.counts[:, Severity.ERROR] > 0)[0])
+    seen = [lut[tuple(px)] for px in buf[mixed, :, 0:3]]
+    runs = [c for i, c in enumerate(seen) if i == 0 or c != seen[i - 1]]
+    assert runs == sorted(runs, reverse=True), (
+        f"bands must descend left to right, got {runs}")
+    assert runs[0] == int(Severity.ERROR), "the mark is at the left edge"
+    s.close()
+
+
+def test_every_class_present_starts_at_the_left_edge_in_turn(needle):
+    """
+    A per-pixel statement of the same property, over the whole strip: for every
+    pixel row, the class at x=0 is the highest class in that row -- which is
+    exactly what `Strip.top_severity` reports, so the picture and the tooltip
+    cannot disagree.
+    """
+    s = session_over(needle)
+    strip = s.overview.minimap(HEIGHT)
+    buf = render_rgba(strip, WIDTH, fill=True)
+    th = StripTheme()
+    lut = {th.severity[i]: i for i in range(CLASSES)}
+    top = strip.top_severity()
+    for p in range(strip.height):
+        if top[p] < 0:
+            continue
+        assert lut[tuple(buf[p, 0, 0:3])] == int(top[p])
+    s.close()
+
+
+def test_the_unclassified_band_is_the_one_that_runs_to_the_right_edge(needle):
+    """
+    `NONE` is last now, which is the right band to put against the viewport box
+    and the separator rule: it is the widest and the least informative, so it
+    is the only one that can afford to be overdrawn.
+    """
+    s = session_over(needle)
+    strip = s.overview.minimap(HEIGHT)
+    counts = strip.counts
+    # The needle log is INFO throughout, so INFO is the lowest class present
+    # and therefore the rightmost band.
+    assert int(counts[:, Severity.NONE].sum()) == 0
+    buf = render_rgba(strip, WIDTH, fill=True)
+    th = StripTheme()
+    info = np.array(th.severity[int(Severity.INFO)], dtype=np.uint8)
+    busy = strip.totals > 0
+    assert busy.any()
+    assert np.array_equal(buf[busy, -1, 0:3],
+                          np.tile(info, (int(busy.sum()), 1)))
+    s.close()
+
+
 def test_a_blank_pixel_row_is_pure_background(gapped):
     s = session_over(gapped)
     strip = s.overview.timeline(HEIGHT)
@@ -393,12 +472,86 @@ def test_the_error_mark_reaches_the_pixels(needle):
     s.close()
 
 
-def test_reverse_draws_the_band_from_the_other_edge(needle):
-    s = session_over(needle)
+# ---------------------------------------------------------------------------
+# the two encodings (the strips must not look like each other)
+# ---------------------------------------------------------------------------
+
+def test_the_minimap_fills_the_width_and_the_timeline_does_not(gapped, needle):
+    """
+    The split that stopped the two strips reading as duplicates.
+
+    A row-proportional axis gives every pixel the same number of entries, so a
+    density-scaled bar on the minimap cannot vary -- it was encoding a constant
+    and producing a ragged right edge from rounding. It fills instead, and the
+    timeline keeps the bar, which is the only strip where bar length means
+    anything.
+    """
+    s = session_over(gapped, needle)
+    mini = widths_for(s.overview.minimap(HEIGHT).counts, WIDTH, fill=True)
+    assert set(mini.sum(axis=1).tolist()) == {WIDTH}
+
+    time_bands = band_widths(s.overview.timeline(HEIGHT).totals, WIDTH)
+    assert time_bands.min() == 0, "an idle pixel draws nothing"
+    assert time_bands.max() == WIDTH, "the busiest pixel fills the width"
+    assert len(set(time_bands.tolist())) > 2, "the bar has to actually vary"
+    s.close()
+
+
+def test_the_timeline_is_one_colour_and_left_justified(gapped):
+    """
+    FR-33 as redesigned: quantity per time period, nothing else.
+
+    Severity is not on this strip -- it is on the minimap, which is also the
+    one you scroll with. Two variables competing on one 64-pixel column was
+    what made them indistinguishable.
+    """
+    s = session_over(gapped)
     strip = s.overview.timeline(HEIGHT)
-    normal = render_rgba(strip, WIDTH, reverse=False)
-    flipped = render_rgba(strip, WIDTH, reverse=True)
-    assert np.array_equal(normal, flipped[:, ::-1, :])
+    buf = render_density_rgba(strip, WIDTH)
+    th = StripTheme()
+
+    seen = {tuple(c) for c in np.unique(buf[..., 0:3].reshape(-1, 3), axis=0)}
+    assert seen <= {th.density, th.background}, "the timeline uses two colours"
+
+    busiest = int(np.argmax(strip.totals))
+    assert tuple(buf[busiest, 0, 0:3]) == th.density, "bars start at the left edge"
+    assert tuple(buf[busiest, WIDTH - 1, 0:3]) == th.density
+
+
+def test_the_timeline_bar_is_proportional_to_the_entry_count(tmp_path):
+    """Linear, and against the busiest pixel. Half the entries, half the bar."""
+    rows = [(s, "INFO", f"a {s}") for s in range(0, 100)]
+    rows += [(s, "INFO", f"b {s}") for s in range(3600, 3650)]
+    s = session_over(write_log(tmp_path / "halves.log", rows))
+    strip = s.overview.timeline(4)
+    bands = band_widths(strip.totals, 100)
+    busy = sorted(int(b) for b in bands if b)
+    assert busy[-1] == 100
+    assert 40 <= busy[0] <= 60, f"half the entries should be about half the bar: {busy}"
+    s.close()
+
+
+def test_a_pixel_with_a_handful_of_entries_still_draws(tmp_path):
+    """
+    `BAR_MIN_PX`: a quiet minute has to read as "not much", never as "nothing".
+    Blank means idle on this strip, and that has to stay true.
+    """
+    rows = [(0, "INFO", "lonely")]
+    rows += [(3600 + i // 50, "INFO", f"flood {i}") for i in range(50_000)]
+    s = session_over(write_log(tmp_path / "lopsided.log", rows))
+    strip = s.overview.timeline(HEIGHT)
+    bands = band_widths(strip.totals, WIDTH)
+    assert bands[0] >= 1
+    assert int(strip.totals[0]) == 1
+    s.close()
+
+
+def test_the_minimap_still_carries_severity(needle):
+    """The split moved severity off the timeline; it must not have lost it."""
+    s = session_over(needle)
+    buf = render_rgba(s.overview.minimap(HEIGHT), WIDTH, fill=True)
+    error = np.array(StripTheme().severity[int(Severity.ERROR)], dtype=np.uint8)
+    assert (buf[..., 0:3] == error).all(axis=2).any()
     s.close()
 
 
@@ -443,3 +596,141 @@ def test_overlay_marks_on_an_empty_list_changes_nothing(needle):
     overlay_marks(buf, np.empty(0, dtype=np.int64), (255, 0, 255))
     assert np.array_equal(buf, before)
     s.close()
+
+
+def test_unclassified_entries_recede_rather_than_flood_the_minimap():
+    """
+    Most entries in most logs carry no level word -- an access log has none at
+    all -- so `Severity.NONE` is usually the widest band on the minimap. At the
+    palette's mid grey it floods the strip and leaves the colours that matter
+    as a fringe, and it lands close enough to the timeline's density grey that
+    the two strips start resembling each other again.
+    """
+    th = StripTheme()
+    none = th.severity[int(Severity.NONE)]
+    assert none == UNCLASSIFIED
+    assert sum(none) < sum(th.density), "unclassified must be dimmer than the bars"
+    assert sum(none) > sum(th.background), "but still distinct from idle"
+    assert none != _rgb(palette.SEVERITY_COLOURS[Severity.NONE]), \
+        "the strip overrides the palette here; the row mark still uses it"
+
+
+def test_an_unclassified_pixel_is_still_not_an_idle_one(tmp_path):
+    """
+    The dimming must not go so far that "nothing notable happened" and "nothing
+    happened" become the same pixel. Blank means idle, and only idle.
+    """
+    path = tmp_path / "plain.log"
+    path.write_text("".join(
+        f"2026-10-04 10:00:{i % 60:02d}.000000 served request {i}\n"
+        for i in range(600)), encoding="utf-8")
+    s = session_over(path)
+    strip = s.overview.minimap(HEIGHT)
+    assert int(strip.counts[:, Severity.NONE].sum()) == s.total_rows
+    buf = render_rgba(strip, WIDTH, fill=True)
+    assert not np.array_equal(buf[0, 0, 0:3],
+                              np.array(StripTheme().background, np.uint8))
+    s.close()
+
+
+# ---------------------------------------------------------------------------
+# the user-rule mark gutter (FR-31a, SPEC 8.4)
+# ---------------------------------------------------------------------------
+
+def layer(times, colour="#ff4040", name="r") -> MarkLayer:
+    return MarkLayer(rule=name, colour=colour,
+                     times=np.array(times, dtype=np.int64))
+
+
+def test_nothing_marked_costs_the_strip_nothing():
+    """
+    The ordinary case. A strip with no marked rules must render exactly as it
+    did before the gutter existed, or every pixel test above is measuring
+    something else.
+    """
+    assert mark_gutter((), WIDTH) == 0
+
+
+def test_each_marked_rule_gets_its_own_column():
+    for n in (1, 2, 3):
+        assert mark_gutter([layer([])] * n, WIDTH) == MARK_COLUMN_PX * n
+
+
+def test_the_gutter_cannot_eat_the_map():
+    """
+    A reader who marks eight rules must still have a strip. Past the cap the
+    columns narrow instead of the bands being squeezed out.
+    """
+    wide = mark_gutter([layer([])] * 20, WIDTH)
+    assert wide <= int(WIDTH * MARK_GUTTER_MAX)
+    assert wide >= 1
+
+
+def test_a_mark_is_drawn_in_the_rules_own_colour():
+    edges = np.arange(0, 11, dtype=np.int64) * US
+    buf = render_mark_gutter([layer([3 * US], colour="#ff4040")],
+                             edges, 10, MARK_COLUMN_PX)
+    assert buf.shape == (10, MARK_COLUMN_PX, 4)
+    assert (buf[..., 3] == 255).all()
+    assert np.array_equal(buf[3, 0, 0:3], np.array(_rgb("#ff4040"), np.uint8))
+    assert np.array_equal(buf[3, -1, 0:3], np.array(_rgb("#ff4040"), np.uint8))
+
+
+def test_an_unmarked_pixel_row_of_the_gutter_is_background():
+    edges = np.arange(0, 11, dtype=np.int64) * US
+    buf = render_mark_gutter([layer([3 * US])], edges, 10, MARK_COLUMN_PX)
+    bg = np.array(StripTheme().background, np.uint8)
+    assert np.array_equal(buf[0, 0, 0:3], bg)
+    assert not np.array_equal(buf[3, 0, 0:3], bg)
+
+
+def test_a_rule_with_no_colour_falls_back_rather_than_vanishing():
+    """
+    A rule may set only bold, or only a background the theme cannot show on a
+    strip. An invisible mark is worse than no mark, because the user asked for
+    it and would conclude there were no hits.
+    """
+    edges = np.arange(0, 11, dtype=np.int64) * US
+    buf = render_mark_gutter([layer([3 * US], colour="")], edges, 10,
+                             MARK_COLUMN_PX, fallback=(1, 2, 3))
+    assert np.array_equal(buf[3, 0, 0:3], np.array([1, 2, 3], np.uint8))
+
+
+def test_columns_keep_their_place_so_a_mark_does_not_move():
+    """
+    One column per layer in rule order. A column that moved when an unrelated
+    rule was toggled would be unreadable even with every pixel in it correct.
+    """
+    edges = np.arange(0, 11, dtype=np.int64) * US
+    layers = [layer([1 * US], colour="#ff0000", name="a"),
+              layer([5 * US], colour="#00ff00", name="b")]
+    buf = render_mark_gutter(layers, edges, 10, 2 * MARK_COLUMN_PX)
+    left, right = buf[:, :MARK_COLUMN_PX, 0:3], buf[:, MARK_COLUMN_PX:, 0:3]
+    assert np.array_equal(left[1, 0], np.array(_rgb("#ff0000"), np.uint8))
+    assert np.array_equal(right[5, 0], np.array(_rgb("#00ff00"), np.uint8))
+    # ... and neither has drawn in the other's column.
+    assert np.array_equal(right[1, 0], np.array(StripTheme().background, np.uint8))
+    assert np.array_equal(left[5, 0], np.array(StripTheme().background, np.uint8))
+
+
+def test_a_gutter_too_narrow_to_divide_still_gives_every_layer_something():
+    """
+    Integer split with the remainder to the left, so three layers in four
+    pixels are 2, 1, 1 rather than one layer silently getting nothing and
+    reading as "no hits".
+    """
+    edges = np.arange(0, 11, dtype=np.int64) * US
+    layers = [layer([i * US], colour=c, name=str(i))
+              for i, c in enumerate(("#ff0000", "#00ff00", "#0000ff"))]
+    buf = render_mark_gutter(layers, edges, 10, 4)
+    seen = {tuple(buf[i, :, 0:3].reshape(-1, 3)[j])
+            for i in range(10) for j in range(4)}
+    for colour in ("#ff0000", "#00ff00", "#0000ff"):
+        assert _rgb(colour) in seen, f"{colour} was given no pixels"
+
+
+def test_a_zero_sized_gutter_is_an_empty_buffer_not_an_error():
+    """A strip collapsed to nothing is a shape the window can ask for."""
+    edges = np.arange(0, 11, dtype=np.int64) * US
+    assert render_mark_gutter([layer([1 * US])], edges, 10, 0).size == 0
+    assert render_mark_gutter([layer([1 * US])], edges, 0, 4).size == 0

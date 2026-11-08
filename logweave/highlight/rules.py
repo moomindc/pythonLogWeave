@@ -181,6 +181,30 @@ class HighlightRule:
     edit produces a user rule that shadows one by the same name, and "reset"
     drops the shadow (SPEC 10.1).
     """
+    on_strips: bool = False
+    """
+    Also mark this rule's hits on the overview strips (FR-31a, SPEC 8.4).
+
+    Off by default, and the default is the interesting part. Painting a rule in
+    the view costs one branch of one regex over the ~48 rows on screen. Marking
+    it on a strip is a different kind of question -- *where in the whole file*
+    are the hits -- and the only way to answer it is to scan every row of every
+    source, because a strip covers the entire merged stream.
+
+    So this flag is a cost control, not a display preference, and the cost is
+    measured rather than guessed. `re` has no DFA: an alternation is tried
+    branch by branch at every position, so a scan's throughput falls roughly
+    linearly in the number of branches -- 439 MB/s for one case-sensitive
+    literal, 40.7 MB/s once it is case-insensitive, 6.9 MB/s for three rules in
+    one alternation and 3.8 MB/s for five (SPEC 14.1f). The full default
+    ruleset is thirty branches and scans at 0.39 MB/s, which is most of three
+    minutes on a 64 MB set. A strip that marked *everything* would therefore be
+    unusable, and marking the two or three patterns a reader is actually
+    hunting for is seconds of background work.
+
+    `session.marks` is what does the scanning, per rule rather than per
+    alternation for the reason above.
+    """
 
     @property
     def style(self) -> Style:

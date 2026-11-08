@@ -127,7 +127,12 @@ restarts a worker, it recovers. The causal order is only visible once they are
 interleaved, which is the whole point of the program. Deliberately included:
 six timestamp formats, differing sub-second precision, multi-line stack traces,
 3000-character SQL lines, a UTF-16 file with a BOM, and a rotated pair that has
-to sort back into one stream. `--help` for the options.
+to sort back into one stream. The rate swings over two orders of magnitude and
+twice drops to nothing, so the timeline strip has something to show.
+
+`--tail` turns the same script into a live writer that keeps appending, rotating
+and truncating, which is how to exercise follow mode (M6) by hand. `--help` for
+the options.
 
 This is **not** the test corpus: `tools/gen_corpus.py` writes machine-checkable
 ground truth that the suite asserts against, while these files exist to be
@@ -137,7 +142,7 @@ looked at.
 
 ```bash
 python tools/gen_corpus.py --out tests/corpus     # corpus + ground truth
-python -m pytest                                  # the suite: 744 tests
+python -m pytest                                  # the suite: 1027 tests
 python -m pytest --ignore=tests/ui                # the engine only, no Qt needed
 python -m ruff check .                            # lint
 python tools/bench.py                             # engine kernels
@@ -165,6 +170,7 @@ like logs, one level deep.
 | Ctrl+A | Select all (a copy past 200 000 rows is refused rather than truncated) |
 | Ctrl+T | Hide the timestamp column — see below |
 | Ctrl+M / Ctrl+L | Collapse the minimap / the timeline — see below |
+| Ctrl+F | Follow new lines: watch every open file and keep the view at the end — see below |
 | Ctrl++ / Ctrl+- / Ctrl+0 | Text size, also Ctrl+wheel; remembered between runs |
 | Arrows, PgUp/PgDn, Home/End | Move; hold Shift to extend the selection |
 | Scrollbar at the bottom | Scrolls the message only; the line number, timestamp, alias and lanes stay put |
@@ -172,7 +178,9 @@ like logs, one level deep.
 | View ▸ Line Number Column | Each entry's line number *within its own file*, in a gutter on the left |
 | View ▸ Lane Width | 4–12px per lane |
 | Right edge | Two overview strips: the minimap, then the timeline. Click or drag either to go there — see below |
-| View ▸ Highlighting | Which of the shipped rule sets are in force — see below |
+| Ctrl+, | Settings: text size, columns, strips, and your own highlight rules — see below |
+| View ▸ Highlighting | Which rule sets are in force, plus **Edit Rules** — see below |
+| Right-click a dock row | Follow that one file, or stop — independently of the others |
 | Double-click a dock row | Rename that source; clear the name to go back to the default |
 | File ▸ Clear Index Cache | Delete the saved indexes — see below |
 
@@ -246,14 +254,105 @@ are. It seeks but deliberately does not drive the scrollbar, because a drag
 down the timeline advances through rows at wildly uneven rates and a scrollbar
 that behaved that way would be broken rather than informative.
 
-Both are coloured by severity, and both are drawn from the same counts, so the
-second one costs nothing to keep. **A class with any entries at all is given at
-least two pixels**, taken from the widest quieter class beside it: one ERROR
-among ten thousand INFO lines is a hundredth of a pixel by proportion, and
-finding that one line is the entire reason to look at an overview. Hover either
-strip for the time, the row and what is in that pixel.
+They are drawn from the same counts, so the second one costs nothing to keep,
+but they are deliberately drawn *differently* — when both showed stacked
+severity bands they were hard to tell apart at a glance, which defeats the point
+of having two.
 
-Ctrl+M and Ctrl+L collapse them independently, and the choice is remembered.
+The minimap is a **full-width colour map of severity**: every pixel is a bar
+across the whole strip, divided by what is in it, **drawn worst first from the
+left**. CRITICAL starts at the left edge, then ERROR, then WARNING, down to the
+unclassified traffic that fills out the right.
+
+That order matters, and getting it wrong is what the first version did. Drawn
+the other way — ascending by class — the dim "no level word" band took the left
+edge, which in most real logs is most of the strip, and the colours worth
+scanning for were squeezed against the right at an *x* that shifted from pixel
+row to pixel row as the unclassified share moved. It read as right-justified,
+and you had to follow a ragged edge across sixty-four pixels to see whether
+anything was wrong. Worst-first means a mark is always in the same column, the
+leftmost pixel always agrees with what the tooltip says is the worst thing
+there, and the band that gets clipped by the viewport box is the one that was
+telling you least.
+
+**A class with any entries at all is given at least two pixels**, taken from the
+widest quieter class beside it: one ERROR among ten thousand INFO lines is a
+hundredth of a pixel by proportion, and finding that one line is the entire
+reason to look at an overview.
+
+The timeline is a **left-justified monochrome bar chart of volume**: bar length
+is entries in that slice of time, scaled against the busiest slice, with no
+colour at all. It answers "when was this thing busy", which is a question about
+quantity, and severity on it was competing with the minimap for the same glance.
+
+Hover either strip for the time, the row and what is in that pixel. Ctrl+M and
+Ctrl+L collapse them independently, and the choice is remembered.
+
+**Your own rules can be marked on both strips.** A highlight rule set to
+*view + strips* gets a three-pixel column down the right-hand edge of each strip,
+in its own colour, with a mark at every pixel row holding a hit — so you can see
+where in a whole day's logs your timeouts actually are, and click straight to
+them. The bands are drawn narrower to make room rather than being painted over,
+because the left edge is where the severity colours now live.
+
+It is per rule and off by default, and that is a cost decision rather than a
+tidiness one — see the settings section below.
+
+**Settings (Ctrl+,).** `Edit ▸ Settings` has two tabs. *Appearance* gathers what
+the View menu already had — text size, lane width, which columns show, which
+strips show — in one place; the menu items stay, because a menu is the right
+control for something you flip while reading and a dialog is the right control
+for something you sit down and set up.
+
+*Highlighting* is the second tab and is where the rules live. The three shipped
+sets (severity words, exception and stack-trace shapes, syslog priorities) have a
+switch each. Below them is your own list: **Add** opens a form with the pattern
+(literal or regular expression), match case, whole words only, whether to colour
+the whole line or just the matched text, foreground and background colours, bold,
+italic, and a priority for when two rules want the same text. The form validates
+while you type and will not let you save a rule that cannot compile — a rule you
+could see in the list but that never fired would be the worst of both.
+
+The last field on that form is **where the colour appears**:
+
+- **The log view only** — the default, and free. Painting a rule costs one branch
+  of one regex over the forty-eight rows on screen.
+- **The log view, and mark hits on the minimap and timeline** — answers "where in
+  the whole file", which means reading every byte of every open file. It runs in
+  the background with a progress readout and you keep scrolling while it does.
+
+It is a switch per rule rather than one for the lot because of a measurement.
+Python's `re` has no DFA, so an alternation is tried branch by branch at every
+position and the cost of a scan rises with the number of rules in it: one
+case-insensitive literal runs at **40.7 MB/s**, five rules in one alternation at
+**3.8 MB/s**, and the whole shipped ruleset — thirty branches — at **0.39 MB/s**,
+which is **166 seconds** on a 64 MB set. Marking everything is not a feature
+anybody would wait for. Marking the two or three patterns you are actually
+hunting for is a second and a half. (It is also why the scan runs one rule at a
+time instead of compiling them together, which is 2.2× faster for the same work
+and the exact opposite of the right answer for painting.)
+
+Your rules are remembered between runs, globally rather than per profile: a rule
+for finding timeouts is about you, so opening a colleague's profile should not
+take their colours with it — or lose yours.
+
+**Follow mode (Ctrl+F).** Every open file is watched, appended lines appear in
+the merged view in their correct place, and the view stays at the end. Scroll
+up and auto-scroll pauses — ingestion does not — and the status bar counts what
+has arrived since: press that counter, or `End`, to go back to the tail.
+Scrolling back down to the bottom resumes on its own, except while you are in
+the middle of a selection.
+
+Right-click a source in the dock to follow or unfollow that one file. A file
+being followed has a green dot; one that has gone stale has a ⊘ and turns
+brown — it stays in the list and stays readable, it has just stopped changing.
+
+Rotation and truncation are handled while you watch. A rotated file is frozen
+where it is, renamed `name (rotated)`, and the new file opens beside it keeping
+the original name — both stay in the view, and the whole stream still reads in
+order. A file truncated in place is re-read from the start and the status bar
+says so; its old contents are genuinely gone from the disk, and the one way to
+have kept them would break the writer's own rotation, so it is not done.
 
 **The line-number gutter.** Each entry's line number *within its own file*,
 not its position in the merged view — which is a number about the viewer rather
@@ -314,9 +413,10 @@ living record — updated as each lands.
 | **M2b** | Sidecar cache, parallel indexer, indexing off the UI thread | ✅ **done** |
 | **M4** | Highlighting, severity classes, source lanes, aliases, text size, copy with and without attribution | ✅ **done** |
 | **M5** | Minimap and timeline strips | ✅ **done** |
-| **M6** | Follow engine; rotation matrix green | ⬜ next |
-| **M7** | Search, filters, selection, copy, export | ⬜ |
-| **M8** | Profiles, settings, file association — plus the highlight-rule editor and ruleset import/export that complete FR-31 | ⬜ |
+| **M6** | Follow engine; rotation matrix green | ✅ **done** |
+| **M6a** | Settings screen, the highlight-rule editor, rule marks on both strips | ✅ **done** |
+| **M7** | Search, filters, selection, copy, export | ⬜ next |
+| **M8** | Profiles, file association, recent lists — plus the TOML ruleset import/export still outstanding on FR-31 | ⬜ |
 | **M9** | Packaging, signing, cold-start tuning — **v1.0** | ⬜ |
 
 Then: phase 2 Windows Event Log, phase 3 syslog listener.
@@ -909,6 +1009,358 @@ similarity score against a reference image would have called that noise.
 
 ---
 
+## M6 — what it delivers and what it found
+
+Follow mode. Files that are still being written to keep arriving in the merged
+view, in the right place, while they are rotated, truncated and deleted
+underneath it (FR-21 to FR-26, NFR-8, NFR-20). Risk R5 — rotation handling
+being harder than it looks — is retired.
+
+**Turn it on with Ctrl+F**, or View ▸ Follow New Lines. Scroll up and it pauses
+and counts what you missed; `End` or the counter puts you back on the tail.
+
+To watch it work, leave the generator running in a second terminal:
+
+```bash
+python tools/make_test_logs.py                     # make the files
+python -m logweave C:/temp/logweave-logs           # open them, Ctrl+F
+python tools/make_test_logs.py --tail              # in another terminal
+```
+
+`--tail` appends in bursts, rotates a file every minute, and will truncate one
+in place if asked (`--truncate-every 30`). All three are things rotation
+handling is written against and none can be arranged by hand at the right
+moment.
+
+### A tick is 19 ms against a 200 ms budget
+
+NFR-8 allows 200 ms from a line being written to it being on screen. The budget
+has two halves and both are now measured.
+
+**Noticing** costs one `os.stat` per source, at **12 µs**. Eight sources are
+**134 µs a pass**, which at a 150 ms poll interval is **0.09% of one core**.
+
+**Doing** is the other ~19 ms, and almost all of the work was making each piece
+incremental. Every row below is the incremental cost against the full rebuild it
+replaces, on a 2,003,000-row merge over 8 sources:
+
+| | Rebuild | Incremental | |
+|---|---|---|---|
+| density histogram | 54 ms | **49.7 µs** | **1090× cheaper** |
+| merge checkpoints | 274 ms | **0.72 ms** | **381× cheaper** |
+| checkpoints, writer 30 s behind | 274 ms | **2.3 ms** | 121× cheaper |
+| index splice | — | 13 ms | still O(entries) |
+| strips re-aggregate | — | 3.85 ms | unchanged from M5 |
+
+Both rebuild figures miss FR-21's 200 ms on their own at 10 M rows, which is the
+size at which people actually tail things. The one term that still scales with
+how much log is open is the index splice, and that is now the top of the list in
+SPEC §14.2 rather than a surprise waiting in it.
+
+### The spec wanted four watching mechanisms; one was enough
+
+SPEC §7.4 specified `ReadDirectoryChangesW` for local files, polling for UNC,
+`inotify`/`FSEvents` elsewhere, and a fallback poller — four mechanisms, three
+platform-specific, before a single appended line had ever reached the view. The
+premise was that polling fast enough to meet NFR-8 would cost too much.
+
+At 0.09% of a core it does not. One portable poller at 150 ms meets NFR-8 on
+local files, works on the shares where notifications cannot be trusted anyway,
+and has no Windows-only failure modes. `ReadDirectoryChangesW` is no longer
+planned, and §7.4 now says so with the number attached.
+
+Two details the spec did not have, both of which matter:
+
+- **The probe is `os.stat`, not an open.** `path_identity()` opens the file, and
+  a log held exclusively by its writer refuses that open — so polling it that way
+  would report a live source gone every 150 ms. A stat reads directory metadata
+  and opens nothing, which also makes the watcher structurally incapable of
+  breaking NFR-20.
+- **The watcher does no work.** Its callback records a source id and returns.
+  Everything else happens on the thread that owns the session, because a
+  background thread re-indexing a source the UI is painting from is the one
+  mistake here that corrupts rather than merely delays.
+
+### Rewriting §6.4: one rule produces both paths
+
+The spec described a fast path (append after the last checkpoint) and a slow
+path (rebuild the affected windows) as separate algorithms, plus a two-second
+pending tail buffer to keep ordinary writer lag out of the slow one.
+
+There is only one rule. Let `t` be the earliest appended timestamp; every row
+before the last checkpoint with `cp_ts < t` has a timestamp below `t`, so no
+appended entry can sort before it, and the merge resumes from there. For a
+normal tail that is the last checkpoint — the fast path, arrived at rather than
+special-cased. For a writer whose clock is behind it is further back, and the
+cost rises in proportion to how far out of order it is. Two implementations
+would have meant two copies of the commit rule, and a copy that drifted would
+produce a merge whose order depended on whether you had followed the file or
+reopened it.
+
+The pending buffer is not built and is not wanted: the "slow path" it existed to
+avoid costs 2.3 ms, so holding every line back by two seconds would trade a
+measured millisecond for a visible delay on every line.
+
+### Four bugs found by building it, each of which looked fine
+
+**The rotation that was read as an append.** SPEC §7.2's table lists "size grew"
+and "the path resolves to a different file" as separate rows, and
+`detect_change` tested them in the order written. A writer that appends its last
+lines and *then* rotates satisfies both in the same poll — so the rotation was
+never noticed, and for a `copytruncate`-style writer, whose old handle keeps
+growing, never noticed at all. The path is now checked before the size, which
+loses nothing because a rotation's prescribed action is to read the open handle
+to EOF first anyway.
+
+**The half-written line that came back as two rows.** §7.3's partial-line rule
+was half-honoured: the line splitter never opens an entry on an unterminated
+line, but `build_index` records its extent as the size it was given. So a file
+ending mid-line indexes 103 bytes of which 32 are half a line, the last entry's
+range swallows the fragment, and when the writer finishes the line its
+*remainder* becomes an entry of its own. The row appears twice — once stuck to
+its predecessor, once as its own tail. `index/appending.py` now finds the last
+terminator and stops there; the leftover bytes stay in the file and are read on
+the next tick.
+
+**The follow that worked except that no row ever appeared.** An append produces
+a *new* `FileIndex` — the arrays are concatenated — and assigning it to the
+session's source left the merge still reading the old object. Everything
+reported success: the tick ran, the index grew, the engine said it had added
+five rows, and the view showed exactly what it had before. `Session.replace_index`
+moves both references together.
+
+**The earliest appended entry, read from the wrong array.** The appended entries
+are entry indices `[seen, n)`, which is a slice of the index's raw timestamps
+but *not* of the merge's sorted view. In a file that was not time-ordered, a
+backdated append shifts every sorted position after it, so reading the tail of
+the sorted array reports a timestamp far too high — and the merge resumes long
+after the point the new entry belonged. Only visible on an out-of-order file,
+and silently wrong on exactly the files that need it most.
+
+### NFR-20, measured in both directions
+
+"Never prevent rotation of a log file" is the kind of requirement that is easy
+to believe you have met. The measurements:
+
+| Operation by the writer | With our mapping held | Unmapped |
+|---|---|---|
+| append | works | works |
+| rename away | works | works |
+| delete | works | works |
+| `ReplaceFileW` over the path | works | works |
+| truncating reopen (`open(path, "w")`) | **fails** | works |
+| `MoveFileEx` replace over the path | fails | fails |
+
+The truncating reopen is what `logging.FileHandler(mode="w")` does when an
+application restarts, and Windows refuses it against a mapped file with
+ERROR_USER_MAPPED_FILE. A source held mapped while being followed therefore
+makes its own writer's rotation fail. So a followed source **gives up its
+mapping**: reads become positional, a 60-row paint goes from 43 µs to 660 µs —
+15× worse, and still 4% of a 16 ms frame. The mapping is kept for the initial
+index, which is the pass that actually reads the whole file.
+
+The last row is not ours. `MoveFileEx` with `MOVEFILE_REPLACE_EXISTING` fails
+against a destination held open by *any* reader — a plain `open(path, "rb")`
+blocks it identically, and the test asserts that side by side with ours.
+`ReplaceFileW` is the API Windows provides for that swap and it succeeds.
+
+### What FR-23 can and cannot have
+
+"Rotation and truncation handled without losing already-read history":
+
+- **Rotation** — complete. The renamed file still exists and our handle still
+  serves it, so the old source is frozen, stays fully readable, and the path's
+  new occupant opens beside it as a separate source. Both are renamed outright
+  (`svc (rotated)` and `svc`) because they share an origin path and the
+  shortest-unique alias rule would otherwise produce `svc` and `svc~2`, leaving
+  you to guess which was yesterday's.
+- **Deletion** — complete. Same handle, same bytes, only the name is gone. The
+  source is marked stale, keeps everything it had, and stops being polled.
+- **Truncation in place** — **not achievable, and not faked.** The bytes are
+  gone from the disk. There is one accidental way to keep them — a live `mmap`
+  keeps truncated pages readable — and taking it means holding the mapping that
+  breaks the writer, per the table above. Breaking a writer to keep a scrollback
+  is the wrong trade. The source is re-read from zero into a new generation and
+  the status bar says what happened.
+
+### The follow tests never sleep
+
+A suite that waits on a 150 ms interval is slow when it passes and intermittent
+when it fails, which is the worst available combination for the one feature
+whose job is to happen on its own. So `tests/unit/test_follow.py` owns a
+`Poller` with an hour-long interval and steps it with `poll_once`, and
+`MainWindow` takes a poller as a constructor argument so the GUI tests do the
+same. Every assertion is about what the engine did, not about whether enough
+time had passed.
+
+The standard of correctness throughout is **a cold session over the same
+bytes**: a file that was tailed and a file opened afterwards must give identical
+rows, identical line numbers and identical histograms. Anything less means the
+log you read depends on when you opened it.
+
+## M6a — what it delivers and what it found
+
+A settings screen, the highlight-rule editor that FR-31 has been owed since M4,
+and the one thing the rules could not previously say: **where** a colour should
+appear. Brought forward from M8 because it started with a question about the
+minimap that turned out to have a real defect behind it.
+
+**Edit ▸ Settings (Ctrl+,)** — *Appearance* gathers the View menu's preferences,
+*Highlighting* owns the rule sets and your own rules. **View ▸ Highlighting ▸
+Edit Rules** goes straight to the second tab.
+
+### The minimap really was right-justified
+
+The severity bands were drawn in ascending class order, 0 to 7. Class 0 is "no
+level word on this line", which in most real logs is most of the lines, and it
+is deliberately dimmed to just above the background so it reads as ordinary
+traffic. Drawn first, it took the left edge; WARNING, ERROR and CRITICAL were
+pushed out against the right, at an *x* that moved from pixel row to pixel row
+as the unclassified share moved.
+
+So the strip was a wide dark band with the only colours worth looking for as a
+fringe along the far edge, and finding them meant following a ragged boundary
+across sixty-four pixels. Every pixel was correct and the picture was close to
+useless.
+
+The bands now descend from the left, and three things fall out of that:
+
+- a mark is always in the same column, so scanning for errors is reading one
+  column rather than tracking an edge;
+- `top_severity` — which is what the tooltip reports — is now by construction
+  the class at `x=0`, so the picture and the words cannot disagree;
+- the band that gets overdrawn by the viewport box and the separator rule is the
+  widest and least informative one, instead of the most important one.
+
+Nothing about the proportions changed. Only the order they are laid down in.
+
+### Which made the overlay plan wrong
+
+`overlay_marks` had been written at M5 with a sentence of justification: marks go
+at the left edge, over whatever is beneath, *because a hit hidden by a dense band
+is a hit the user cannot find*. That was right while the left edge was the dim
+unclassified band. It is wrong now that the left edge is where CRITICAL and ERROR
+live — a user's rule drawn there would hide one thing a reader is scanning for in
+order to show another.
+
+So a marked rule gets a **reserved column on the right**, three pixels wide, and
+the bands are rendered that much narrower rather than painted over: a marked rule
+costs the map three pixels of width instead of three pixels of information. The
+gutter is capped at a third of the strip, past which the columns narrow instead —
+degrading the thing that was added rather than the thing it was added to.
+
+### `re` has no DFA, and SPEC §10.1 quietly assumed otherwise
+
+§10.1's design is one named group per rule in a **single alternation**, so that
+"a line is scanned once however many rules there are". For painting that is
+right, and M4 measured highlighting as not detectable on ordinary lines.
+
+What it implies — that rule count is free — is not true. Python's `re` is a
+backtracking engine with no DFA, so an alternation is tried branch by branch at
+every position. Measured on the shipped corpus:
+
+| Pattern | Throughput | 64 MB set |
+|---|---|---|
+| one case-sensitive literal | **439 MB/s** | 0.1 s |
+| one case-insensitive literal | **40.7 MB/s** | 1.6 s |
+| three rules, one alternation | 6.9 MB/s | 9.3 s |
+| five rules, one alternation | 3.8 MB/s | 16.6 s |
+| **five rules, five separate passes** | **8.6 MB/s** | 7.4 s |
+| the full shipped ruleset (30 branches) | **0.39 MB/s** | **166 s** |
+
+The absolute numbers move 20–30% between runs on a laptop under thermal load —
+the harness says so in its own header — so it is the ratios that matter, and
+those are stable. At forty-eight visible rows of a hundred and twenty
+characters, none of this is detectable. Over every byte of every open file, the
+last row is most of three minutes. Two decisions come straight off the table:
+
+- **The scan runs one rule at a time**, which is 2.2× faster than compiling them
+  together and scales predictably instead of falling off a cliff. That is the
+  exact opposite of the right answer for painting, and both arrangements now
+  exist in the codebase for the measured reason rather than by habit.
+- **Marking is opt-in per rule.** The flag reads like a display preference and is
+  really a cost control. Nobody waits three minutes for an overview, and nobody
+  needs to: marking the two or three patterns you are hunting for is a second and
+  a half.
+
+A third thing worth knowing and not worth acting on: one literal loses 11× to
+case-insensitivity, because `re`'s fast substring path goes with it. A rule that
+has to match `Timeout` and `timeout` is the normal case, and 40.7 MB/s is well
+inside what a background job absorbs.
+
+### The scan sees more than the view, on purpose
+
+A `MarkLayer` is a sorted array of merged timestamps — not rows, because a row
+number moves when a source is toggled or a followed file appends in the middle,
+and a wall time does not. Both strips already work in merged time, so drawing a
+layer is two `searchsorted`s per strip and costs the same whether ten thousand
+rows are open or ten million.
+
+It scans raw bytes, because the index addresses bytes: a match offset goes
+straight into `searchsorted(off, …)` to find its entry, and there is no loop over
+entries and no decode anywhere in it. Three deliberate differences from what the
+view does:
+
+| | The view | The scan |
+|---|---|---|
+| how much of an entry | the first physical line | all of it |
+| what `^` anchors to | the start of what is drawn | a line of the file |
+| matches past 2048 bytes in | not scanned | not marked either |
+
+The first two are the useful way round. A collapsed row draws one line, so the
+view cannot colour an `OutOfMemoryError` on the fourth line of a stack trace —
+and telling you that entry is there is the whole job of a strip. And in the view
+`^` anchors to the start of what is being drawn, which *moves* when the timestamp
+column trims a duplicate; a mark whose position depended on a column being shown
+would be a mark nobody could trust. The third goes the other way deliberately: a
+strip pointing at rows the view then draws plain would be worse than no strip.
+
+A UTF-16 source is **reported rather than scanned**. Its bytes are not a
+byte-oriented encoding of the pattern, and scanning them anyway would find
+nothing while looking as though it had looked. This is the only place in the
+engine that has ever had to care — everything else treats a file as bytes and
+decodes on demand.
+
+### Four defects, each of which looked fine
+
+**A rule you switched off came back on.** The rule store omits any field at its
+default, which keeps the JSON small and lets a later version change a default
+without every old rule pinning the previous one. The first version omitted
+anything *falsy* instead — and `enabled` is the one field here whose default is
+`True`, so `enabled: false` was written as nothing at all and read back as `true`.
+Switch a rule off, restart, and it is on again, with the tick in the list
+agreeing with the file and both disagreeing with what you did.
+
+**The lane-width menu could never be put back in step.** The settings dialog has
+to re-tick the View menu after Apply, since the two are doors to one state. The
+lane-width actions carried no width — the handler closed over it instead — so the
+sync compared `None` to a number for all nine of them and silently did nothing.
+The same bug class SPEC §9.1 already records twice from M5.
+
+**A hit on the very last row was dropped.** A strip's pixel edges are
+`linspace(first, last, H + 1)`, so the final edge sits exactly *on* the last
+entry's timestamp and a half-open range excludes it. §8.2 has a paragraph about
+this exact off-by-one, written when `_aggregate` reported 6,996 of 7,000 rows and
+looked right; the mark layer reproduced it independently a milestone later. One
+missing mark in thousands is indistinguishable from a correct strip, which is why
+there is now a test that puts the needle in the last row on purpose.
+
+**The rule form's advice only appeared after an unrelated keystroke.** Two of its
+warnings are about fields that cannot make a rule invalid — that a regex cannot
+set a severity class (SPEC §10.3: the index-time classifier compares fixed byte
+columns and has no way to run one), and that marking scans every open file. Those
+two controls were not wired to the revalidation, so picking a severity showed
+nothing until you also touched the name or the pattern.
+
+### The tests open no modal dialogs
+
+`RuleDialog` and `QColorDialog` both block until dismissed, so a test that
+clicked **Add** would hang rather than fail — the same category of problem as a
+follow test that sleeps, and the same answer. `HighlightPage` exposes `add_rule`
+and `replace_rule` beside the `add`/`edit_selected` that the buttons call, and
+`ColourButton.set_colour` is the API rather than its click handler. Every
+assertion is about what the dialog settled, never about a dialog being dismissed.
+
 ## Layout
 
 ```
@@ -921,6 +1373,7 @@ logweave/
     winfile.py       CreateFileW with FILE_SHARE_DELETE; the SPEC 7.1.1 ladder
     encoding.py      BOM / UTF-16 / UTF-8 / ANSI detection, decode on demand
     file.py          local and UNC files, mmap or buffered
+    poller.py        one stat-polling thread for every file being followed
     gzipped.py       .gz decompressed once into the cache (D12)
   index/       layer 2: bytes to timestamps, headless and Qt-free
     layouts.py       the 15-format catalogue and the layout model
@@ -935,6 +1388,7 @@ logweave/
     sidecar.py       the on-disk index cache: format, validation, LRU sweep
     cached.py        hit / append / miss -- indexing only what is not cached
     layoutio.py      the proven layout, serialised so an append can reuse it
+    appending.py     indexing an appended region, without splitting its last line
   merge/       layer 3: k-way merge over the indexes, Qt-free
     mergeindex.py    checkpointed cursors, block cache, random access by row
   session/     layer 4: what the UI asks for, still Qt-free
@@ -944,20 +1398,27 @@ logweave/
     palette.py       severity ramp and source-lane colours
     overview.py      the two strips as data, rendered to pixels without Qt
     aliasing.py      shortest distinguishing source names, for the column and copy
+    follow.py        the follow engine: append, rotate, truncate, go stale
+    marks.py         where a marked rule's hits are, as merged timestamps
   highlight/   layer 5 by number, Qt-free by rule: the rules, not the colours
     rules.py         HighlightRule, Ruleset, the one-pass compiled scanner
-    builtins.py      the three shipped rulesets: severity, shapes, syslog
+    builtins.py      the shipped rulesets: severity, shapes, syslog, and yours
+    store.py         your rules as text, read back without trusting a byte
   ui/          layer 5: the only layer allowed to import Qt
     mergedview.py    QAbstractScrollArea, custom paint, int64 row space
     strips.py        the minimap and timeline widgets: one blit and the mouse
     mainwindow.py    drag-and-drop, source dock, menus, status reporting
     indexing.py      the worker thread that keeps the window answering
+    followui.py      the thread hop, and the "N new lines below" counter
     settings.py      the view preferences that outlive the window
+    settingsdialog.py  the settings window: appearance, and the rule list
+    ruledialog.py    one rule's form, validated while you type
+    markscan.py      the mark scan on a worker thread, superseded not queued
     theme.py         fonts, chrome colours, stylesheet
     app.py           QApplication entry point
 tools/
   gen_corpus.py      corpus + ground truth generator, with ground truth
-  make_test_logs.py  realistic logs to try the GUI on, written to C:/temp
+  make_test_logs.py  realistic logs to try the GUI on; --tail keeps writing them
   bench.py           benchmark harness and regression gate (no Qt, by test)
   bench_ui.py        the paint budget; the one tool that needs Qt
   _prototypes.py     M0 kernels kept only as reference rows in the gate

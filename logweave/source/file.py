@@ -53,12 +53,13 @@ from collections.abc import Callable
 from pathlib import Path
 
 from . import encoding as enc
-from . import winfile
+from . import poller, winfile
 from .base import (
     HEAD_SAMPLE,
     ChangeEvent,
     ChangeKind,
     LogSource,
+    OpenMethod,
     OpenReport,
     SourceError,
     SourceId,
@@ -115,6 +116,8 @@ class FileSource(LogSource):
         self._fd: int | None = None
         self._map: mmap.mmap | None = None
         self._extent = 0
+        self._poller: poller.Poller | None = None
+        """Set by ``use_poller``; otherwise ``watch`` takes the shared default."""
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -196,6 +199,33 @@ class FileSource(LogSource):
         if self._map is not None:
             self._map.close()
         self._map = new_map
+
+    def unmap(self) -> None:
+        """
+        Give up the mapping and read positionally from here on -- NFR-20.
+
+        **Measured, not theoretical.** The module docstring records that Windows
+        refuses a truncate-on-open (``CREATE_ALWAYS``) against a file with a
+        live mapping, with ERROR_USER_MAPPED_FILE. That is what
+        ``logging.FileHandler(mode="w")`` does when an application restarts, and
+        what ``open(path, "w")`` does from a script -- so a source held mapped
+        while being followed makes its writer's own log rotation fail. NFR-20
+        says watching must never do that, and it is not a trade: breaking the
+        writer is worse than any amount of our own slowness.
+
+        The slowness is small. A 60-row paint over a 200 k-line file measured
+        **43 us mapped against 660 us positional** -- 15x worse per read, and
+        still 4% of a 16ms frame (NFR-5). Everything bulk reads in chunks, not
+        rows, so one syscall covers a megabyte there.
+
+        Called when following starts, which is after the first index has been
+        built, so the expensive pass over the whole file still gets the mapping.
+        Idempotent, and harmless on a UNC source that never had one.
+        """
+        self._use_mmap = False
+        if self._map is not None:
+            self._map.close()
+            self._map = None
 
     def size(self) -> int:
         """Current extent in bytes. Costs one ``fstat`` and may grow between calls."""
@@ -340,6 +370,24 @@ class FileSource(LogSource):
         now = self.identity()
         if not now.same_file(previous):
             return ChangeKind.ROTATED
+
+        # **The path is checked before the size, and that ordering is the fix
+        # for a real bug.** SPEC 7.2's table lists "size grew" and "the path
+        # resolves to a different file" as separate rows, and both can be true
+        # of the same poll: a writer that appends its last lines and then
+        # rotates does exactly that. Returning APPENDED on the size and never
+        # looking at the path meant a rotation went unnoticed for as long as the
+        # old file was still growing -- which, for copytruncate, is forever.
+        #
+        # Nothing is lost by preferring the rotation, because the prescribed
+        # action for one is to read the open handle to EOF first (SPEC 7.2), and
+        # `FollowEngine._rotate` does that before freezing the source.
+        at_path = self.path_identity()
+        if at_path is None:
+            return ChangeKind.VANISHED
+        if not at_path.same_file(now):
+            return ChangeKind.ROTATED
+
         if now.size < previous.size:
             return ChangeKind.TRUNCATED
         if previous.head_len and previous.rewritten_given(
@@ -348,16 +396,43 @@ class FileSource(LogSource):
             return ChangeKind.TRUNCATED          # same inode, rewritten in place
         if now.size > previous.size:
             return ChangeKind.APPENDED
-        at_path = self.path_identity()
-        if at_path is None:
-            return ChangeKind.VANISHED
-        if not at_path.same_file(now):
-            return ChangeKind.ROTATED
         return ChangeKind.UNCHANGED
 
+    def use_poller(self, p: poller.Poller) -> None:
+        """
+        Watch through this poller rather than the shared default.
+
+        How a test drives following deterministically: a poller it owns can be
+        stepped with ``poll_once`` instead of slept on, so a follow test asserts
+        on what came out rather than on whether 250ms was long enough. The
+        follow engine also sets it, so one session's sources share one thread
+        even when several sessions are open.
+        """
+        self._poller = p
+
     def watch(self, on_change: Callable[[ChangeEvent], None]) -> Watcher | None:
-        """Following arrives in M6 (SPEC 7.4); until then the source is static."""
-        return None
+        """
+        Follow the file, calling ``on_change`` **on the poller's thread** (M6).
+
+        Watching is registered against the **path**, not this source's handle,
+        which is what lets a rotation be noticed at all: the handle keeps
+        serving the old file quite happily after the name has been given to a
+        new one (SPEC 7.2), so a watcher that only looked at the descriptor
+        would report "unchanged" forever.
+
+        ``None`` is returned for a source that cannot grow -- a VSS snapshot
+        (SPEC 7.1.1 rung 4) is a frozen point in time, and following it would
+        poll a path whose content is fixed and tell the user it was live.
+        """
+        if self._poller is None:
+            self._poller = poller.default_poller()
+        if self.report is not None and self.report.method is OpenMethod.VSS_SNAPSHOT:
+            return None
+        # Before the first event, not after: a mapping held even briefly while
+        # the writer restarts is enough to fail its truncating reopen. See
+        # ``unmap`` for the measurement.
+        self.unmap()
+        return self._poller.add(self.id, self.path, on_change)
 
     def __repr__(self) -> str:
         return f"FileSource({str(self.path)!r}, open={self.is_open}, size={self._extent})"

@@ -37,6 +37,10 @@ least once during development:
 * **A UTF-16 file with a BOM**, which Windows tools produce constantly.
 * **A rotated pair** (`gateway.log` and `gateway.1.log`), to see two halves of
   one stream sort back together.
+* **Dead periods and bursts.** The rate varies by over two orders of magnitude
+  across the window and twice drops to exactly nothing, so the timeline strip
+  (FR-33) has something to show and the minimap has something to differ from.
+  See `ACTIVITY`.
 """
 
 from __future__ import annotations
@@ -44,6 +48,7 @@ from __future__ import annotations
 import argparse
 import random
 import sys
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -72,11 +77,75 @@ def phase(frac: float) -> str:
     return "recovered"
 
 
+ACTIVITY: list[tuple[float, float, float]] = [
+    # (from, to, relative rate).  Fractions of the window, in order, covering
+    # it exactly once.
+    (0.00, 0.08, 1.0),     # ordinary background traffic
+    (0.08, 0.20, 0.0),     # DEAD: nothing is logged at all
+    (0.20, 0.26, 6.0),     # a batch job wakes up and hammers for a few minutes
+    (0.26, 0.33, 0.15),    # barely a trickle
+    (0.33, 0.40, 0.0),     # DEAD again, and longer
+    (0.40, SATURATED, 1.4),   # traffic builds as the incident starts
+    (SATURATED, FAILING, 9.0),   # saturation: everything retries at once
+    (FAILING, RESTART, 14.0),    # failing: the loudest the system ever gets
+    (RESTART, 0.86, 0.05),       # the restart itself -- near silence
+    (0.86, 0.94, 2.5),           # recovery chatter, backlog draining
+    (0.94, 1.00, 1.0),           # back to background
+]
+"""
+How busy the window is, minute by minute (and the reason it is not uniform).
+
+Entries used to be spread evenly across the window, which made every test log
+look the same at a glance: a flat wall of text, and -- once the overview strips
+arrived at M5 -- a flat timeline with nothing to see. Real logs are nothing
+like that. They have hours where nothing happens, a batch job that produces a
+day's volume in ninety seconds, and an incident that logs more in two minutes
+than the whole quiet morning.
+
+So the rate varies by more than two orders of magnitude across the window, and
+**two bands are exactly zero**. The dead bands are global, applied to every
+file: a gap only reads as a gap in the merged view if nothing at all is in it,
+and one source quietly heartbeating through would fill it in.
+
+This is what makes the timeline strip (FR-33) worth looking at, and it is also
+the shape that finds bugs -- an idle gap inside a single checkpoint block is
+what caught the minimap's row-to-time interpolation at M5.
+"""
+
+GRID = 4096
+"""
+Sub-intervals the activity profile is sampled on.
+
+Fine enough that a band boundary lands within a fraction of a second of where
+`ACTIVITY` puts it, coarse enough that building the CDF is free.
+"""
+
+
 class Clock:
     """Hands out timestamps across the window, in order, with jitter."""
 
     def __init__(self, start: datetime, span: timedelta, rng: random.Random):
         self.start, self.span, self.rng = start, span, rng
+        self._cdf = self._build_cdf()
+
+    @staticmethod
+    def _build_cdf() -> list[tuple[float, float]]:
+        """
+        `(cumulative weight, fraction)` pairs, for sampling by inverse CDF.
+
+        A piecewise-constant rate sampled this way puts exactly no entries in a
+        zero band -- which a rejection sampler would also do, but only
+        eventually, and a shaped random walk would not do at all.
+        """
+        pairs, total = [], 0.0
+        for i in range(GRID):
+            frac = i / GRID
+            rate = next((w for lo, hi, w in ACTIVITY if lo <= frac < hi), 1.0)
+            total += rate
+            pairs.append((total, frac))
+        if total <= 0:
+            return [(1.0, i / GRID) for i in range(GRID)]
+        return [(c / total, f) for c, f in pairs]
 
     def at(self, frac: float, jitter_s: float = 0.0) -> datetime:
         t = self.start + self.span * max(0.0, min(1.0, frac))
@@ -84,8 +153,29 @@ class Clock:
             t += timedelta(seconds=self.rng.uniform(-jitter_s, jitter_s))
         return t
 
+    def _sample(self) -> float:
+        """One fraction, drawn against the activity profile."""
+        u = self.rng.random()
+        lo, hi = 0, len(self._cdf) - 1
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if self._cdf[mid][0] < u:
+                lo = mid + 1
+            else:
+                hi = mid
+        # Spread within the sub-interval, so a dense band is not visibly combed.
+        return min(1.0, self._cdf[lo][1] + self.rng.random() / GRID)
+
     def series(self, n: int) -> list[tuple[float, datetime]]:
-        fracs = sorted(self.rng.random() for _ in range(n))
+        """
+        `n` timestamps in order, distributed by `ACTIVITY`.
+
+        Jitter is applied *after* ordering and can therefore put two entries a
+        few hundred milliseconds out of sequence. That is deliberate and is
+        what a real multi-threaded writer does -- it is also the case SPEC 4.6's
+        sort permutation exists for, so the test logs should contain it.
+        """
+        fracs = sorted(self._sample() for _ in range(n))
         return [(f, self.at(f, jitter_s=0.4)) for f in fracs]
 
 
@@ -290,6 +380,126 @@ def write(path: Path, lines: list[str], *, encoding: str = "utf-8",
     return len(text.encode(encoding))
 
 
+# ---------------------------------------------------------------------------
+# --tail: a live writer, for exercising follow by hand (M6)
+# ---------------------------------------------------------------------------
+
+TAIL_FILES = ("app.log", "soa.log", "database.log", "syslog", "gateway.log")
+"""
+Which files `--tail` keeps writing to.
+
+`worker.log` is left out on purpose: it is UTF-16, and appending to it correctly
+means not writing a second BOM, which is a thing to test deliberately rather
+than by accident in the middle of watching an incident. `gateway.1.log` is the
+already-rotated half and is supposed to be finished.
+"""
+
+
+def tail(out: Path, rng: random.Random, *, rate: float, rotate_every: float,
+         truncate_every: float, seconds: float) -> int:
+    """
+    Keep appending to the generated files, as a running service would.
+
+    This is the hands-on test for M6 that nothing else provides: the unit tests
+    drive the poller by hand precisely so they do not depend on timing, which
+    means nothing in the suite ever watches a file for real. Run the generator,
+    open the folder in LogWeave, turn on View > Follow New Lines, and leave this
+    running in another terminal.
+
+    Three things are done on purpose, because all three are what rotation and
+    truncation handling (FR-23) is written against and none of them can be
+    arranged by hand at the right moment:
+
+    * lines are appended in **bursts with pauses between**, so the "N new lines
+      below" indicator has something to count and the timeline keeps growing
+      unevenly rather than at a constant rate;
+    * a file is occasionally **rotated** -- renamed aside and recreated -- which
+      is what logrotate and most Windows services do;
+    * a file is occasionally **truncated in place**, which is what logrotate's
+      `copytruncate` and a restarted `logging.FileHandler(mode="w")` do, and is
+      the case that destroys history.
+
+    Writes with `"a"` and flushes per burst, so what LogWeave sees is what a
+    real writer would produce: whole lines, and sometimes a line that is only
+    half on disk when the poll lands.
+    """
+    started = datetime.now()
+    deadline = started + timedelta(seconds=seconds)
+    next_rotate = started + timedelta(seconds=rotate_every) if rotate_every else None
+    next_truncate = (started + timedelta(seconds=truncate_every)
+                     if truncate_every else None)
+    appended = rotations = truncations = 0
+
+    print(f"Appending to {len(TAIL_FILES)} files in {out}")
+    print(f"  ~{rate:g} lines/second across them, for {seconds:g}s")
+    if next_rotate:
+        print(f"  rotating a file every {rotate_every:g}s")
+    if next_truncate:
+        print(f"  truncating a file in place every {truncate_every:g}s")
+    print("  Ctrl+C to stop\n")
+
+    try:
+        while datetime.now() < deadline:
+            burst = rng.choice([1, 1, 2, 3, 5, 9])
+            name = rng.choice(TAIL_FILES)
+            path = out / name
+            now = datetime.now()
+            lines = [
+                f"{now:%Y-%m-%d %H:%M:%S}.{now.microsecond // 1000:03d} "
+                f"{rng.choice(['INFO ', 'INFO ', 'INFO ', 'WARN ', 'ERROR'])}  "
+                f"[tail-{appended + i:05d}] live append to {name}"
+                for i in range(burst)
+            ]
+            try:
+                with open(path, "a", encoding="utf-8", newline="") as handle:
+                    handle.write("\r\n".join(lines) + "\r\n")
+            except OSError as exc:
+                print(f"  ! could not append to {name}: {exc}")
+            appended += burst
+
+            if next_rotate and now >= next_rotate:
+                victim = out / rng.choice(TAIL_FILES)
+                # A fresh name each time. Reusing one would be a rename *over*
+                # an existing file, and if LogWeave is still holding that
+                # earlier rotation open -- which it is, because a frozen
+                # rotated source stays readable -- Windows refuses the replace
+                # with ERROR_ACCESS_DENIED. That is a property of MoveFileEx
+                # and not something a reader can permit; a rotating writer
+                # numbers its archives for exactly this reason.
+                rotations += 1
+                aside = victim.with_suffix(f"{victim.suffix}.{rotations}")
+                try:
+                    victim.replace(aside)
+                    victim.write_text("", encoding="utf-8")
+                    print(f"  rotated {victim.name} -> {aside.name}")
+                except OSError as exc:
+                    rotations -= 1
+                    print(f"  ! could not rotate {victim.name}: {exc}")
+                next_rotate = now + timedelta(seconds=rotate_every)
+
+            if next_truncate and now >= next_truncate:
+                victim = out / rng.choice(TAIL_FILES)
+                try:
+                    # "w" is CREATE_ALWAYS on Windows, which is exactly what a
+                    # restarting application does -- and what fails if anything
+                    # is holding the file mapped (see FileSource.unmap).
+                    with open(victim, "w", encoding="utf-8", newline="") as handle:
+                        handle.write("")
+                    truncations += 1
+                    print(f"  truncated {victim.name} in place")
+                except OSError as exc:
+                    print(f"  ! could not truncate {victim.name}: {exc}")
+                next_truncate = now + timedelta(seconds=truncate_every)
+
+            time.sleep(max(0.01, burst / max(0.1, rate)))
+    except KeyboardInterrupt:
+        print("\n  stopped")
+
+    print(f"\n  {appended:,} lines appended, {rotations} rotations, "
+          f"{truncations} truncations")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(
         description=__doc__,
@@ -297,14 +507,41 @@ def main(argv: list[str] | None = None) -> int:
     )
     ap.add_argument("--out", type=Path, default=DEFAULT_OUT,
                     help=f"where to write (default: {DEFAULT_OUT})")
-    ap.add_argument("--minutes", type=int, default=45,
-                    help="how long a window the incident spans (default: 45)")
+    ap.add_argument("--minutes", type=int, default=240,
+                    help="how long a window the incident spans (default: 240). "
+                         "Long enough that the quiet periods are quiet for "
+                         "minutes rather than seconds")
     ap.add_argument("--rate", type=int, default=25,
-                    help="roughly how many entries a minute, per file (default: 25)")
+                    help="average entries a minute, per file (default: 25). "
+                         "The actual rate swings from zero to ~14x this; see "
+                         "ACTIVITY in this file")
     ap.add_argument("--seed", type=int, default=7)
+    ap.add_argument("--tail", type=float, nargs="?", const=300.0, default=None,
+                    metavar="SECONDS",
+                    help="do not generate; keep appending to the files already "
+                         "in --out for this long (default 300), so follow mode "
+                         "can be watched working. Run it in a second terminal "
+                         "with LogWeave open on the folder")
+    ap.add_argument("--tail-rate", type=float, default=4.0,
+                    help="lines a second while --tail is running (default: 4)")
+    ap.add_argument("--rotate-every", type=float, default=60.0,
+                    help="seconds between rotating one file aside while "
+                         "--tail runs; 0 to never (default: 60)")
+    ap.add_argument("--truncate-every", type=float, default=0.0,
+                    help="seconds between truncating one file in place while "
+                         "--tail runs; 0 to never (default: 0, because it "
+                         "destroys the history it truncates -- FR-23)")
     args = ap.parse_args(argv)
 
     rng = random.Random(args.seed)
+    if args.tail is not None:
+        if not args.out.is_dir():
+            print(f"{args.out} does not exist -- generate the files first, "
+                  f"without --tail")
+            return 1
+        return tail(args.out, rng, rate=args.tail_rate,
+                    rotate_every=args.rotate_every,
+                    truncate_every=args.truncate_every, seconds=args.tail)
     span = timedelta(minutes=args.minutes)
     # Ending now, so the files look like something that just happened and the
     # yearless syslog is anchored against a sensible mtime.
@@ -350,6 +587,11 @@ def main(argv: list[str] | None = None) -> int:
     print("  - syslog has no year in it at all; check its dates are right")
     print("  - database.log has 3000-character lines; scroll right (FR-36a)")
     print("  - app.log stack traces are one entry each, marked with an arrow")
+    print("  - the timeline strip has blank stretches; the minimap does not")
+    print("  - the minimap is a colour map of severity; the timeline is volume")
+    print("")
+    print("To watch follow mode work (M6), leave this running next door:")
+    print(f"  python tools/make_test_logs.py --out {out} --tail")
     return 0
 
 

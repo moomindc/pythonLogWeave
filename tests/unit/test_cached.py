@@ -421,7 +421,7 @@ def test_a_spliced_index_has_the_histogram_a_full_re_index_would(log, root):
     must not be able to tell from the overview strips how the index was built.
 
     The splice *rebuilds* rather than adding the tail's counts to the prefix's,
-    and the reason is in `_splice`: a longer span can widen the bucket, so the
+    and the reason is in `splice`: a longer span can widen the bucket, so the
     grid the prefix was counted on may no longer exist -- and an append that
     starts before the prefix's `t0`, which an out-of-order append does, has no
     bucket to be added to at all.

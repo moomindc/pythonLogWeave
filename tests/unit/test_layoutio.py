@@ -159,7 +159,7 @@ def test_a_restored_layout_extracts_the_same_timestamps(corpus):
 
 def test_a_header_missing_a_field_is_an_error_not_a_default(layout):
     """
-    A truncated or hand-edited header must fail where `cached._detection_for`
+    A truncated or hand-edited header must fail where `cached.detection_of`
     catches it and re-indexes, rather than producing a plausible-looking layout
     with a zeroed field.
     """

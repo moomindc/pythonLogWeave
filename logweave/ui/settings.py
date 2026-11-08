@@ -43,6 +43,33 @@ D4's point is that they answer different questions, so "minimap only" and
 """
 
 
+USER_RULES = "highlight/user_rules"
+"""
+FR-31: the user's own highlight rules, as the JSON `highlight.store` writes.
+
+An *application* preference and not a profile one, deliberately. A profile
+(FR-49) is about a particular set of logs -- which files, which skews, which
+filters -- and a reader's rule for finding timeouts is about the reader. Opening
+a colleague's profile must not take their colours with it, and must not lose
+yours.
+
+One value rather than a key per rule: the list has an order, which is FR-31's
+tiebreak when two rules share a priority, and a registry has none.
+"""
+
+
+FOLLOW = "view/follow"
+"""
+FR-24: the global follow toggle, remembered between runs.
+
+Defaults **off**. Following is a thing you ask for -- it starts a watcher
+thread, re-indexes on every append, and drags the view to the bottom -- and
+having that happen to a log someone opened to read a stack trace in would be
+a surprise, not a convenience. Per-file follow flags belong to a profile
+(FR-49), not here.
+"""
+
+
 def store() -> QSettings:
     return QSettings(ORGANISATION, APPLICATION)
 

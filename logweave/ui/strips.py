@@ -32,8 +32,20 @@ from PySide6.QtWidgets import QSizePolicy, QWidget
 from ..index.civil import format_wall_us
 from ..index.severity import Severity
 from ..session import Session
-from ..session.overview import Strip, StripTheme, render_rgba
+from ..session.overview import (
+    Strip,
+    StripTheme,
+    mark_gutter,
+    render_density_rgba,
+    render_mark_gutter,
+    render_rgba,
+)
 from . import theme
+
+
+def _rgb(hex_str: str) -> tuple[int, int, int]:
+    h = hex_str.lstrip("#")
+    return (int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16))
 
 
 class OverviewStrip(QWidget):
@@ -59,6 +71,15 @@ class OverviewStrip(QWidget):
         access violation the rest.
         """
         self._drawn: Strip | None = None
+        self._marks: tuple = ()
+        """
+        The user-rule mark layers currently drawn (FR-31a).
+
+        A tuple assigned wholesale, never mutated, so "have the marks changed"
+        is an identity test -- the same reason `_drawn` compares `Strip` by
+        identity rather than diffing two count arrays.
+        """
+        self._drawn_marks: tuple | None = None
         self._top_row = 0
         self._page_rows = 1
         self._marker_time: int | None = None
@@ -77,10 +98,19 @@ class OverviewStrip(QWidget):
     # what the subclasses fill in
     # ------------------------------------------------------------------
 
-    reverse = False
-    """Whether bands are drawn from the right edge. See `render_rgba`."""
-
     def strip(self, height: int) -> Strip:
+        raise NotImplementedError
+
+    def _render_pixels(self, strip: Strip, width: int) -> np.ndarray:
+        """
+        The strip's pixels. The two subclasses encode different quantities --
+        see `render_density_rgba` for why -- so this is theirs to answer.
+
+        Underscored, and not called `render`: `QWidget.render` already exists,
+        paints the widget into a paint device, and is what the tests and Qt's
+        own grab path call. Shadowing it with something of a different shape
+        fails somewhere far away from here.
+        """
         raise NotImplementedError
 
     def _seek_to(self, pixel: int) -> None:
@@ -111,11 +141,26 @@ class OverviewStrip(QWidget):
         # is the path a scroll takes, so it must not re-aggregate.
         self.update()
 
+    def set_marks(self, layers) -> None:
+        """
+        Which user rules are marked on this strip (FR-31a).
+
+        Pushed in, like the viewport: the strips know nothing about rules,
+        scans or threads, and a `MarkLayer` is a sorted array of merged
+        timestamps plus a colour. Takes effect on the next paint.
+        """
+        layers = tuple(layers)
+        if layers == self._marks:
+            return
+        self._marks = layers
+        self.update()
+
     def refresh(self) -> None:
         """The session changed: drop the cached image and repaint."""
         self._image = None
         self._buffer = None
         self._drawn = None
+        self._drawn_marks = None
         self.update()
 
     # ------------------------------------------------------------------
@@ -148,10 +193,10 @@ class OverviewStrip(QWidget):
         """
         stale = (self._buffer is None
                  or self._drawn is not strip
+                 or self._marks != self._drawn_marks
                  or self._buffer.shape[:2] != (height, width))
         if stale:
-            self._buffer = np.ascontiguousarray(
-                render_rgba(strip, width, theme=self._theme, reverse=self.reverse))
+            self._buffer = np.ascontiguousarray(self._compose(strip, width))
             self._image = QImage(self._buffer.data, width, height,
                                  self._buffer.strides[0],
                                  QImage.Format.Format_RGBA8888)
@@ -160,8 +205,26 @@ class OverviewStrip(QWidget):
             # it has not changed. That makes "is this buffer still current" a
             # pointer comparison rather than a diff of two count arrays.
             self._drawn = strip
+            self._drawn_marks = self._marks
         if self._image is not None:
             painter.drawImage(0, 0, self._image)
+
+    def _compose(self, strip: Strip, width: int) -> np.ndarray:
+        """
+        The strip's own pixels, plus the user-rule gutter on the right.
+
+        The bands are rendered *narrower* rather than being overdrawn, so a
+        marked rule costs the map three pixels of width instead of three pixels
+        of information. With nothing marked the gutter is zero wide and this is
+        the single `_render_pixels` call it was before.
+        """
+        gutter = mark_gutter(self._marks, width)
+        bands = self._render_pixels(strip, width - gutter)
+        if not gutter:
+            return bands
+        return np.concatenate([bands, render_mark_gutter(
+            self._marks, strip.times, strip.height, gutter,
+            theme=self._theme, fallback=_rgb(theme.FOREGROUND))], axis=1)
 
     # ------------------------------------------------------------------
     # the mouse (FR-32, FR-33)
@@ -226,6 +289,16 @@ class MinimapStrip(OverviewStrip):
     def strip(self, height: int) -> Strip:
         return self.session.overview.minimap(height)
 
+    def _render_pixels(self, strip: Strip, width: int) -> np.ndarray:
+        """
+        A full-width colour map of what kind of entries are where.
+
+        `fill=True`, because this strip's axis is rows: every pixel covers the
+        same number of them, so bar length carries no information and scaling
+        by it produces nothing but a ragged right edge.
+        """
+        return render_rgba(strip, width, theme=self._theme, fill=True)
+
     def _seek_to(self, pixel: int) -> None:
         """
         Centre the viewport on the clicked pixel rather than putting it at the
@@ -277,15 +350,6 @@ class TimelineStrip(OverviewStrip):
     scrollbar that behaved that way would be broken rather than informative.
     """
 
-    reverse = True
-    """
-    Bands grow leftward, away from the minimap beside it.
-
-    The two strips sit side by side with their quiet edges together, so a dense
-    band in each reads as one shape growing outward from the middle rather than
-    as two columns that happen to be adjacent.
-    """
-
     timeSought = Signal("qlonglong")
     """
     `qlonglong`, because a `wall_us` does not fit in a C++ `int`.
@@ -300,6 +364,15 @@ class TimelineStrip(OverviewStrip):
 
     def strip(self, height: int) -> Strip:
         return self.session.overview.timeline(height)
+
+    def _render_pixels(self, strip: Strip, width: int) -> np.ndarray:
+        """
+        A monochrome bar chart of how many entries fall in each slice of time.
+
+        Left-justified and one colour. The bar is the only variable, and its
+        length is the row's entry count against the busiest row's.
+        """
+        return render_density_rgba(strip, width, theme=self._theme)
 
     def _seek_to(self, pixel: int) -> None:
         h = self.height()

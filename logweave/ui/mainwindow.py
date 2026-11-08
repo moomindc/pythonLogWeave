@@ -21,6 +21,7 @@ from PySide6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QMainWindow,
+    QMenu,
     QProgressBar,
     QPushButton,
     QStatusBar,
@@ -29,12 +30,19 @@ from PySide6.QtWidgets import (
 )
 
 from ..highlight import default_group
+from ..highlight import store as rulestore
+from ..highlight.builtins import USER_SET
+from ..highlight.rules import Ruleset
 from ..index import sidecar
 from ..index.civil import format_wall_us
 from ..session import Session
+from ..session.follow import FollowEngine
 from . import settings, theme
+from .followui import FollowNotifier, NewLinesButton
 from .indexing import IndexWorker, start
+from .markscan import MarkScanner
 from .mergedview import MergedLogView
+from .settingsdialog import SettingsDialog, Settled
 from .strips import MinimapStrip, TimelineStrip
 
 SWATCH = 10
@@ -101,8 +109,18 @@ class MainWindow(QMainWindow):
     """One window, one session. Multiple windows are independent (FR-33)."""
 
     def __init__(self, session: Session | None = None, *,
-                 background: bool = True):
+                 background: bool = True, poller=None):
         super().__init__()
+        self._poller = poller
+        """
+        A `source.poller.Poller` to watch through, or None for the shared one.
+
+        Injectable so a follow test can step the watcher with `poll_once`
+        instead of sleeping past an interval and hoping. A test that slept
+        would be slow when it passed and intermittent when it failed, which is
+        the worst available combination for the one feature whose whole job is
+        to happen on its own.
+        """
         self.session = session or Session()
         self.background_indexing = background
         """
@@ -136,6 +154,17 @@ class MainWindow(QMainWindow):
         self.view.copyRefused.connect(self._report_copy_refused)
         self.view.fontPointChanged.connect(
             lambda pt: settings.write(settings.FONT_POINT, pt))
+        self.marks = MarkScanner(self.session, self)
+        """
+        The background scan behind a rule's "also on the strips" (FR-31a).
+
+        Owned here for the same reason the follow engine is: it is a property
+        of how this window is being read, and the session knows nothing about
+        it. Idle unless a rule asks for marks.
+        """
+        self.marks.updated.connect(self._marks_ready)
+        self.marks.progress.connect(self._marks_progress)
+        self.marks.started.connect(self._marks_started)
         self._restore_preferences()
 
         self._worker: IndexWorker | None = None
@@ -143,9 +172,31 @@ class MainWindow(QMainWindow):
         self._pending: list[Path] = []
         self._queued: list[Path] = []
 
+        self._notifier = FollowNotifier(self)
+        self.follow = FollowEngine(self.session, poller=poller,
+                                   notify=self._notifier.wake)
+        """
+        The follow engine (M6). Constructed always, started only on request.
+
+        Owned by the window rather than the session because following is a
+        choice about how this window is being used, and FR-33 allows several
+        windows over the same files: one of them watching the tail should not
+        drag the others to the bottom.
+        """
+        # Auto-connection, which is what makes this safe: the notifier lives on
+        # this (the UI) thread and the signal is emitted from the poller's, so
+        # Qt queues the call onto the event loop instead of running it there.
+        self._notifier.woken.connect(self._follow_woken)
+        self.view.tailingChanged.connect(self._tailing_changed)
+
         self._build_sources_dock()
         self._build_menus()
         self._build_status()
+        self._restore_follow()
+        if self._rule_notes:
+            # Read before the status bar existed (`_restore_preferences` runs
+            # ahead of the chrome), so it is reported here rather than lost.
+            self._status_msg.setText("   ".join(self._rule_notes))
         self.refresh()
 
     # ------------------------------------------------------------------
@@ -229,6 +280,130 @@ class MainWindow(QMainWindow):
             settings.write(settings.SHOW_TIMELINE, bool(timeline))
 
     # ------------------------------------------------------------------
+    # following (FR-21 to FR-26)
+    # ------------------------------------------------------------------
+
+    def _restore_follow(self) -> None:
+        """FR-24 and FR-38: the global toggle survives a restart, defaulting off."""
+        on = settings.read_bool(settings.FOLLOW, False)
+        self.follow_act.setChecked(on)
+        self._follow_toggled(on)
+
+    def _follow_toggled(self, on: bool) -> None:
+        """
+        The global switch (FR-24).
+
+        Turning it on starts tailing as well as watching, because the two
+        together are what "follow" means to a reader; turning it off stops
+        both and leaves everything already read exactly where it is.
+        """
+        on = bool(on)
+        self.follow.set_global_follow(on)
+        settings.write(settings.FOLLOW, on)
+        self.view.set_tailing(on)
+        if not on:
+            self._new_lines.clear()
+        self._reload_source_list()
+        self._update_follow_status()
+
+    def _follow_woken(self) -> None:
+        """
+        A watcher saw something. Runs on the UI thread (see `followui`).
+
+        Guarded on `has_pending` rather than applying unconditionally: several
+        sources changing between two trips round the event loop produce several
+        wake-ups for one batch of work, and `apply` has already taken it.
+        """
+        if not self.follow.has_pending:
+            return
+        self._after_tick(self.follow.apply())
+
+    def _after_tick(self, tick) -> None:
+        """Put one `FollowTick` on the screen."""
+        if not tick.anything:
+            return
+        if tick.rebuilt or tick.truncated or tick.rotated:
+            # A re-index or a new source changes the row count, the aliases and
+            # the lane colours, so this is the full refresh and not the cheap one.
+            self.refresh()
+        else:
+            self.view.refresh()
+            self.minimap.refresh()
+            self.timeline.refresh()
+            self._sync_strips()
+            self._update_span()
+            self._reload_source_list()
+
+        if self.view.tailing:
+            self.view.scroll_to_tail()
+            self._new_lines.clear()
+        elif tick.added_rows:
+            # FR-26: counted since the pause began, so it keeps accumulating
+            # across ticks until the reader goes and looks.
+            self._new_lines.set_count(self._new_lines.count + tick.added_rows)
+
+        self._report_follow_events(tick)
+        self._update_follow_status()
+
+    def _report_follow_events(self, tick) -> None:
+        """FR-23 and FR-25: say what happened to a file, rather than just doing it."""
+        notes: list[str] = []
+        for pos in tick.truncated:
+            notes.append(f"{self._alias_at(pos)} was truncated by its writer "
+                         f"and has been re-read")
+        for pos in tick.rotated:
+            notes.append(f"{self._alias_at(pos)} rotated; the new file is open beside it")
+        for pos in tick.went_stale:
+            if pos in tick.rotated:
+                continue
+            state = self._follow_state(pos)
+            why = state.stale_reason if state else "no longer updating"
+            notes.append(f"{self._alias_at(pos)} is stale: {why}")
+        if notes:
+            self._status_msg.setText("; ".join(notes))
+
+    def _alias_at(self, pos: int) -> str:
+        if 0 <= pos < len(self.session.sources):
+            return self.session.sources[pos].alias
+        return f"source {pos}"
+
+    def _follow_state(self, pos: int):
+        if not 0 <= pos < len(self.session.sources):
+            return None
+        return self.follow.states.get(str(self.session.sources[pos].source.id))
+
+    def _tailing_changed(self, on: bool) -> None:
+        """FR-22: scrolling up pauses, arriving back at the bottom resumes."""
+        if on:
+            self._new_lines.clear()
+        self._update_follow_status()
+
+    def _resume_tailing(self) -> None:
+        """The new-lines indicator was pressed -- the same thing `End` does."""
+        self.view.set_tailing(True)
+        self.view.set_current_row(max(0, self.session.total_rows - 1))
+        self._new_lines.clear()
+
+    def _update_follow_status(self) -> None:
+        if not self.follow.global_follow:
+            self._status_follow.setText("")
+            return
+        live = sum(1 for st in self.follow.states.values() if st.live)
+        stale = sum(1 for st in self.follow.states.values() if st.stale)
+        bits = [f"following {live}"]
+        if stale:
+            bits.append(f"{stale} stale")
+        if not self.view.tailing:
+            bits.append("paused")
+        self._status_follow.setText("  ".join(bits))
+
+    def _source_follow_toggled(self, pos: int, on: bool) -> None:
+        """FR-24: follow this one file or not, independently of the others."""
+        self.follow.set_follow(pos, on)
+        self._reload_source_list()
+        self._update_follow_status()
+
+    # ------------------------------------------------------------------
     # preferences (FR-38)
     # ------------------------------------------------------------------
 
@@ -252,6 +427,15 @@ class MainWindow(QMainWindow):
         self.minimap.setVisible(settings.read_bool(settings.SHOW_MINIMAP, True))
         self.timeline.setVisible(settings.read_bool(settings.SHOW_TIMELINE, True))
 
+        rules, notes = rulestore.load(settings.store().value(settings.USER_RULES))
+        self.highlight_group.sets[USER_SET] = Ruleset(rules)
+        self._rule_notes = tuple(notes)
+        """
+        Complaints from reading the stored rules, reported once the status bar
+        exists. A hand-edited rule that will not compile is the user's to fix,
+        and silence would leave them hunting for a colour that never comes.
+        """
+
         remembered = settings.store().value(settings.HIGHLIGHTS)
         if isinstance(remembered, str):
             wanted = {name for name in remembered.split(",") if name}
@@ -261,10 +445,137 @@ class MainWindow(QMainWindow):
         self._apply_highlights()
 
     def _apply_highlights(self) -> None:
-        """Flatten the active rulesets into the view and repaint."""
+        """
+        Flatten the active rulesets into the view, repaint, and re-mark.
+
+        The mark request is here rather than at each call site because every
+        one of them -- a menu toggle, the settings dialog, a restore at
+        startup -- changes the same thing, and `MarkScanner.request` already
+        decides for itself whether the answer can have moved.
+        """
         self.view.highlights = self.highlight_group.flatten()
         settings.write(settings.HIGHLIGHTS, ",".join(sorted(self.highlight_group.active)))
         self.view.viewport().update()
+        self.marks.request(self.view.highlights.rules)
+
+    # ------------------------------------------------------------------
+    # settings (FR-31, FR-52)
+    # ------------------------------------------------------------------
+
+    def settings_dialog(self) -> SettingsDialog:
+        """
+        Built over the *live* window, not over the settings store.
+
+        Anything changed from a menu since the last write is in the window and
+        may not yet be in the store, so reading the store here would show a
+        stale value and Apply would then write it back -- a dialog that undid a
+        menu by being opened.
+        """
+        current = Settled(
+            font_point=self.view.font_point,
+            lane_width=self.view.lane_width,
+            show_timestamp=self.view.show_timestamp,
+            show_alias=self.view.show_alias,
+            show_line_no=self.view.show_line_no,
+            show_minimap=self.minimap.isVisibleTo(self),
+            show_timeline=self.timeline.isVisibleTo(self),
+        )
+        dialog = SettingsDialog(self.highlight_group, current=current, parent=self)
+        dialog.changed.connect(self._settings_changed)
+        return dialog
+
+    def open_settings(self) -> None:
+        self.settings_dialog().exec()
+
+    def _settings_changed(self, settled: Settled) -> None:
+        """
+        Install everything the dialog settled, then let the menus catch up.
+
+        Order matters once: the rules go in before `_apply_highlights`, because
+        that is what flattens them into the view and asks for a mark scan.
+        """
+        self.view.set_font_point(settled.font_point)
+        settings.write(settings.FONT_POINT, settled.font_point)
+        self._set_lane_width(settled.lane_width)
+        self._timestamp_toggled(settled.show_timestamp)
+        self._alias_toggled(settled.show_alias)
+        self._line_no_toggled(settled.show_line_no)
+        self._set_strips_visible(minimap=settled.show_minimap,
+                                 timeline=settled.show_timeline)
+
+        self.highlight_group.sets[USER_SET] = Ruleset(settled.user_rules)
+        self.highlight_group.active = (
+            settled.active_sets & set(self.highlight_group.sets))
+        settings.write(settings.USER_RULES, rulestore.dump(settled.user_rules))
+        self._apply_highlights()
+        self._sync_setting_menus()
+
+        marked = sum(1 for r in settled.user_rules if r.enabled and r.on_strips)
+        rules = len(self.view.highlights.rules)
+        extra = f", {marked} marked on the strips" if marked else ""
+        self._status_msg.setText(f"{rules} highlight rules active{extra}")
+
+    def _sync_setting_menus(self) -> None:
+        """
+        Put the menu ticks back in step with what was just applied.
+
+        One direction only, and guarded, because every one of these actions has
+        a `toggled` handler that writes a setting: re-checking them without the
+        guard would re-enter the handlers and, for the strips, fight the
+        visibility that was just set.
+        """
+        pairs = [
+            (self.timestamp_act, self.view.show_timestamp),
+            (self.alias_act, self.view.show_alias),
+            (self.line_no_act, self.view.show_line_no),
+            (self.minimap_act, self.minimap.isVisibleTo(self)),
+            (self.timeline_act, self.timeline.isVisibleTo(self)),
+        ]
+        for name, act in self.highlight_acts.items():
+            pairs.append((act, name in self.highlight_group.active))
+        width = self.view.lane_width
+        for act in self.lane_acts:
+            pairs.append((act, act.data() == width))
+        for act, on in pairs:
+            if act.isChecked() != on:
+                act.blockSignals(True)
+                act.setChecked(on)
+                act.blockSignals(False)
+
+    # ------------------------------------------------------------------
+    # mark scanning (FR-31a)
+    # ------------------------------------------------------------------
+
+    def _marks_started(self) -> None:
+        self._status_msg.setText("Scanning for marked highlight rules...")
+
+    def _marks_progress(self, done: int, total: int, rule: str) -> None:
+        if total > 0:
+            self._status_msg.setText(
+                f"Scanning for {rule}... {done * 100 // total}%")
+
+    def _marks_ready(self, result) -> None:
+        """
+        Push the finished layers onto both strips and say what was found.
+
+        Both strips, not just the minimap: a mark answers two questions --
+        which part of the stream, and which part of the day -- and those are
+        exactly the two the strips answer, so a hit visible on one of them only
+        would be the odd thing out in an overview built on D4's premise that a
+        reader wants both.
+        """
+        self.minimap.set_marks(result.layers)
+        self.timeline.set_marks(result.layers)
+        if not result.layers:
+            return
+        hits = result.hits
+        rules = len(result.layers)
+        plural_h = "s" if hits != 1 else ""
+        plural_r = "s" if rules != 1 else ""
+        parts = [f"{hits:,} hit{plural_h} from {rules} marked rule{plural_r} "
+                 f"in {result.elapsed_ms / 1000:.1f}s"]
+        parts.extend(result.notes)
+        self._status_msg.setText("   ".join(parts))
 
     def _toggle_highlight_set(self, name: str, on: bool) -> None:
         if on:
@@ -323,6 +634,18 @@ class MainWindow(QMainWindow):
             "with no timestamp column and no attribution")
         copy_plain_act.triggered.connect(self.view.copy_selection_plain)
         edit_menu.addAction(copy_plain_act)
+        edit_menu.addSeparator()
+
+        settings_act = QAction("&Settings…", self)
+        # The platform shortcut for preferences: Ctrl+, on Windows and Linux,
+        # Cmd+, on macOS, which is what Qt's Preferences role already maps to.
+        settings_act.setShortcut(QKeySequence("Ctrl+,"))
+        settings_act.setMenuRole(QAction.MenuRole.PreferencesRole)
+        settings_act.setStatusTip(
+            "Text size, columns, strips, and the highlight rules")
+        settings_act.triggered.connect(self.open_settings)
+        self.settings_act = settings_act
+        edit_menu.addAction(settings_act)
         self.copy_act, self.copy_plain_act = copy_act, copy_plain_act
 
         view_menu = self.menuBar().addMenu("&View")
@@ -388,6 +711,16 @@ class MainWindow(QMainWindow):
         view_menu.addAction(self.timeline_act)
 
         view_menu.addSeparator()
+        self.follow_act = QAction("&Follow New Lines", self)
+        self.follow_act.setCheckable(True)
+        self.follow_act.setShortcut("Ctrl+F")
+        self.follow_act.setStatusTip(
+            "Watch every open file for new lines and keep the view at the end; "
+            "scroll up to pause, End to resume (FR-21, FR-22)")
+        self.follow_act.toggled.connect(self._follow_toggled)
+        view_menu.addAction(self.follow_act)
+
+        view_menu.addSeparator()
         self._build_zoom_menu(view_menu)
         view_menu.addSeparator()
         self._build_lane_menu(view_menu)
@@ -434,18 +767,38 @@ class MainWindow(QMainWindow):
         for px in range(theme.LANE_WIDTH_MIN, theme.LANE_WIDTH_MAX + 1):
             act = QAction(f"{px} px", self)
             act.setCheckable(True)
+            # The width lives on the action, so anything that has to put these
+            # ticks back in step -- `_sync_setting_menus`, after the settings
+            # dialog -- can ask rather than reconstruct it from the list index.
+            act.setData(px)
             act.setChecked(px == self.view.lane_width)
             act.triggered.connect(lambda _=False, w=px: self._set_lane_width(w))
             group.addAction(act)
             menu.addAction(act)
             self.lane_acts.append(act)
 
+    SET_LABELS = {USER_SET: "My Rules"}
+    """
+    Menu labels that are not just the set name capitalised.
+
+    Only one so far. `USER_SET` is called `user` in the store, in the settings
+    key and in every test, and renaming it to read well in a menu would mean a
+    migration for a string nobody sees.
+    """
+
     def _build_highlight_menu(self, view_menu) -> None:
-        """FR-30/FR-31: which shipped rulesets are in force."""
+        """
+        FR-30/FR-31: which rulesets are in force, including the user's own.
+
+        A switch per set, the user's included, so that "turn my colours off for
+        a minute" is one click from the same place as the shipped ones. The
+        rules themselves are edited in the settings dialog; this menu only ever
+        answers which sets apply.
+        """
         menu = view_menu.addMenu("&Highlighting")
         self.highlight_acts = {}
         for name in sorted(self.highlight_group.sets):
-            act = QAction(name.capitalize(), self)
+            act = QAction(self.SET_LABELS.get(name, name.capitalize()), self)
             act.setCheckable(True)
             act.setChecked(name in self.highlight_group.active)
             act.setStatusTip(f"Apply the {name} highlight rules")
@@ -453,6 +806,20 @@ class MainWindow(QMainWindow):
                 lambda on, n=name: self._toggle_highlight_set(n, on))
             menu.addAction(act)
             self.highlight_acts[name] = act
+        menu.addSeparator()
+        edit_rules = QAction("&Edit Rules…", self)
+        edit_rules.setStatusTip("Add or change your own highlight rules")
+        # Straight to the tab that was asked for, rather than to the dialog's
+        # first tab: an item called "Edit Rules" that lands on text size is an
+        # item that has not done what it said.
+        edit_rules.triggered.connect(self.open_highlight_settings)
+        menu.addAction(edit_rules)
+
+    def open_highlight_settings(self) -> None:
+        """The settings dialog, opened on the highlighting tab."""
+        dialog = self.settings_dialog()
+        dialog.tabs.setCurrentWidget(dialog.highlight)
+        dialog.exec()
 
     def _timestamp_toggled(self, on: bool) -> None:
         self.view.set_show_timestamp(on)
@@ -476,6 +843,14 @@ class MainWindow(QMainWindow):
         self._status_msg = QLabel("No logs open")
         self._status_pos = QLabel("")
         self._status_span = QLabel("")
+        self._status_follow = QLabel("")
+        self._status_follow.setStyleSheet(f"color: {theme.FOLLOW_ACTIVE};")
+
+        # FR-26, in the status bar rather than floated over the last row: an
+        # overlay would sit on top of the text someone scrolled up to read,
+        # which is the one thing they are known to be looking at.
+        self._new_lines = NewLinesButton(self)
+        self._new_lines.clicked.connect(self._resume_tailing)
 
         # The progress bar lives in the status bar rather than a modal: the
         # window stays usable while a drop indexes, which is the whole point of
@@ -490,8 +865,10 @@ class MainWindow(QMainWindow):
         self._cancel_btn.hide()
 
         bar.addWidget(self._status_msg, 1)
+        bar.addWidget(self._new_lines)
         bar.addWidget(self._progress)
         bar.addWidget(self._cancel_btn)
+        bar.addPermanentWidget(self._status_follow)
         bar.addPermanentWidget(self._status_span)
         bar.addPermanentWidget(self._status_pos)
 
@@ -512,6 +889,14 @@ class MainWindow(QMainWindow):
             rename=self.rename_source,
         ))
         self.source_list.itemChanged.connect(self._source_toggled)
+        # Per-source follow (FR-24) goes on a context menu rather than a second
+        # checkbox. The row already has one, for whether the source is in the
+        # merge (FR-9), and two checkboxes a few pixels apart meaning "shown"
+        # and "watched" is a guessing game -- the one someone would reach for to
+        # hide a noisy file is the one that would stop it being read.
+        self.source_list.setContextMenuPolicy(
+            Qt.ContextMenuPolicy.CustomContextMenu)
+        self.source_list.customContextMenuRequested.connect(self._source_menu)
         self.sources_dock.setWidget(self.source_list)
         self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, self.sources_dock)
         self.sources_dock.setMinimumWidth(220)
@@ -645,7 +1030,16 @@ class MainWindow(QMainWindow):
 
     def _finish_open(self, files: list[Path], prepared=None) -> None:
         result = self.session.add_files(files)
+        # A file opened while following is on is followed from the start.
+        # `sync` is idempotent, so calling it unconditionally is cheaper to
+        # reason about than deciding here whether it is needed.
+        self.follow.sync()
         self.refresh()
+        # Opening a file changes which rows a mark falls on, so the cached scan
+        # is void whatever the rules say. `request` then re-runs it only if
+        # something is actually marked.
+        self.marks.invalidate()
+        self.marks.request(self.view.highlights.rules)
         self._cancel_btn.setEnabled(True)
 
         parts = [result.summary()]
@@ -697,12 +1091,30 @@ class MainWindow(QMainWindow):
             f"{root}\n{bytes_before / 1e6:.1f} MB before")
 
     def close_all(self) -> None:
+        # The watchers hold a callback that reaches this window, and the states
+        # are keyed by source id, so both have to go before the session does --
+        # otherwise a file written to a moment later wakes a tick that looks up
+        # sources that are no longer there.
+        self.follow.stop()
+        self.follow.states.clear()
         self.session.close()
         self.session = Session()
+        self.follow.session = self.session
         self.view.session = self.session
         self.minimap.session = self.session
         self.timeline.session = self.session
+        # The layers are timestamps from files that are no longer open, so they
+        # would mark positions in a stream that no longer exists.
+        self.marks.session = self.session
+        self.marks.stop()
+        self.marks.invalidate()
+        self.minimap.set_marks(())
+        self.timeline.set_marks(())
+        self.view.set_tailing(False)
+        self._new_lines.clear()
+        self.follow.set_global_follow(self.follow_act.isChecked())
         self.refresh()
+        self._update_follow_status()
         self._status_msg.setText("No logs open")
 
     # ------------------------------------------------------------------
@@ -744,7 +1156,13 @@ class MainWindow(QMainWindow):
         self.source_list.blockSignals(True)
         self.source_list.clear()
         for i, s in enumerate(self.session.sources):
-            item = QListWidgetItem(f"{s.alias}   {s.index.n:,}")
+            state = self.follow.states.get(str(s.source.id))
+            mark = ""
+            if state is not None and state.stale:
+                mark = "  ⊘"
+            elif state is not None and state.live:
+                mark = "  ●"
+            item = QListWidgetItem(f"{s.alias}   {s.index.n:,}{mark}")
             pix = QPixmap(SWATCH, SWATCH)
             pix.fill(QColor(s.colour))
             item.setIcon(pix)
@@ -754,17 +1172,66 @@ class MainWindow(QMainWindow):
                 Qt.CheckState.Checked if s.meta.enabled else Qt.CheckState.Unchecked
             )
             item.setData(Qt.ItemDataRole.UserRole, i)
+            # FR-25: a stale source stays in the list, stays readable and stays
+            # tickable -- it is only coloured differently and marked, because
+            # the content already read is no less good for the file being gone.
+            if state is not None and state.stale:
+                item.setForeground(QColor(theme.STALE))
+            elif state is not None and state.live:
+                item.setForeground(QColor(theme.FOLLOW_ACTIVE))
             fmt = s.index.format_name or "no format"
             custom = "  (renamed)" if s.meta.alias_custom else ""
             item.setToolTip(
                 f"{s.meta.origin or s.alias}\n"
                 f"{s.index.n:,} entries, {fmt}, {s.index.encoding}\n"
                 f"confidence {s.index.confidence:.0%}\n"
+                f"{self._follow_tooltip(s, state)}\n"
                 f"alias: {s.alias}{custom} -- double-click to rename, "
                 f"clear it to go back to the default"
             )
             self.source_list.addItem(item)
         self.source_list.blockSignals(False)
+
+    def _follow_tooltip(self, source, state) -> str:
+        """One line in a source's tooltip saying what following is doing to it."""
+        if not self.follow.global_follow:
+            return "not following (View > Follow New Lines)"
+        if not source.meta.follow:
+            return "follow is off for this file"
+        if state is None:
+            return "not followed"
+        if state.stale:
+            return f"stale: {state.stale_reason}"
+        if not state.following:
+            return state.note or "not followed"
+        bits = [f"following, +{state.added:,} since started"]
+        if state.pending_bytes:
+            bits.append(f"{state.pending_bytes} bytes of a part-written line held")
+        if state.truncations:
+            bits.append(f"truncated {state.truncations}x")
+        return "; ".join(bits)
+
+    def _source_menu(self, point) -> None:
+        """Right-click on a source: the per-file follow toggle (FR-24)."""
+        item = self.source_list.itemAt(point)
+        if item is None:
+            return
+        pos = item.data(Qt.ItemDataRole.UserRole)
+        if pos is None:
+            return
+        pos = int(pos)
+        source = self.session.sources[pos]
+        menu = QMenu(self.source_list)
+        act = QAction(f"Follow “{source.alias}”", menu)
+        act.setCheckable(True)
+        act.setChecked(bool(source.meta.follow))
+        act.setEnabled(self.follow.global_follow)
+        act.setStatusTip(
+            "Watch this file for new lines. The global switch is "
+            "View > Follow New Lines")
+        act.toggled.connect(lambda on, p=pos: self._source_follow_toggled(p, on))
+        menu.addAction(act)
+        menu.exec(self.source_list.mapToGlobal(point))
 
     def _alias_of_row(self, row: int) -> str:
         if 0 <= row < len(self.session.sources):
@@ -801,6 +1268,10 @@ class MainWindow(QMainWindow):
         # (FR-9), so this is a rebuild and not a repaint.
         self.minimap.refresh()
         self.timeline.refresh()
+        # ... and the marks with them: a layer is merged timestamps, and a
+        # source switched off removes some of them. `scan_key` carries the
+        # enabled flags for exactly this, so `request` re-runs itself.
+        self.marks.request(self.view.highlights.rules)
         self._update_span()
 
     def _update_span(self) -> None:
@@ -849,5 +1320,7 @@ class MainWindow(QMainWindow):
         """
         self.cancel_indexing()
         self._join_thread()
+        self.follow.stop()
+        self.marks.stop()
         self.session.close()
         super().closeEvent(event)

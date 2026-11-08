@@ -185,6 +185,7 @@ class MergeIndex:
         self._cp_cursors = np.zeros((0, 0), dtype=np.int64)
         self._anchor_row = np.zeros(0, dtype=np.int64)
         self._anchor_ts = np.zeros(0, dtype=np.int64)
+        self._seen = np.zeros(len(sources), dtype=np.int64)
         self._built = False
         self.build_checkpoints()
 
@@ -349,21 +350,60 @@ class MergeIndex:
     # ------------------------------------------------------------------
 
     def build_checkpoints(self, window: int = WINDOW_ROWS) -> None:
+        """Rebuild from scratch: one pass over every timestamp."""
+        k = len(self.sources)
+        found = self._scan(0, np.zeros(k, dtype=np.int64), self._stride(), window)
+        rows, tss, curs, anchor_rows, anchor_tss = found
+
+        self._cp_row = np.asarray(rows, dtype=np.int64)
+        self._cp_ts = np.asarray(tss, dtype=np.int64)
+        self._cp_cursors = (
+            np.vstack(curs) if curs else np.zeros((0, k), dtype=np.int64)
+        )
+        self._anchor_row = (np.concatenate(anchor_rows) if anchor_rows
+                            else np.zeros(0, dtype=np.int64))
+        self._anchor_ts = (np.concatenate(anchor_tss) if anchor_tss
+                           else np.zeros(0, dtype=np.int64))
+        self._built = True
+        self._cache.clear()
+        self._seen = self._counts()
+        self._record_stats()
+
+    def _stride(self) -> int:
+        """
+        Rows between row-to-time anchors, so their count stays bounded.
+
+        One row per anchor below the bound, which makes the table exact for a
+        small merge (see ROW_TIME_ANCHORS).
+        """
+        return max(1, -(-self.total // ROW_TIME_ANCHORS))
+
+    def _scan(
+        self,
+        row: int,
+        cursors: np.ndarray,
+        stride: int,
+        window: int,
+    ) -> tuple[list[int], list[int], list[np.ndarray], list, list]:
+        """
+        Merge from `(row, cursors)` to the end, collecting checkpoints and anchors.
+
+        Split out of `build_checkpoints` so `extend_checkpoints` can run the
+        same loop from a checkpoint in the middle. There is deliberately only
+        one copy of the commit rule -- a second copy that drifted would produce
+        a merge whose order depended on whether the file was followed or
+        reopened, which is the worst class of bug this design can have.
+        """
         C = self.checkpoint
         k = len(self.sources)
-        cursors = np.zeros(k, dtype=np.int64)
         rows: list[int] = []
         tss: list[int] = []
         curs: list[np.ndarray] = []
         anchor_rows: list[np.ndarray] = []
         anchor_tss: list[np.ndarray] = []
-        row = 0
+        cursors = np.asarray(cursors, dtype=np.int64).copy()
         total = self.total
         take = window
-        # Anchors every `stride` rows, so their count is bounded whatever the
-        # merge's size (see ROW_TIME_ANCHORS). One row per anchor below the
-        # bound, which makes the table exact for a small merge.
-        stride = max(1, -(-total // ROW_TIME_ANCHORS))
 
         while row < total:
             ts_s, s_s, _p_s, bound = self._window(cursors, take)
@@ -405,19 +445,144 @@ class MergeIndex:
             )
             row += commit
 
-        self._cp_row = np.asarray(rows, dtype=np.int64)
-        self._cp_ts = np.asarray(tss, dtype=np.int64)
-        self._cp_cursors = (
-            np.vstack(curs) if curs else np.zeros((0, k), dtype=np.int64)
-        )
-        self._anchor_row = (np.concatenate(anchor_rows) if anchor_rows
-                            else np.zeros(0, dtype=np.int64))
-        self._anchor_ts = (np.concatenate(anchor_tss) if anchor_tss
-                           else np.zeros(0, dtype=np.int64))
-        self._built = True
-        self._cache.clear()
+        return rows, tss, curs, anchor_rows, anchor_tss
 
-        self.stats.rows = total
+    # ------------------------------------------------------------------
+    # SPEC 6.4: keeping the checkpoints current under follow (M6)
+    # ------------------------------------------------------------------
+
+    def extend_checkpoints(self, window: int = WINDOW_ROWS) -> int:
+        """
+        Fold appended entries into the existing checkpoints. Returns the first
+        merged row whose content may have changed, or `self.total` if nothing did.
+
+        ## Why this is not just "rebuild, it is only one pass"
+
+        One pass over every timestamp is the cheapest possible *full* build and
+        it is still O(rows): measured at **7.3 Mrow/s**, so a 10 M-row merge
+        costs 1.4 s. FR-21 gives appended lines 200 ms to appear, and NFR-8
+        wants following to be nearly free, so a rebuild per tick fails both by
+        an order of magnitude on exactly the sets people tail.
+
+        ## What actually has to be redone
+
+        The merged order is determined by the timestamps (see the module
+        docstring), so an appended entry can only disturb rows it sorts *before*.
+        Let `t` be the earliest timestamp among the appended entries. Every row
+        before the last checkpoint with `cp_ts < t` has a timestamp below `t`,
+        so no appended entry can precede it -- that checkpoint's cursors are
+        still exact, and the merge can resume from there.
+
+        For a well-behaved tail that is the **last** checkpoint, and the work is
+        the appended rows plus at most `checkpoint` rows of old merge. For a
+        source whose clock ran behind, it is further back, and the cost rises in
+        proportion to how far out of order the writer is -- which is the right
+        shape, because nothing cheaper can be correct.
+
+        A source that *shrank* is not an append at all (truncation or rotation,
+        SPEC 7.2); it falls back to a full rebuild, and the caller finds out
+        from the returned row being 0.
+        """
+        if not self._built:
+            self.build_checkpoints(window)
+            return 0
+
+        now = self._counts()
+        if np.array_equal(now, self._seen):
+            return self.total
+        if np.any(now < self._seen):
+            # Truncated or rotated: the entries behind the existing cursors are
+            # not the ones they were recorded against.
+            self.build_checkpoints(window)
+            return 0
+
+        earliest = self._earliest_appended(now)
+        if earliest is None:                     # growth only in disabled sources
+            self._seen = now
+            self._record_stats()
+            return self.total
+
+        # Last checkpoint strictly before the earliest appended entry.
+        c = int(np.searchsorted(self._cp_ts, earliest, side="left")) - 1
+        if c < 0:
+            self.build_checkpoints(window)
+            return 0
+
+        from_row = int(self._cp_row[c])
+        stride = self._stride()
+        found = self._scan(from_row, self._cp_cursors[c], stride, window)
+        rows, tss, curs, anchor_rows, anchor_tss = found
+
+        self._cp_row = np.concatenate([self._cp_row[:c],
+                                       np.asarray(rows, dtype=np.int64)])
+        self._cp_ts = np.concatenate([self._cp_ts[:c],
+                                      np.asarray(tss, dtype=np.int64)])
+        self._cp_cursors = np.vstack(
+            [self._cp_cursors[:c]]
+            + ([np.vstack(curs)] if curs else
+               [np.zeros((0, len(self.sources)), dtype=np.int64)]))
+
+        keep = int(np.searchsorted(self._anchor_row, from_row, side="left"))
+        self._anchor_row = np.concatenate(
+            [self._anchor_row[:keep]]
+            + (anchor_rows or [np.zeros(0, dtype=np.int64)]))
+        self._anchor_ts = np.concatenate(
+            [self._anchor_ts[:keep]]
+            + (anchor_tss or [np.zeros(0, dtype=np.int64)]))
+        self._thin_anchors()
+
+        # Blocks are replayed from the checkpoints, so everything from the
+        # resume point on is stale even where the checkpoints agree.
+        for block in [b for b in self._cache if b * self.checkpoint >= from_row]:
+            del self._cache[block]
+
+        self._seen = now
+        self._record_stats()
+        return from_row
+
+    def _counts(self) -> np.ndarray:
+        return np.array([s.n for s in self.sources], dtype=np.int64)
+
+    def _earliest_appended(self, now: np.ndarray) -> int | None:
+        """Smallest skewed timestamp among entries not seen at the last build."""
+        best: int | None = None
+        for i in self.active:
+            s = self.sources[i]
+            at = int(self._seen[i])
+            if at >= int(now[i]):
+                continue
+            # Read from the index's RAW `ts`, not the merge's `ts_sorted`.
+            # Entry indices `[seen, n)` are the appended ones by definition, so
+            # this slice is O(appended). In `ts_sorted` they are not a slice at
+            # all: a file that was not time-ordered (SPEC 4.6) puts an appended
+            # line with an old timestamp early in the sorted view, and
+            # `ts_sorted[seen:]` would then be the *old* entries that got
+            # shifted along -- reporting the tail's timestamp and resuming far
+            # too late.
+            lowest = int(s.index.ts[at:].min()) + s.skew_us
+            best = lowest if best is None else min(best, lowest)
+        return best
+
+    def _thin_anchors(self) -> None:
+        """
+        Keep the anchor table bounded across many appends.
+
+        The stride is chosen from the row count, so every append makes it
+        coarser -- and the anchors kept from before the resume point were
+        recorded at the *old*, finer stride. Left alone, a file followed for an
+        hour accumulates them. Dropping every n-th is safe because `row_times`
+        interpolates between whatever anchors exist and does not assume they are
+        evenly spaced; the ones kept stay exact.
+        """
+        size = int(self._anchor_row.size)
+        if size <= 2 * ROW_TIME_ANCHORS:
+            return
+        step = -(-size // ROW_TIME_ANCHORS)
+        self._anchor_row = self._anchor_row[::step].copy()
+        self._anchor_ts = self._anchor_ts[::step].copy()
+
+    def _record_stats(self) -> None:
+        self.stats.rows = self.total
         self.stats.sources = len(self.active)
         self.stats.checkpoints = int(self._cp_row.size)
         self.stats.checkpoint_bytes = int(

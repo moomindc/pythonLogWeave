@@ -332,8 +332,43 @@ class StripTheme:
 
     background: tuple[int, int, int] = (0x16, 0x18, 0x1d)
     severity: tuple[tuple[int, int, int], ...] = field(
-        default_factory=lambda: tuple(
-            _rgb(palette.SEVERITY_COLOURS[Severity(i)]) for i in range(CLASSES)))
+        default_factory=lambda: _strip_severity())
+
+    density: tuple[int, int, int] = (0x8a, 0x94, 0xa3)
+    """
+    The timeline's single colour.
+
+    Deliberately a neutral grey and not a member of the severity ramp. The two
+    strips sit side by side, and when both were drawn as stacked severity bands
+    they read as two copies of one thing -- which they nearly were, because the
+    minimap's bar length cannot vary. One saturated colour map next to one
+    monochrome bar chart tells a reader at a glance that they are being shown
+    two different quantities.
+    """
+
+
+UNCLASSIFIED = (0x39, 0x3f, 0x4a)
+"""
+What `Severity.NONE` is drawn as **on a strip**, overriding the palette.
+
+The palette's NONE is a mid grey, which is right where it means "no severity
+mark on this row". On a 64-pixel strip it is wrong twice over. Most entries in
+most logs carry no level word at all -- an access log has none by construction
+-- so NONE is usually the widest band, and at mid grey it floods the minimap
+and leaves the colours that matter as a fringe. It also lands close enough to
+the timeline's density grey that the two strips start resembling each other
+again, which is the thing the split was for.
+
+Dimmed to just above the background, it recedes into "ordinary traffic" and the
+saturated classes read as marks on it. Nothing is hidden: an unclassified
+stretch is still visibly distinct from an idle one, which is blank.
+"""
+
+
+def _strip_severity() -> tuple[tuple[int, int, int], ...]:
+    colours = [_rgb(palette.SEVERITY_COLOURS[Severity(i)]) for i in range(CLASSES)]
+    colours[int(Severity.NONE)] = UNCLASSIFIED
+    return tuple(colours)
 
 
 def _rgb(hex_str: str) -> tuple[int, int, int]:
@@ -341,23 +376,54 @@ def _rgb(hex_str: str) -> tuple[int, int, int]:
     return (int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16))
 
 
+def band_widths(totals: np.ndarray, width: int, *,
+                peak: int | None = None, fill: bool = False) -> np.ndarray:
+    """
+    How wide each pixel row's bar is, before it is divided up.
+
+    The bar is the row's entry count against the busiest row's, so an idle
+    stretch is blank and the busiest moment is full width. Linear, not log: the
+    question the timeline answers is "how much happened here", and a log scale
+    would make a quiet minute and a catastrophic one look comparable. The
+    minimum below is what stops a quiet minute reading as *nothing*.
+
+    `fill` gives every non-empty row the whole width instead. That is the right
+    answer for the **row-proportional** minimap, where every pixel covers the
+    same number of rows by construction: scaling by density there encodes a
+    quantity that cannot vary, and all it actually produces is a ragged right
+    edge where rounding differs by a row or two.
+    """
+    totals = np.asarray(totals, dtype=np.int64)
+    if totals.size == 0 or width <= 0:
+        return np.zeros(totals.shape, dtype=np.int64)
+    if fill:
+        return np.where(totals > 0, width, 0).astype(np.int64)
+
+    top = int(totals.max()) if peak is None else int(peak)
+    if top <= 0:
+        return np.zeros(totals.shape, dtype=np.int64)
+    band = np.maximum(
+        np.where(totals > 0, BAR_MIN_PX, 0),
+        (totals * width // top).astype(np.int64),
+    )
+    return np.clip(band, 0, width)
+
+
 def widths_for(counts: np.ndarray, width: int, *, peak: int | None = None,
-               min_mark: int = MIN_MARK_PX) -> np.ndarray:
+               min_mark: int = MIN_MARK_PX, fill: bool = False) -> np.ndarray:
     """
     Per-pixel-row segment widths: `(rows, 8)` int64 summing to at most `width`.
 
-    Two things are encoded at once, which is what makes one strip answer both
-    "when was it busy" and "where are the errors":
+    The bar from `band_widths` is divided between the severity classes in
+    proportion to their counts, lowest class first, so the band's colour is the
+    mix of what is in it. The minimum-width rule then runs over the result: any
+    class with entries gets at least `min_mark` pixels, funded by the widest
+    class below it. See `MIN_MARK_PX` for why a strip without it is unusable.
 
-    * **Density.** A row's total width is its entry count against the busiest
-      row's, so an idle stretch is blank and a burst is a full-width band.
-    * **Composition.** That width is divided between the severity classes in
-      proportion to their counts, lowest class first, so the band's colour is
-      the mix of what is in it.
-
-    The minimum-width rule then runs over the result: any class with entries
-    gets at least `min_mark` pixels, funded by the widest class below it. See
-    `MIN_MARK_PX` for why a strip without it is unusable.
+    This is the **minimap's** encoding (`fill=True`): the whole width, divided
+    by composition. The timeline uses `render_density_rgba` instead and shows
+    no severity at all -- see its docstring for why the two strips deliberately
+    encode different things.
     """
     counts = np.asarray(counts, dtype=np.int64)
     rows = counts.shape[0]
@@ -366,16 +432,9 @@ def widths_for(counts: np.ndarray, width: int, *, peak: int | None = None,
         return out
 
     totals = counts.sum(axis=1)
-    top = int(totals.max()) if peak is None else int(peak)
-    if top <= 0:
+    band = band_widths(totals, width, peak=peak, fill=fill)
+    if not band.any():
         return out
-
-    # Density first: how wide the whole band is.
-    band = np.maximum(
-        np.where(totals > 0, BAR_MIN_PX, 0),
-        (totals * width // top).astype(np.int64),
-    )
-    np.clip(band, 0, width, out=band)
 
     # Then composition, by truncating division. The remainder is given to the
     # *highest* class present rather than spread around: it is a pixel or two,
@@ -432,7 +491,7 @@ def _apply_min_mark(out: np.ndarray, counts: np.ndarray, band: np.ndarray,
 
 
 def render_rgba(strip: Strip, width: int, *, theme: StripTheme | None = None,
-                reverse: bool = False) -> np.ndarray:
+                fill: bool = False) -> np.ndarray:
     """
     The strip as a `(height, width, 4)` RGBA buffer, ready to blit.
 
@@ -442,8 +501,8 @@ def render_rgba(strip: Strip, width: int, *, theme: StripTheme | None = None,
     is two NumPy calls and one `drawImage`. SPEC 8 says a repaint should be a
     blit; this is what makes it one.
 
-    `reverse` draws each band from the right edge instead of the left, which is
-    what puts the two strips back to back with their quiet ends together.
+    `fill` gives every non-empty row the whole width, which is what the
+    row-proportional minimap wants: see `band_widths`.
 
     ## Why run-lengths and not a per-pixel comparison
 
@@ -471,35 +530,51 @@ def render_rgba(strip: Strip, width: int, *, theme: StripTheme | None = None,
         buf[..., 3] = 255
         return buf
 
-    widths = widths_for(strip.counts, width)
+    widths = widths_for(strip.counts, width, fill=fill)
 
     # Nine runs a row: one per severity class, then the background that fills
     # out the rest of the width. `counts` may be zero for any of them, which is
     # what makes a run-length encoding right here -- an absent class is a run
     # of length nought and needs no special case.
+    #
+    # `widths` is indexed by class, 0..7 ascending; the runs are emitted in the
+    # reverse of that, so CRITICAL is the leftmost band. See `_RUN_CLASSES`.
     counts = np.empty((height, CLASSES + 1), dtype=np.int64)
-    counts[:, :CLASSES] = widths
+    counts[:, :CLASSES] = widths[:, ::-1]
     counts[:, CLASSES] = width - widths.sum(axis=1)
 
-    runs = np.tile(_RUN_CLASSES, height)
-    if reverse:
-        runs = np.tile(_RUN_CLASSES_REVERSED, height)
-        counts = counts[:, ::-1]
-    classes = np.repeat(runs, counts.ravel()).reshape(height, width)
+    classes = np.repeat(np.tile(_RUN_CLASSES, height),
+                        counts.ravel()).reshape(height, width)
     np.take(_lut(theme), classes, axis=0, out=buf)
     return buf
 
 
-_RUN_CLASSES = np.arange(CLASSES + 1, dtype=np.uint8)
-"""The eight severity classes then the background, as palette rows."""
-
-_RUN_CLASSES_REVERSED = _RUN_CLASSES[::-1].copy()
+_RUN_CLASSES = np.array([*range(CLASSES - 1, -1, -1), CLASSES], dtype=np.uint8)
 """
-The same runs right to left, for a strip whose band grows from its right edge.
+The severity classes **highest first**, then the background, as palette rows.
 
-Reversing the run *order* rather than flipping the finished buffer: a flip is
-another full-size copy, and the whole point of the function above is that there
-is exactly one write per pixel.
+Descending, and that is the whole of the fix for a strip that read as
+right-justified. The bands were emitted in class order, 0 to 7, which puts
+`NONE` -- usually most of a log, and deliberately dimmed to near the background
+(see `UNCLASSIFIED`) -- along the left edge and pushes WARNING, ERROR and
+CRITICAL out to the right. The strip was then a wide dark band with the only
+colours that matter as a fringe against the far edge, varying in position from
+pixel row to pixel row as the unclassified share moved.
+
+Reversed, every saturated band starts at x=0. Three consequences, each of which
+is the actual reason:
+
+* **A mark is at a fixed place.** Scanning for errors becomes reading one
+  column, rather than following a ragged edge across 64 pixels.
+* **It agrees with everything beside it.** `overlay_marks` draws at the left
+  edge, and the timeline's bars are left-justified; a severity map justified the
+  other way was the only thing in the overview growing rightwards.
+* **The widest band is the one that can afford to be clipped.** `NONE` now runs
+  to the right edge, where the viewport box and the strip's separator rule sit.
+
+Nothing about the proportions changes -- `widths_for` still divides by
+composition and still applies `MIN_MARK_PX`. Only the order they are laid down
+in does.
 """
 
 
@@ -515,6 +590,54 @@ def _lut(theme: StripTheme) -> np.ndarray:
     lut[CLASSES, 0:3] = theme.background
     lut[:, 3] = 255
     return lut
+
+
+def render_density_rgba(strip: Strip, width: int, *,
+                        theme: StripTheme | None = None) -> np.ndarray:
+    """
+    The timeline: entries per time bucket, as a plain bar chart.
+
+    One colour, left-justified, bar length proportional to how many entries
+    fall in that pixel's slice of wall-clock time. No severity, by design.
+
+    ## Why this is not the minimap's encoding
+
+    Both strips originally drew stacked severity bands scaled by density, and
+    side by side they were nearly indistinguishable -- for a reason worth
+    writing down rather than restyling around. The minimap's axis is **rows**,
+    so every pixel holds the same number of entries by construction and its bar
+    length *cannot vary*. All its information is in the colour mix. The
+    timeline's axis is **time**, so its bar length is the only thing that
+    varies interestingly, and severity shading on top of it is a second
+    variable competing with the one the strip exists to show.
+
+    So they are split: the minimap is a full-width colour map of what kind of
+    entries are where, and the timeline is a monochrome bar chart of how many
+    there are when. Each encodes one thing, and the two are legible apart.
+
+    Severity has not been lost from the overview -- it is on the minimap, which
+    is also the strip you scroll with.
+    """
+    theme = theme or StripTheme()
+    height = strip.height
+    buf = np.empty((height, max(1, width), 4), dtype=np.uint8)
+    if width <= 0 or not strip.counts.size:
+        buf[..., 0:3] = theme.background
+        buf[..., 3] = 255
+        return buf
+
+    band = band_widths(strip.totals, width)
+    # Two runs a row -- the bar, then the background -- which is the same
+    # run-length blit as `render_rgba` with a palette of two.
+    counts = np.empty((height, 2), dtype=np.int64)
+    counts[:, 0] = band
+    counts[:, 1] = width - band
+    lut = np.array([[*theme.density, 255], [*theme.background, 255]],
+                   dtype=np.uint8)
+    classes = np.repeat(np.tile(np.array([0, 1], dtype=np.uint8), height),
+                        counts.ravel()).reshape(height, width)
+    np.take(lut, classes, axis=0, out=buf)
+    return buf
 
 
 def overlay_marks(buf: np.ndarray, pixels: np.ndarray, colour: tuple[int, int, int],
@@ -536,4 +659,92 @@ def overlay_marks(buf: np.ndarray, pixels: np.ndarray, colour: tuple[int, int, i
     rows = np.clip(np.asarray(pixels, dtype=np.int64), 0, buf.shape[0] - 1)
     w = max(1, min(int(span), buf.shape[1]))
     buf[rows[:, None], np.arange(w)[None, :], 0:3] = colour
+    return buf
+
+
+# ---------------------------------------------------------------------------
+# the user-rule mark gutter (FR-31a, SPEC 8.4)
+# ---------------------------------------------------------------------------
+
+MARK_COLUMN_PX = 3
+"""
+Width of one marked rule's column in the gutter.
+
+Three, not one: a mark has to be findable without being hunted for, and at one
+pixel a single hit in a 700-pixel strip is a hairline that antialiasing in a
+screenshot can lose entirely. The same argument as `MIN_MARK_PX`, applied to the
+other axis.
+"""
+
+MARK_GUTTER_MAX = 0.34
+"""
+Most of a strip's width the gutter may take.
+
+A reader who marks eight rules must not end up with a strip that is all gutter
+and no map. Past the cap the columns are narrowed instead of the bands being
+squeezed out, which degrades the thing that was added rather than the thing it
+was added to.
+"""
+
+
+def mark_gutter(layers, width: int) -> int:
+    """
+    How many pixels on the right belong to user-rule marks.
+
+    Zero when nothing is marked, which is the ordinary case and costs nothing:
+    the strips render exactly as they did before this existed.
+    """
+    n = len(layers)
+    if n == 0 or width <= 0:
+        return 0
+    cap = max(1, int(width * MARK_GUTTER_MAX))
+    return int(min(cap, MARK_COLUMN_PX * n))
+
+
+def render_mark_gutter(layers, edges: np.ndarray, height: int, width: int, *,
+                       theme: StripTheme | None = None,
+                       fallback: tuple[int, int, int] = (0xff, 0xff, 0xff)
+                       ) -> np.ndarray:
+    """
+    The gutter as its own `(height, width, 4)` RGBA block.
+
+    **Why a reserved column and not an overlay.** `overlay_marks` draws over
+    whatever is beneath it, which was the right answer while the severity bands
+    were a stacked map whose left edge was `NONE` -- dim, uninformative, and
+    free to be covered. Now that the bands descend from the left
+    (`_RUN_CLASSES`), the left edge is where CRITICAL and ERROR live, and a user
+    rule drawn over it would hide the one thing the strip is scanned for in
+    order to show the other. So the two encodings get their own space: severity
+    grows from the left, user marks from the right, and neither can erase the
+    other.
+
+    One column per layer, in rule order, so a mark keeps its position for as
+    long as the rule list does -- a column that moved when an unrelated rule was
+    toggled would be unreadable even though every pixel in it was correct.
+    """
+    theme = theme or StripTheme()
+    buf = np.empty((max(0, height), max(0, width), 4), dtype=np.uint8)
+    if buf.size == 0:
+        return buf
+    buf[..., 0:3] = theme.background
+    buf[..., 3] = 255
+    if not len(layers):
+        return buf
+
+    # Integer split, remainder to the leftmost columns: with a 4px gutter and
+    # three layers the widths are 2, 1, 1 rather than one layer silently
+    # getting nothing.
+    n = len(layers)
+    base, extra = divmod(width, n)
+    x = 0
+    for i, layer in enumerate(layers):
+        w = base + (1 if i < extra else 0)
+        if w <= 0:
+            continue
+        colour = _rgb(layer.colour) if layer.colour else fallback
+        rows = layer.pixels(edges)
+        if np.size(rows):
+            rows = np.clip(np.asarray(rows, dtype=np.int64), 0, height - 1)
+            buf[rows[:, None], np.arange(x, x + w)[None, :], 0:3] = colour
+        x += w
     return buf

@@ -35,6 +35,7 @@ from logweave.highlight import (  # noqa: E402
     SEVERITY_SET,
     SHAPES_SET,
     SYSLOG_SET,
+    USER_SET,
     HighlightRule,
     Ruleset,
 )
@@ -744,7 +745,7 @@ def test_the_active_rulesets_are_remembered(window):
 
     again = second_window()
     try:
-        assert again.highlight_group.active == {SEVERITY_SET}
+        assert again.highlight_group.active == {SEVERITY_SET, USER_SET}
         assert again.highlight_acts[SHAPES_SET].isChecked() is False
     finally:
         again.session.close()
@@ -757,6 +758,9 @@ def test_an_unknown_remembered_ruleset_is_ignored(window):
 
     again = second_window()
     try:
+        # The remembered value replaces the default active set outright, so
+        # `user` is absent here because it was absent from what was stored --
+        # which is the whole point: a remembered choice is a choice.
         assert again.highlight_group.active == {SEVERITY_SET}
         assert again.view.highlights.rejected == []
     finally:

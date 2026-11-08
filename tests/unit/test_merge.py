@@ -21,6 +21,9 @@ from conftest import files_of, index_of
 
 from logweave.index.fileindex import FileIndex
 from logweave.merge import CHECKPOINT, MergeIndex, MergeSource, merge_of
+from logweave.merge.mergeindex import ROW_TIME_ANCHORS
+
+US = 1_000_000
 
 
 def fake_index(ts, order=None, source_id="fake") -> FileIndex:
@@ -483,3 +486,218 @@ def test_row_times_error_is_bounded_by_the_anchor_stride():
     span = int(ts[-1] - ts[0])
     # Each strip pixel covers 250 rows; the anchors are 49 rows apart.
     assert np.abs(got - want).max() < span / 800
+
+
+# ---------------------------------------------------------------------------
+# SPEC 6.4: incremental checkpoints under follow (M6)
+# ---------------------------------------------------------------------------
+#
+# The standard of proof here is identity, not similarity. A merge that was
+# followed must end up with the *same* checkpoints, cursors, anchors and rows
+# as the same content opened cold -- otherwise someone who tailed a file sees a
+# different log from someone who opened it afterwards, and no test of "looks
+# about right" would catch it.
+
+
+def grown(ix: FileIndex, more, *, reorder: bool = False) -> FileIndex:
+    """Append timestamps to a fake index in place, as the indexer would."""
+    ix.ts = np.concatenate([ix.ts, np.asarray(more, dtype=np.int64)])
+    n = ix.ts.size
+    ix.off = np.arange(n + 1, dtype=np.uint64) * 100
+    ix.flags = np.zeros(n, dtype=np.uint8)
+    ix.line_no = np.arange(n, dtype=np.uint32) + 1
+    if reorder:
+        ix.order = np.argsort(ix.ts, kind="stable").astype(np.uint64)
+    return ix
+
+
+def rebuilt_like(m: MergeIndex) -> MergeIndex:
+    """A cold merge over the same sources' current content."""
+    srcs = []
+    for s in m.sources:
+        ix = fake_index(s.index.ts, source_id=s.index.source_id)
+        ix.order = s.index.order
+        srcs.append(MergeSource(ix, skew_us=s.skew_us, enabled=s.enabled,
+                                name=s.name))
+    return MergeIndex(srcs)
+
+
+def assert_identical(a: MergeIndex, b: MergeIndex) -> None:
+    assert a.total == b.total
+    assert np.array_equal(a._cp_row, b._cp_row)
+    assert np.array_equal(a._cp_ts, b._cp_ts)
+    assert np.array_equal(a._cp_cursors, b._cp_cursors)
+    assert merged_pairs(a) == merged_pairs(b)
+
+
+def test_a_tail_append_lands_identically_to_a_cold_rebuild():
+    a = fake_index(np.arange(5000, dtype=np.int64) * US, source_id="a")
+    b = fake_index(np.arange(5000, dtype=np.int64) * US + US // 2, source_id="b")
+    m = MergeIndex([MergeSource(a, name="a"), MergeSource(b, name="b")])
+
+    grown(a, np.arange(5000, 5100, dtype=np.int64) * US)
+    grown(b, np.arange(5000, 5050, dtype=np.int64) * US + US // 2)
+    m.extend_checkpoints()
+
+    assert_identical(m, rebuilt_like(m))
+    assert m.total == 10_150
+
+
+def test_extending_resumes_near_the_tail_rather_than_at_the_start():
+    """
+    The whole point. An append may only disturb rows it sorts before, so the
+    merge resumes from the last checkpoint below the earliest appended
+    timestamp -- which for an ordinary tail is within one checkpoint of the end.
+    """
+    a = fake_index(np.arange(40_000, dtype=np.int64) * US, source_id="a")
+    m = MergeIndex([MergeSource(a, name="a")])
+    grown(a, np.arange(40_000, 40_010, dtype=np.int64) * US)
+
+    from_row = m.extend_checkpoints()
+
+    assert from_row > 0
+    assert m.total - from_row <= CHECKPOINT + 10
+
+
+def test_extending_reports_nothing_changed_when_no_source_grew():
+    a = fake_index(np.arange(100, dtype=np.int64) * US, source_id="a")
+    m = MergeIndex([MergeSource(a, name="a")])
+    cps = m._cp_row.copy()
+    assert m.extend_checkpoints() == m.total    # == total means "no rows moved"
+    assert np.array_equal(m._cp_row, cps)
+
+
+def test_an_append_that_sorts_backwards_rebuilds_the_rows_it_overtakes():
+    """
+    A writer whose clock is behind appends entries that belong *before* rows
+    already shown. Resuming at the tail would merge them in at the wrong place,
+    and the merged view would disagree with the same files opened cold.
+    """
+    a = fake_index(np.arange(20_000, dtype=np.int64) * US, source_id="a")
+    b = fake_index(np.arange(20_000, dtype=np.int64) * US + US // 2, source_id="b")
+    m = MergeIndex([MergeSource(a, name="a"), MergeSource(b, name="b")])
+
+    # 3000 s back, which is ~6000 merged rows -- well behind the last checkpoint.
+    grown(a, [17_000 * US + 1], reorder=True)
+    from_row = m.extend_checkpoints()
+
+    assert from_row < m.total - CHECKPOINT      # went back further than the tail
+    assert_identical(m, rebuilt_like(m))
+
+
+def test_the_earliest_appended_entry_is_found_through_raw_entry_order():
+    """
+    Regression. The appended entries are entry indices `[seen, n)`, which is a
+    slice of the index's raw `ts` but *not* of the merge's `ts_sorted`: in a
+    reordered file (SPEC 4.6) a backdated append shifts every sorted position
+    after it along, so `ts_sorted[seen:]` is a handful of old entries and
+    reports a timestamp far too high. Resuming from there would merge the
+    backdated entry in after rows it belongs before.
+
+    Built so the trap fires: the appended entry is the *earliest* in the file,
+    so in sorted order it takes position 0 and `ts_sorted[seen:]` is the tail.
+    """
+    a = fake_index((np.arange(12_000, dtype=np.int64) + 1000) * US, source_id="a")
+    m = MergeIndex([MergeSource(a, name="a")])
+    grown(a, [0], reorder=True)
+
+    assert m.extend_checkpoints() == 0          # must redo from the very start
+    assert_identical(m, rebuilt_like(m))
+    assert m.row_to_time(0) == 0
+
+
+def test_a_truncated_source_falls_back_to_a_full_rebuild():
+    """
+    Fewer entries than last time is not an append (SPEC 7.2: truncation or
+    rotation). The recorded cursors point into content that is no longer there,
+    so there is nothing to resume from and the caller is told so by row 0.
+    """
+    a = fake_index(np.arange(3000, dtype=np.int64) * US, source_id="a")
+    m = MergeIndex([MergeSource(a, name="a")])
+    a.ts = a.ts[:1000]
+    a.off = np.arange(1001, dtype=np.uint64) * 100
+    a.flags = np.zeros(1000, dtype=np.uint8)
+    a.line_no = np.arange(1000, dtype=np.uint32) + 1
+
+    assert m.extend_checkpoints() == 0
+    assert m.total == 1000
+    assert_identical(m, rebuilt_like(m))
+
+
+def test_growth_in_a_disabled_source_changes_no_rows():
+    """FR-9: a source that is off contributes nothing, including when it grows."""
+    a = fake_index(np.arange(500, dtype=np.int64) * US, source_id="a")
+    b = fake_index(np.arange(500, dtype=np.int64) * US, source_id="b")
+    m = MergeIndex([MergeSource(a, name="a"),
+                    MergeSource(b, enabled=False, name="b")])
+    before = merged_pairs(m)
+
+    grown(b, np.arange(500, 700, dtype=np.int64) * US)
+    assert m.extend_checkpoints() == m.total
+    assert merged_pairs(m) == before
+
+
+def test_many_appends_leave_the_checkpoints_exact_and_the_anchors_bounded():
+    """
+    300 follow ticks. Checkpoints must still match a cold build exactly, and the
+    anchor table must not grow with the number of ticks -- the stride coarsens
+    as rows accumulate, so anchors kept from earlier ticks are denser than the
+    current stride and would otherwise pile up.
+    """
+    a = fake_index(np.arange(1000, dtype=np.int64) * US, source_id="a")
+    m = MergeIndex([MergeSource(a, name="a")])
+    for _ in range(300):
+        grown(a, int(a.ts[-1]) + US + np.arange(500, dtype=np.int64) * US)
+        m.extend_checkpoints()
+
+    cold = rebuilt_like(m)
+    assert m.total == 151_000
+    assert np.array_equal(m._cp_row, cold._cp_row)
+    assert np.array_equal(m._cp_ts, cold._cp_ts)
+    assert m.stats.row_time_anchors <= 2 * ROW_TIME_ANCHORS
+    # and the anchors kept are still exact, which is what the minimap reads
+    probe = np.arange(0, m.total, 997)
+    assert np.array_equal(m.row_times(probe), cold.row_times(probe))
+
+
+def test_extending_drops_only_the_cached_blocks_that_went_stale():
+    """
+    Blocks are replayed from the checkpoints, so every block from the resume
+    point on is stale even where the checkpoints themselves agree. Blocks
+    before it are untouched -- dropping those would throw away the scrollback
+    on screen and make a follow tick feel like a reload.
+    """
+    a = fake_index(np.arange(40_000, dtype=np.int64) * US, source_id="a")
+    m = MergeIndex([MergeSource(a, name="a")])
+    m.rows(0, 100)                       # block 0 cached
+    m.rows(39_000, 100)                  # a block near the tail cached
+    assert len(m._cache) == 2
+
+    grown(a, [40_000 * US])
+    from_row = m.extend_checkpoints()
+
+    assert 0 in m._cache
+    assert all(b * m.checkpoint < from_row for b in m._cache)
+
+
+def test_a_followed_merge_serves_the_same_rows_as_a_cold_one():
+    """
+    End to end, on three sources with different rates and a skew, appended in
+    seventeen uneven ticks: every merged row must match the cold merge.
+    """
+    rng = np.random.default_rng(4)
+    srcs = [fake_index(np.sort(rng.integers(0, 600_000, 2000)).astype(np.int64),
+                       source_id=f"s{i}") for i in range(3)]
+    m = MergeIndex([MergeSource(srcs[0], name="s0"),
+                    MergeSource(srcs[1], skew_us=1500, name="s1"),
+                    MergeSource(srcs[2], name="s2")])
+    end = 600_000
+    for _tick in range(17):
+        for ix in srcs:
+            n = int(rng.integers(0, 60))
+            if n:
+                grown(ix, np.sort(rng.integers(end, end + 5000, n)).astype(np.int64))
+        end += 5000
+        m.extend_checkpoints()
+
+    assert_identical(m, rebuilt_like(m))

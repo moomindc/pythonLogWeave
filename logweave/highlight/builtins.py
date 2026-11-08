@@ -33,6 +33,19 @@ from .rules import HighlightRule, Ruleset, RulesetGroup
 SEVERITY_SET = "severity"
 SHAPES_SET = "shapes"
 SYSLOG_SET = "syslog"
+USER_SET = "user"
+"""
+The set a user's own rules live in -- FR-31.
+
+A fourth set rather than rules mixed into the other three, so that "my rules"
+is one switch, so that a reset of the shipped sets cannot take a user's work
+with it, and so that the thing being saved to the settings store is exactly one
+list with a name.
+
+Empty when the application ships, and **active**: a set that had to be switched
+on before a rule a user had just typed did anything would read as the rule not
+working.
+"""
 
 
 def _severity_rules() -> list[HighlightRule]:
@@ -158,14 +171,17 @@ def default_group() -> RulesetGroup:
     outside a raw syslog capture, and a rule that almost never fires still
     costs a branch in the one regex every row is scanned with. It is one switch
     away for anyone reading those files.
+
+    The fourth set, `user`, ships empty and on; see `USER_SET`.
     """
     return RulesetGroup(
         sets={
             SEVERITY_SET: Ruleset(_severity_rules()),
             SHAPES_SET: Ruleset(_shape_rules()),
             SYSLOG_SET: Ruleset(_syslog_rules()),
+            USER_SET: Ruleset([]),
         },
-        active={SEVERITY_SET, SHAPES_SET},
+        active={SEVERITY_SET, SHAPES_SET, USER_SET},
     )
 
 

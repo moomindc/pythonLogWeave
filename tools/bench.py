@@ -494,6 +494,214 @@ def run_cache_benches(b: Bench, chunk: bytes) -> None:
                  f"including {overview / (1 << 20):.1f}MB of overview histogram"))
 
 
+MARK_SUBJECT_BYTES = 2 << 20
+"""
+How much log text the mark-scan rows are measured over.
+
+Two megabytes, because the slowest row is 0.77 MB/s and the harness has to stay
+something a person runs before a commit. Independent of `--chunk-mb` on
+purpose: these rows are a property of `re`, not of the corpus size, so pinning
+the subject keeps them comparable across runs of different shapes -- and keeps
+them out of the baseline's workload check for the same reason.
+"""
+
+
+def run_mark_benches(b: Bench, chunk: bytes) -> None:
+    """
+    What a strip mark costs -- FR-31a, SPEC 10.1, 14.1f.
+
+    The measurement that decided the design of `session.marks`, and the one
+    that decided marking has to be opt-in at all. `re` has no DFA: an
+    alternation is tried branch by branch at every position, so a scan's
+    throughput falls roughly linearly in the number of branches -- which means
+    the paint path's single-alternation trick (SPEC 10.1) is exactly the wrong
+    shape for a whole-file scan.
+
+    Every row is the same subject, so only the pattern differs.
+
+    **The subject is capped at `MARK_SUBJECT_BYTES`, not the whole chunk**, and
+    that is a consequence of the thing being measured rather than a shortcut.
+    The last row runs at 0.77 MB/s, so over a 64 MB chunk it alone would be 83
+    seconds a rep -- four minutes of a harness that has to stay runnable. A
+    throughput figure does not need a big subject; it needs the same subject
+    for every row, which is what this gives.
+    """
+    import re as _re
+
+    from logweave.highlight import default_ruleset
+
+    chunk = chunk[:MARK_SUBJECT_BYTES]
+
+    # Patterns that do not match, so the figure is scanning cost and not match
+    # bookkeeping -- a rule a reader is hunting with is rare by construction.
+    absent = ["timeout", "deadlock", "OutOfMemory", "refused", "retrying"]
+
+    def alternation(words, flags=_re.IGNORECASE):
+        body = b"|".join(b"(?P<g%d>%s)" % (i, w.encode())
+                         for i, w in enumerate(words))
+        return _re.compile(body, flags)
+
+    def scan_with(pattern):
+        return lambda: sum(1 for _ in pattern.finditer(chunk))
+
+    b.throughput("mark_scan_literal_cs",
+                 scan_with(_re.compile(absent[0].encode())), len(chunk),
+                 note="one case-sensitive literal: `re` takes a fast "
+                      "substring path and nothing else here comes close")
+    b.throughput("mark_scan_literal_ci",
+                 scan_with(_re.compile(absent[0].encode(), _re.IGNORECASE)),
+                 len(chunk),
+                 note="the same literal, case-insensitively -- the realistic "
+                      "shape of a user rule, and 20x worse because the fast "
+                      "substring path is gone")
+    b.throughput("mark_scan_3_rules_one_pass",
+                 scan_with(alternation(absent[:3])), len(chunk),
+                 note="three rules as ONE alternation, the way the paint path "
+                      "compiles them")
+    b.throughput("mark_scan_5_rules_one_pass",
+                 scan_with(alternation(absent[:5])), len(chunk),
+                 note="five the same way; the fall from three is the branch "
+                      "count, not the flags")
+
+    def separate():
+        for word in absent[:5]:
+            pattern = _re.compile(word.encode(), _re.IGNORECASE)
+            for _ in pattern.finditer(chunk):
+                pass
+
+    # Over `len(chunk)`, not `len(chunk) * 5`: the job is "scan this subject
+    # for these five rules", so the only comparable denominator is the subject.
+    # Charging it five times would make the slower arrangement look faster.
+    b.throughput("mark_scan_5_rules_separately", separate, len(chunk),
+                 note="the same five as five passes, which is what "
+                      "`session.marks` does -- 2.3x better than one "
+                      "alternation, and the reason it scans per rule")
+
+    rules = [r for r in default_ruleset().rules if r.enabled]
+    whole = alternation([r.pattern for r in rules[:30]])
+    b.throughput("mark_scan_whole_default_ruleset",
+                 scan_with(whole), len(chunk),
+                 note=f"{min(30, len(rules))} branches -- what marking the "
+                      f"shipped ruleset would cost. This row is why marking is "
+                      f"opt-in per rule (FR-31a) rather than a global switch")
+
+
+def run_follow_benches(b: Bench, rows: int, sources: int) -> None:
+    """
+    What a follow tick costs -- SPEC 7, NFR-8, M6.
+
+    NFR-8 gives 200ms from a line being written to it being on screen, of which
+    the 150ms poll interval spends most. What is measured here is the other
+    half, and each row is written against the full rebuild it replaces, because
+    the only interesting question about an incremental update is how much it
+    saves over not being incremental.
+    """
+    from logweave.index.fileindex import FileIndex
+    from logweave.index.histogram import Histogram
+    from logweave.merge import MergeIndex, MergeSource
+    from logweave.source.poller import probe_path
+
+    rng = np.random.default_rng(11)
+    per = max(1, rows // sources)
+    span = 24 * 3600 * 1_000_000          # a day, in us
+
+    def index_of(n: int, seed_ts=None) -> FileIndex:
+        ts = (np.sort(rng.integers(0, span, n)).astype(np.int64)
+              if seed_ts is None else seed_ts)
+        return FileIndex(
+            source_id="bench", ts=ts,
+            off=np.arange(ts.size + 1, dtype=np.uint64) * 100,
+            flags=rng.integers(0, 8, ts.size).astype(np.uint8),
+            line_no=(np.arange(ts.size, dtype=np.uint32) + 1),
+        )
+
+    # ---- the histogram (SPEC 8.1): extend against rebuild
+    hist_ts = np.sort(rng.integers(0, span, rows)).astype(np.int64)
+    hist_sev = rng.integers(0, 8, rows).astype(np.uint8)
+    b.rowrate("follow_histogram_rebuild",
+              lambda: Histogram.build(hist_ts, hist_sev), rows,
+              note="what a tick would cost without `extend`: O(entries)")
+
+    hist = Histogram.build(hist_ts, hist_sev)
+    tail_ts = hist_ts[-1] + np.arange(1, 501, dtype=np.int64) * 1000
+    tail_sev = rng.integers(0, 8, 500).astype(np.uint8)
+    hist.extend(tail_ts[:1], tail_sev[:1])          # warm
+    b.latency("follow_histogram_extend",
+              lambda: hist.extend(tail_ts, tail_sev), 1,
+              note=f"500 entries appended to a {hist.nbuckets:,}-bucket grid; "
+                   f"counts only the buckets touched")
+
+    # ---- the checkpoints (SPEC 6.4): extend against rebuild
+    indexes = [index_of(per) for _ in range(sources)]
+    merge = MergeIndex([MergeSource(index=ix, name=f"s{i}")
+                        for i, ix in enumerate(indexes)])
+    b.rowrate("follow_merge_rebuild", merge.build_checkpoints, merge.total,
+              note="what a tick would cost without `extend_checkpoints`")
+
+    def append_tail(n: int = 125) -> None:
+        for ix in indexes:
+            more = int(ix.ts[-1]) + np.arange(1, n + 1, dtype=np.int64) * 1000
+            ix.ts = np.concatenate([ix.ts, more])
+            ix.off = np.arange(ix.ts.size + 1, dtype=np.uint64) * 100
+            ix.flags = np.zeros(ix.ts.size, dtype=np.uint8)
+            ix.line_no = np.arange(ix.ts.size, dtype=np.uint32) + 1
+
+    def timed_extend(prepare) -> float:
+        """
+        Best of `b.reps`, timing `extend_checkpoints` **alone**.
+
+        The harness's `latency` would have to time the preparation too, and
+        growing eight 400 k-element arrays costs more than the thing being
+        measured -- the benchmark would then be reporting `np.concatenate`
+        under a name that claims to be the merge.
+        """
+        best = float("inf")
+        for _ in range(max(2, b.reps)):
+            prepare()
+            t0 = time.perf_counter()
+            merge.extend_checkpoints()
+            best = min(best, time.perf_counter() - t0)
+        return best
+
+    seconds = timed_extend(append_tail)
+    b.results.append(Result(
+        "follow_merge_extend", "us/call", seconds * 1e6, seconds, False,
+        note=f"{sources} sources x 125 appended rows onto {merge.total:,}; "
+             f"resumes from the last checkpoint below the earliest new entry"))
+
+    # ---- a writer whose clock is behind: how far back the resume has to go
+    def backdate() -> None:
+        ix = indexes[0]
+        late = int(ix.ts[-1]) - 30_000_000           # 30 s in the past
+        ix.ts = np.concatenate([ix.ts, np.array([late], dtype=np.int64)])
+        ix.off = np.arange(ix.ts.size + 1, dtype=np.uint64) * 100
+        ix.flags = np.zeros(ix.ts.size, dtype=np.uint8)
+        ix.line_no = np.arange(ix.ts.size, dtype=np.uint32) + 1
+        ix.order = np.argsort(ix.ts, kind="stable").astype(np.uint64)
+
+    seconds = timed_extend(backdate)
+    b.results.append(Result(
+        "follow_merge_extend_backdated", "us/call", seconds * 1e6, seconds, False,
+        note="one entry timestamped 30s ago; an out-of-order writer costs in "
+             "proportion to how far out of order it is"))
+
+    # ---- the watcher itself
+    with tempfile.TemporaryDirectory(prefix="logweave-follow-") as tmp:
+        paths = []
+        for i in range(sources):
+            p = Path(tmp) / f"s{i}.log"
+            p.write_bytes(b"x" * 4096)
+            paths.append(p)
+
+        def one_pass() -> None:
+            for p in paths:
+                probe_path(p)
+
+        b.latency("follow_poll_pass", one_pass, 1,
+                  note=f"one stat per source, {sources} sources; the whole cost "
+                       f"of watching, every 150ms, on its own thread")
+
+
 def report(results: list[Result], baseline: dict | None, tolerance: float) -> list[str]:
     name_w = max(len(r.name) for r in results) + 1
     print(f"\n{'benchmark':<{name_w}} {'value':>12} {'unit':<9} {'time':>9}  "
@@ -530,6 +738,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--baseline", type=Path,
                     default=Path(__file__).resolve().parent / "bench_baseline.json")
     ap.add_argument("--update-baseline", action="store_true")
+    ap.add_argument("--skip-follow", action="store_true",
+                    help="skip the follow-tick benchmarks (SPEC 7, NFR-8)")
     ap.add_argument("--gate", action="store_true", help="exit non-zero on regression")
     ap.add_argument("--tolerance", type=float, default=0.25)
     ap.add_argument("--cores", type=int, default=0,
@@ -553,6 +763,10 @@ def main(argv: list[str] | None = None) -> int:
         run_merge_benches(b, args.merge_rows, args.merge_sources)
     if not args.skip_cache:
         run_cache_benches(b, chunk)
+    if not args.skip_follow:
+        run_follow_benches(b, args.merge_rows, args.merge_sources)
+    if not args.skip_follow:
+        run_mark_benches(b, chunk)
 
     # A baseline is only comparable to a run of the same shape. Several
     # benchmarks (histogram, build_cumulative) scale with bucket count rather

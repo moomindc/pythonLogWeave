@@ -23,6 +23,7 @@ from logweave.highlight import (
     SEVERITY_SET,
     SHAPES_SET,
     SYSLOG_SET,
+    USER_SET,
     HighlightRule,
     Ruleset,
     Style,
@@ -463,14 +464,33 @@ def test_the_shipped_rules_all_compile():
     group = default_group()
     for name, rs in group.sets.items():
         assert rs.rejected == [], (name, rs.rejected)
+        if name == USER_SET:
+            # The fourth set is where a user's own rules go (FR-31). It ships
+            # empty, which is a set with nothing in it rather than a set that
+            # failed to compile -- `rejected` above is what tells those apart.
+            assert rs.rules == []
+            continue
         assert rs.rules, name
+
+
+def test_the_user_set_ships_empty_and_already_on():
+    """
+    FR-31: a rule a user has just typed must colour something without their
+    having to find a switch for it first. The set it lands in is therefore
+    active from the start, and being active while empty contributes nothing --
+    `(?!)` can never match.
+    """
+    group = default_group()
+    assert group.sets[USER_SET].rules == []
+    assert USER_SET in group.active
+    assert group.flatten().style_of("anything at all").is_plain
 
 
 def test_syslog_priorities_are_available_but_off_by_default():
     group = default_group()
     assert SYSLOG_SET in group.sets
     assert SYSLOG_SET not in group.active
-    assert group.active == {SEVERITY_SET, SHAPES_SET}
+    assert group.active == {SEVERITY_SET, SHAPES_SET, USER_SET}
 
     assert group.flatten().style_of("<3>kernel: oops").is_plain
     group.active.add(SYSLOG_SET)

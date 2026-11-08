@@ -290,6 +290,22 @@ class Session:
         if self._overview is not None:
             self._overview.invalidate()
 
+    def replace_index(self, source: int, index: FileIndex) -> None:
+        """
+        Swap in a re-read index for one source -- the follow path (M6).
+
+        The merge holds its own `MergeSource` per source, each referring to a
+        `FileIndex` *object*. An append produces a new one (see
+        `index.appending`), so assigning it to the `SessionSource` alone leaves
+        the merge reading the index as it was when the checkpoints were built --
+        which looks exactly like a follow that is working except that no new
+        rows ever appear. Both references move here, together, so there is no
+        window in which they disagree.
+        """
+        self.sources[source].index = index
+        if self._merge is not None:
+            self._merge.sources[source].index = index
+
     def close(self) -> None:
         for s in self.sources:
             s.source.close()

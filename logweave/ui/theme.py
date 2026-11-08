@@ -116,6 +116,25 @@ file (SPEC 4.5). A guess and a fact should not look identical.
 STATUS_WARN = "#d9a33c"
 STATUS_ERROR = "#e06c4f"
 
+FOLLOW_ACTIVE = "#6fbf73"
+"""
+The colour of "following", in the status bar and on the new-lines indicator.
+
+Green rather than the accent blue the selection uses, because following is a
+*state of the world* -- lines are arriving -- and not a thing the user has
+selected. A reader glancing at the window should be able to tell at once
+whether what they are looking at is still moving.
+"""
+
+STALE = "#8a6a4a"
+"""
+FR-25: a source that is gone or unreachable. Muted brown, not red.
+
+Red is for a severity in the log, and a vanished share is not an error in the
+file -- the content already read is still perfectly good. It needs to read as
+"this one has stopped" rather than as "something is wrong with this line".
+"""
+
 CHROME = "#1b1e24"
 HANDLE = "#3a3f4a"
 HANDLE_HOVER = "#4d535f"
