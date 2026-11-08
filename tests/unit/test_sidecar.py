@@ -512,3 +512,78 @@ def _restamp(target: Path, root: Path, log: Path, *, size: int, mtime_ns: int,
     moved = root / sidecar.cache_name(log, size, mtime_ns)
     target.replace(moved)
     return moved
+
+
+# ---------------------------------------------------------------------------
+# the overview histogram (SPEC 8.1, M5)
+# ---------------------------------------------------------------------------
+
+def test_the_histogram_survives_the_round_trip(log, root):
+    """
+    The histogram is cached for the same reason the arrays are: rebuilding it
+    on open would mean reading every timestamp back out of the mapping, which
+    is the work NFR-4 exists to avoid.
+    """
+    _, idx, head = store(log, root)
+    got = look(log, root, head).index
+
+    assert got.hist is not None
+    assert got.hist.t0 == idx.hist.t0
+    assert got.hist.bucket_us == idx.hist.bucket_us
+    assert got.hist.counts.shape == idx.hist.counts.shape
+    assert np.array_equal(got.hist.counts, idx.hist.counts)
+    assert got.hist.total == idx.n
+
+
+def test_the_histogram_is_memory_mapped_like_everything_else(log, root):
+    _, _, head = store(log, root)
+    got = look(log, root, head).index
+    assert isinstance(got.hist.counts, np.memmap)
+    # Two dimensions, not a flat array reshaped on faith -- the header carries
+    # the shape so a disagreement is a refusal rather than a transposed strip.
+    assert got.hist.counts.ndim == 2
+
+
+def test_the_prefix_sum_is_rebuilt_from_a_mapped_histogram(log, root):
+    """
+    `cum` is derived, so it is never stored -- it is twice the size of what it
+    is derived from. It has to be buildable from the mapping, which means the
+    mapped counts have to be a real array and not a lazy proxy.
+    """
+    _, idx, head = store(log, root)
+    got = look(log, root, head).index
+    assert np.array_equal(got.hist.cum, idx.hist.cum)
+
+
+def test_a_header_whose_shape_disagrees_with_its_length_is_refused(log, root):
+    """
+    A silently transposed overview would be the worst available failure: it
+    looks like data and is noise. The reader checks rather than reshapes.
+    """
+    target = sidecar_of(log, root)
+    _, _, head = store(log, root)
+    blob = target.read_bytes()
+    at = len(sidecar.MAGIC)
+    (hlen,) = sidecar.HEADER_LEN.unpack(blob[at:at + sidecar.HEADER_LEN.size])
+    at += sidecar.HEADER_LEN.size
+    header = json.loads(blob[at:at + hlen].decode("utf-8"))
+    for spec in header["arrays"]:
+        if spec["name"] == "hist":
+            spec["shape"] = [spec["len"], 3]
+    new = json.dumps(header, separators=(",", ":")).encode("utf-8")
+    head_blob = sidecar.MAGIC + sidecar.HEADER_LEN.pack(len(new)) + new
+    target.write_bytes(head_blob + b"\0" * (sidecar.PAGE - len(head_blob))
+                       + blob[sidecar.PAGE:])
+
+    got = look(log, root, head)
+    assert got.miss
+    assert "unreadable sidecar" in got.reason
+
+
+def test_the_format_version_bump_retires_the_older_sidecars(log, root):
+    """
+    A version 2 sidecar has no histogram, and there is nothing to be gained by
+    serving one: the strips would have no data and the only way to get it would
+    be the full read the cache exists to avoid.
+    """
+    assert sidecar.FORMAT_VERSION >= 3

@@ -30,6 +30,7 @@ from ..source.base import LogSource
 from . import sidecar
 from .detect import Detection
 from .fileindex import FileIndex
+from .histogram import Histogram
 from .indexer import build_index
 from .layoutio import from_json, to_json
 from .layouts import TimestampFormat
@@ -278,6 +279,15 @@ def _splice(old: FileIndex, tail: FileIndex) -> FileIndex:
     ts = out.ts
     s.monotonic = bool(ts.size < 2 or np.all(ts[1:] >= ts[:-1]))
     out.order = None if s.monotonic else np.argsort(ts, kind="stable").astype(np.uint64)
+
+    # The overview histogram is rebuilt over the whole index rather than having
+    # the tail's counts added to the prefix's (SPEC 8.1). Adding would be
+    # cheaper and is wrong: a longer span can widen the bucket, and a tail that
+    # starts before `t0` -- which an out-of-order append does -- has no bucket
+    # to be added to. Rebuilding is one vectorised pass over timestamps already
+    # in memory, and it is the path that `invalidate` would otherwise have to
+    # be remembered on.
+    out.hist = Histogram.build(ts, out.severity) if out.n else None
     return out
 
 

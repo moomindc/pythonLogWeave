@@ -94,7 +94,12 @@ class MergedLogView(QAbstractScrollArea):
     """The merged, time-ordered view of every open source."""
 
     rowsChanged = Signal()
-    currentRowChanged = Signal(int)
+    currentRowChanged = Signal("qlonglong")
+    """
+    `qlonglong`: a row number is int64 here on purpose (SPEC 9.1), and
+    `Signal(int)` would narrow it back to the C++ `int` this view exists to
+    avoid -- silently, at the row ceiling, through a signal connection.
+    """
     copied = Signal(int)
     copyRefused = Signal(int)
     timestampVisibilityChanged = Signal(bool)

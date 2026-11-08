@@ -164,12 +164,14 @@ like logs, one level deep.
 | Ctrl+Shift+C | Copy the same rows verbatim — no attribution, no timestamp column |
 | Ctrl+A | Select all (a copy past 200 000 rows is refused rather than truncated) |
 | Ctrl+T | Hide the timestamp column — see below |
+| Ctrl+M / Ctrl+L | Collapse the minimap / the timeline — see below |
 | Ctrl++ / Ctrl+- / Ctrl+0 | Text size, also Ctrl+wheel; remembered between runs |
 | Arrows, PgUp/PgDn, Home/End | Move; hold Shift to extend the selection |
 | Scrollbar at the bottom | Scrolls the message only; the line number, timestamp, alias and lanes stay put |
 | View ▸ Source Alias Column | The short name of each row's file, as words rather than a colour |
 | View ▸ Line Number Column | Each entry's line number *within its own file*, in a gutter on the left |
 | View ▸ Lane Width | 4–12px per lane |
+| Right edge | Two overview strips: the minimap, then the timeline. Click or drag either to go there — see below |
 | View ▸ Highlighting | Which of the shipped rule sets are in force — see below |
 | Double-click a dock row | Rename that source; clear the name to go back to the default |
 | File ▸ Clear Index Cache | Delete the saved indexes — see below |
@@ -181,7 +183,8 @@ you keep coming back to — only has its new tail read. Nothing is reused unless
 the file's head still hashes the same, so a rotated log is re-indexed rather
 than mis-read.
 
-The saved indexes cost about 21 bytes an entry and live in
+The saved indexes cost about 21 bytes an entry, plus a few megabytes for the
+overview histogram the two strips are drawn from, and live in
 `%LOCALAPPDATA%\LogWeave\index` (`$XDG_CACHE_HOME/logweave/index` on Linux,
 `~/Library/Caches/LogWeave/index` on macOS) — never beside the log, which is
 often read-only or on a share. They are capped and swept oldest-used-first, and
@@ -226,6 +229,31 @@ scanned once however many rules there are, and the result is memoised by the
 row's text. Colouring an ordinary file is lost in the run-to-run noise; a file
 that is all stack traces, six highlighted spans to a row, costs about 3 ms a
 frame (see M4 below).
+
+**The two overview strips.** On the right, outside the scrollbar, and both on
+by default. They look similar and answer opposite questions.
+
+The **minimap** is the inner one, and its axis is *rows*: every pixel covers
+the same share of the merged stream, so it is a scrollbar you can read. Drag it
+and you move linearly through the log; the lighter box on it is where the
+viewport currently is.
+
+The **timeline** is the outer one, and its axis is *wall-clock time* across the
+whole merged span. An idle hour is an inch of blank strip; a burst is a dense
+band. That is the thing the minimap physically cannot show — a row axis has no
+rows in a gap with which to draw the gap. The bright line on it is where you
+are. It seeks but deliberately does not drive the scrollbar, because a drag
+down the timeline advances through rows at wildly uneven rates and a scrollbar
+that behaved that way would be broken rather than informative.
+
+Both are coloured by severity, and both are drawn from the same counts, so the
+second one costs nothing to keep. **A class with any entries at all is given at
+least two pixels**, taken from the widest quieter class beside it: one ERROR
+among ten thousand INFO lines is a hundredth of a pixel by proportion, and
+finding that one line is the entire reason to look at an overview. Hover either
+strip for the time, the row and what is in that pixel.
+
+Ctrl+M and Ctrl+L collapse them independently, and the choice is remembered.
 
 **The line-number gutter.** Each entry's line number *within its own file*,
 not its position in the merged view — which is a number about the viewer rather
@@ -285,8 +313,8 @@ living record — updated as each lands.
 | **M3** | Qt shell: merged view, scrolling, drag-and-drop | ✅ **done** |
 | **M2b** | Sidecar cache, parallel indexer, indexing off the UI thread | ✅ **done** |
 | **M4** | Highlighting, severity classes, source lanes, aliases, text size, copy with and without attribution | ✅ **done** |
-| **M5** | Minimap and timeline strips | ⬜ next |
-| **M6** | Follow engine; rotation matrix green | ⬜ |
+| **M5** | Minimap and timeline strips | ✅ **done** |
+| **M6** | Follow engine; rotation matrix green | ⬜ next |
 | **M7** | Search, filters, selection, copy, export | ⬜ |
 | **M8** | Profiles, settings, file association — plus the highlight-rule editor and ruleset import/export that complete FR-31 | ⬜ |
 | **M9** | Packaging, signing, cold-start tuning — **v1.0** | ⬜ |
@@ -745,6 +773,142 @@ same failure the sidecar cache had at M2b, in a place that is easier to miss.
 
 ---
 
+## M5 — what it delivers and what it found
+
+Both overview strips (D4, FR-32, FR-33), either collapsible and remembered
+(FR-34), fed by one density histogram built during indexing and cached in the
+sidecar (SPEC §8.1).
+
+The two strips answer different questions and neither can answer the other's,
+which is the whole argument for shipping both:
+
+- The **minimap** is row-proportional — a scrollbar you can read. Every pixel
+  covers the same share of the merged rows, so dragging it moves linearly
+  through the stream, and it draws a box where the viewport currently is.
+- The **timeline** is time-proportional. An idle hour is an inch of blank
+  strip and a burst is a dense band. That is the one thing a row axis cannot
+  show: there are no rows in a gap to draw the gap with.
+
+Both are drawn from the same `uint32[buckets, 8]` of entries per time bucket
+per severity class. The second strip costs one extra array of H times, no
+second data structure and no second indexing pass — which is how risk R3, "two
+minimap render paths become the frame-budget bottleneck", was meant to be
+contained. It is contained, but not where the spec was looking.
+
+### The strips are 4× under budget, and the cost was never the aggregation
+
+`python tools/bench.py` and `python tools/bench_ui.py`, same machine and method
+as M3 and M4. Strips measured at 844 px, which is what a 1080p screen allows.
+
+| What | Cost | Against |
+|---|---|---|
+| Build the histogram | 38.2 M entries/s | ~3% of the indexing budget |
+| Build the prefix sum | 3.24 ms | once per index or append |
+| Range-sum one strip, 800 px | **83 µs** | SPEC §8's claim, confirmed |
+| **Repaint both strips (a scroll)** | **0.63 ms** | **26× under** a 16 ms frame |
+| **Re-aggregate both (a resize)** | **3.85 ms** | **4× under** |
+| Histogram in memory, 64 MB chunk | 4.67 MB | "a few MB a source" |
+
+SPEC §8 spent its care on the aggregation — the prefix sum exists so that a
+repaint never re-runs a `cumsum`. That part was right, and the aggregation is
+0.15 ms. But the first working version of the strips cost **5.65 ms each**, and
+all of it was *after* the aggregation, in the code that turns counts into
+pixels. Two strips at 11.3 ms left 4.7 ms of a frame for the view beside them.
+R3 came in through a door the spec was not watching.
+
+Two changes took it to 0.84 ms:
+
+- **A pixel row is nine contiguous runs** — eight severity classes and the
+  background — so `np.repeat` builds the whole row-major class map in one
+  call. What it replaced ran eight broadcast comparisons over the entire
+  buffer to work out which class owned each pixel: 1.2 ms for an answer
+  already implicit in the widths it had just computed.
+- **`np.take(..., out=buf)` writes colours straight into the destination.**
+  Indexing a three-channel *view* of the RGBA buffer instead allocates the
+  result and copies it across a stride of four: 1.5 ms for a slicing
+  convenience.
+
+Same lesson as M3's glyph cost and M4's span cost, from a third direction: in
+this application the data structure is never what costs, the per-pixel work at
+the end of it is.
+
+### Two numbers in SPEC §8 were wrong, in opposite directions
+
+**§8.1 asked for a million buckets and claimed "a few MB per source" in the
+same paragraph.** Those are not compatible. A million buckets is 32 MB of
+counts plus 64 MB of prefix sum — 96 MB a source, 770 MB across eight, against
+NFR-7's 500 MB for the whole application. The cap is now 65,536, which costs
+4.67 MB on a 64 MB chunk and loses nothing: the buckets exist to be aggregated
+onto pixels, and 65,536 is 32× the height of a 2000-pixel strip. The resolution
+being paid for could not be seen on any display.
+
+**§8.3 asked for too few lookups, not too many.** It said a minimap pixel's row
+boundaries are converted to times by "`row_to_time` on each boundary (a
+checkpoint lookup)". Checkpoints sit 4096 rows apart, so a strip pixel only
+contains one once the merge is over ~3.3M rows. Below that, the times between
+them are interpolated at a constant rate — and a log with a genuine idle gap
+*inside* one checkpoint block has that gap smeared across the rows around it.
+Built that way, a 7000-row merge drew ten blank minimap pixels in the middle
+and piled a thousand rows into the last one: an idle period that did not exist,
+beside a burst that did not either.
+
+The fix is a **fixed-size row-to-time anchor table**: 4096 anchors spread
+evenly over the merged rows, read out of the merge window while
+`build_checkpoints` already has it in hand. Fixed is the point — 32 KB whatever
+the merge's size, where one anchor per *n* rows would be 64 MB at the row
+ceiling. Against an 800-pixel strip every pixel holds about five anchors, and
+for any merge under 4096 rows the stride is one and the table is exact.
+
+### Four bugs found by building it
+
+1. **`Signal(int)` is a 32-bit C++ int.** A `wall_us` is around 1.8×10¹⁵, six
+   orders of magnitude past it. Every click on the timeline truncated the
+   timestamp and seeked to row 0. The only symptom was a `RuntimeWarning` on
+   stderr that a release build does not print — the seek simply did nothing,
+   repeatably, in a way that reads like a geometry mistake.
+
+   SPEC §9.1 already makes this exact argument about row numbers and
+   `QModelIndex.row()`, which is why the view paints from an int64 row index.
+   The argument had not been carried across to the signals, and
+   `currentRowChanged` had the same latent defect waiting at the row ceiling.
+   Both are now `Signal("qlonglong")`.
+
+2. **A menu built before the window is shown reads `isVisible()` False** for a
+   child that is perfectly visible — `setVisible(True)` does not make a widget
+   visible until its ancestors are mapped. So both strips were drawn on screen
+   and ticked *off* in the View menu from the moment the window opened. This is
+   the M4 lane-width trap in a new place: a menu built from one source of truth
+   and a widget set from another. `isVisibleTo(self)` asks the question that is
+   actually being asked.
+
+3. **The strip reported 6,996 of 7,000 rows.** A pixel's range is a half-open
+   run of buckets `[lo, hi)`, and the last edge is placed at the last entry's
+   own timestamp — which lands *inside* the bucket holding it, excluding that
+   bucket. Four rows missing in seven thousand is invisible on a strip. It was
+   caught by a test that summed the counts, which is now the first test in the
+   file.
+
+4. **The pixel buffer must outlive the `QImage` over it.** A `QImage` built on
+   a buffer does not copy it and does not own it. Letting the NumPy array fall
+   out of scope leaves the image pointing at freed memory — wrong pixels most
+   of the time, an access violation the rest, and neither reproducible.
+
+### Screenshot comparisons, without the screenshots
+
+SPEC §15 asked for "a small set of screenshot comparisons" for the strips. They
+are tested on their **exact pixels** instead, and that part of the suite runs in
+the engine CI job with no Qt installed at all — because `session/overview.py`
+renders a strip into an RGBA buffer with NumPy and `ui/strips.py` only blits it.
+
+So a test asserts that a single ERROR among ten thousand INFO lines is visible,
+at a known pixel, in the palette's error colour. By proportion that error is a
+hundredth of a pixel wide; finding it is the one thing a user scans an overview
+for, so any class with entries at all is guaranteed two pixels, funded by the
+widest class *below* it so that severity order survives the pressure. A
+similarity score against a reference image would have called that noise.
+
+---
+
 ## Layout
 
 ```
@@ -767,6 +931,7 @@ logweave/
     lines.py         line splitting and entry grouping
     indexer.py       chunked build and rollover inference
     fileindex.py     the four parallel arrays, 21 bytes an entry
+    histogram.py     the density histogram both overview strips are drawn from
     sidecar.py       the on-disk index cache: format, validation, LRU sweep
     cached.py        hit / append / miss -- indexing only what is not cached
     layoutio.py      the proven layout, serialised so an append can reuse it
@@ -777,12 +942,14 @@ logweave/
     prepare.py       warm the cache in worker processes, before opening
     rowformat.py     copy and export formatting, with attribution (D9)
     palette.py       severity ramp and source-lane colours
+    overview.py      the two strips as data, rendered to pixels without Qt
     aliasing.py      shortest distinguishing source names, for the column and copy
   highlight/   layer 5 by number, Qt-free by rule: the rules, not the colours
     rules.py         HighlightRule, Ruleset, the one-pass compiled scanner
     builtins.py      the three shipped rulesets: severity, shapes, syslog
   ui/          layer 5: the only layer allowed to import Qt
     mergedview.py    QAbstractScrollArea, custom paint, int64 row space
+    strips.py        the minimap and timeline widgets: one blit and the mouse
     mainwindow.py    drag-and-drop, source dock, menus, status reporting
     indexing.py      the worker thread that keeps the window answering
     settings.py      the view preferences that outlive the window

@@ -32,6 +32,15 @@ SHOW_ALIAS = "view/show_alias"
 SHOW_LINE_NO = "view/show_line_no"
 LANE_WIDTH = "view/lane_width"
 HIGHLIGHTS = "view/highlights"
+SHOW_MINIMAP = "view/show_minimap"
+SHOW_TIMELINE = "view/show_timeline"
+"""
+FR-34: either overview strip can be collapsed and the choice persists.
+
+Two keys rather than one tri-state, because the two strips are independent --
+D4's point is that they answer different questions, so "minimap only" and
+"timeline only" are both ordinary configurations rather than steps on a scale.
+"""
 
 
 def store() -> QSettings:

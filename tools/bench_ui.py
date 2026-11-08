@@ -22,6 +22,19 @@ that matters. So this opens a real window, parked off-screen.
 
 Long lines get their own case because they were a 10x hazard before the message
 was sliced to the visible character window.
+
+## The strips (M5)
+
+Risk R3 was that two minimap render paths become the frame-budget bottleneck.
+Three numbers settle it, and they are measured here rather than reasoned about:
+
+* **a strip re-aggregation** -- what a resize or a newly opened file costs,
+  which is the range-sum of SPEC 8.1 plus the NumPy that turns it into pixels
+* **a strip repaint** -- what a scroll costs, which should be one `drawImage`
+  and no aggregation at all, because the viewport box moves and the data under
+  it does not
+* **both strips together**, since D4 ships two of them and they repaint in the
+  same frame as the view
 """
 
 from __future__ import annotations
@@ -42,6 +55,7 @@ from PySide6.QtWidgets import QApplication  # noqa: E402
 from logweave.highlight import Ruleset  # noqa: E402
 from logweave.session import Session  # noqa: E402
 from logweave.ui.mergedview import MergedLogView  # noqa: E402
+from logweave.ui.strips import MinimapStrip, TimelineStrip  # noqa: E402
 
 BUDGET_MS = 16.0
 FMT = QImage.Format.Format_ARGB32_Premultiplied
@@ -154,6 +168,66 @@ def bench_view(session: Session, height: int, n: int = 60,
             "clamped": actual < height - 120}
 
 
+def bench_strips(session: Session, height: int, n: int = 60) -> dict[str, float]:
+    """
+    The two overview strips at `height` pixels (SPEC 8, risk R3).
+
+    Both are shown in a real window for the same reason the view is: the
+    offscreen backend is not what the user runs, and a blit is exactly the kind
+    of operation a fallback renderer gets wrong in a flattering direction.
+    """
+    strips = []
+    for cls in (MinimapStrip, TimelineStrip):
+        s = cls(session)
+        s.move(-6000, -6000)
+        s.resize(s.width(), height)
+        s.show()
+        strips.append(s)
+    QApplication.processEvents()
+
+    images = [QImage(s.size(), FMT) for s in strips]
+    rows = session.total_rows
+    rng = random.Random(5)
+
+    def repaint():
+        """A scroll: the box moves, the aggregation is memoised."""
+        for s, img in zip(strips, images, strict=True):
+            s.set_viewport(rng.randrange(max(1, rows - 60)), 60)
+            s.render(img)
+
+    def reaggregate():
+        """A resize or a new file: the buffer and the counts are rebuilt."""
+        for s, img in zip(strips, images, strict=True):
+            s.session.overview.invalidate()
+            s.refresh()
+            s.render(img)
+
+    both_repaint = time_ms(repaint, n)
+    both_reagg = time_ms(reaggregate, n)
+
+    # One strip on its own, so the per-strip cost is attributable rather than
+    # halved on an assumption.
+    one = strips[0]
+    one_img = images[0]
+
+    def one_repaint():
+        one.set_viewport(rng.randrange(max(1, rows - 60)), 60)
+        one.render(one_img)
+
+    single = time_ms(one_repaint, n * 4)
+
+    actual = strips[0].height()
+    for s in strips:
+        s.close()
+        s.deleteLater()
+    # Like the view's cases: a top-level window cannot exceed the physical
+    # screen, so a 2160px request on a 1080p display silently measures a
+    # 1080px strip. Reported rather than assumed, because a strip's cost is
+    # linear in its height and a clamped row would read as free scaling.
+    return {"repaint_one": single, "repaint_both": both_repaint,
+            "reaggregate_both": both_reagg, "height": float(actual)}
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--entries", type=int, default=20_000)
@@ -218,7 +292,26 @@ def main(argv: list[str] | None = None) -> int:
               f"{delta:>+7.2f} ms {on['spans']:>10.0f}")
     print()
 
+    print(f"{'overview strips (M5)':<24} {'tall':>7} {'1 repaint':>10} "
+          f"{'2 repaint':>10} {'2 re-aggregate':>15}")
+    print("-" * 68)
+    worst_strip = 0.0
+    session = Session()
+    session.add_files([cases[0][1]])
+    for height in (900, 1440, 2160):
+        r = bench_strips(session, height)
+        clamped = "  (clamped)" if r["height"] < height - 120 else ""
+        print(f"{str(height) + 'px asked':<24} {r['height']:>5.0f}px "
+              f"{r['repaint_one']:>7.3f} ms {r['repaint_both']:>7.3f} ms "
+              f"{r['reaggregate_both']:>12.3f} ms{clamped}")
+        worst_strip = max(worst_strip, r["reaggregate_both"])
+    session.close()
+    print()
+
     print(f"budget {BUDGET_MS:.0f} ms a frame (NFR-5).")
+    print(f"worst strip cost {worst_strip:.2f} ms "
+          f"= {BUDGET_MS / max(worst_strip, 1e-9):.0f}x under budget "
+          f"(both strips, re-aggregating: risk R3).")
     print(f"worst scroll step {worst_step:.2f} ms "
           f"= {BUDGET_MS / worst_step:.0f}x under budget.")
     print("A full repaint is a seek or a resize, not a scroll; it exceeds the")

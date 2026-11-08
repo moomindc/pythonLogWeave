@@ -51,8 +51,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 #                             the new normal.
 #   * extract_scalar_strptime -- what logmerger does today. There is no shipped
 #                             equivalent and there should not be.
-#   * histogram/cumulative/strip -- overview strips are M5; the prototype is
-#                             still the only implementation.
+#   * histogram/cumulative/strip -- M0's prototypes, kept as reference rows
+#                             beside the shipped `index.histogram` ones. They
+#                             run at the million buckets SPEC 8.1 originally
+#                             specified, which is exactly the measurement that
+#                             justified capping the shipped version at 65536:
+#                             the prototype's `build_cumulative` row is the
+#                             7.4ms repaint the cap and the prefix sum exist to
+#                             remove.
 from _prototypes import (  # noqa: E402
     build_cumulative,
     extract_fixed_iso,
@@ -64,6 +70,7 @@ from _prototypes import (  # noqa: E402
 from logweave.index import extract as _ex  # noqa: E402
 from logweave.index.detect import detect  # noqa: E402
 from logweave.index.fileindex import FileIndex  # noqa: E402
+from logweave.index.histogram import MAX_BUCKETS, Histogram  # noqa: E402
 from logweave.index.lines import group_entries, split_lines  # noqa: E402
 from logweave.index.severity import (  # noqa: E402
     severity_at_offset,
@@ -266,6 +273,7 @@ def run_index_benches(b: Bench, chunk: bytes) -> dict:
         edges = np.linspace(0, nbk, 801).astype(np.int64)
         b.latency("strip_repaint_800px", lambda: strip_aggregate(cum, edges), 1,
                   note="SPEC 8.2/8.3; must fit inside a 16ms frame (NFR-5)")
+        run_overview_benches(b, ets, esev)
 
     # The headline number: everything NFR-3 covers, in one pass.
     def full_pipeline():
@@ -292,6 +300,45 @@ def run_index_benches(b: Bench, chunk: bytes) -> dict:
                  note="worst case: unpredictable severity position")
 
     return {"lines": int(n), "entries": int(nent), "severity_offset": sev_off}
+
+
+def run_overview_benches(b: Bench, ts: np.ndarray, sev: np.ndarray) -> None:
+    """
+    The shipped overview histogram -- SPEC 8.1, risk R3.
+
+    The rows above measure M0's prototype at the million buckets SPEC 8.1
+    originally asked for. These measure what ships, at the 65536-bucket cap,
+    and the pair is the argument for the cap: the prototype's prefix sum is
+    half a frame and the shipped one is a small fraction of one, for resolution
+    that no display can show.
+
+    `strip_repaint_shipped` is the number risk R3 turns on. It must stay far
+    inside the 16 ms frame budget (NFR-5) *per strip*, because D4 ships two of
+    them and they repaint together.
+    """
+    nent = ts.size
+    b.rowrate("overview_histogram", lambda: Histogram.build(ts, sev), nent,
+              note=f"shipped, <= {MAX_BUCKETS} buckets")
+
+    hist = Histogram.build(ts, sev)
+    b.latency("overview_prefix_sum", lambda: _fresh_cum(hist), 1,
+              note="once per index or append, never in a repaint")
+
+    _ = hist.cum
+    edges = np.linspace(hist.t0, hist.t0 + hist.nbuckets * hist.bucket_us,
+                        801).astype(np.int64)
+    b.latency("strip_repaint_shipped", lambda: hist.range_counts(edges), 1,
+              note="one strip, 800px; D4 paints two (risk R3)")
+
+    print(f"  overview: {hist.nbuckets} buckets of {hist.bucket_us / 1e6:.0f}s, "
+          f"{hist.nbytes() / 1e6:.2f} MB with the prefix sum "
+          f"(SPEC 8.1 budget: a few MB a source)")
+
+
+def _fresh_cum(hist: Histogram):
+    """Force the prefix sum to be rebuilt, which is what an append costs."""
+    hist.invalidate()
+    return hist.cum
 
 
 def run_merge_benches(b: Bench, rows: int, k: int, seed: int = 7) -> None:
@@ -434,10 +481,17 @@ def run_cache_benches(b: Bench, chunk: bytes) -> None:
                        "whole 10GB set")
 
         size = sum(p.stat().st_size for p in root.glob("*.lwi"))
+        # The histogram is in the sidecar from M5 (SPEC 8.1) and is a fixed
+        # cost rather than a per-entry one, so it is subtracted out before the
+        # per-entry figure is reported and stated separately. Left in, this row
+        # would rise or fall with the span of the log rather than with its
+        # entries, and the number would stop meaning what its name says.
+        overview = warm.index.hist.counts.nbytes if warm.index.hist else 0
         b.results.append(Result(
-            "cache_bytes_per_entry", "B/entry", size / max(1, warm.index.n),
-            0.0, False,
-            note=f"off+ts+flags+line_no; {size / (1 << 20):.1f}MB sidecar"))
+            "cache_bytes_per_entry", "B/entry",
+            (size - overview) / max(1, warm.index.n), 0.0, False,
+            note=f"off+ts+flags+line_no; {size / (1 << 20):.1f}MB sidecar "
+                 f"including {overview / (1 << 20):.1f}MB of overview histogram"))
 
 
 def report(results: list[Result], baseline: dict | None, tolerance: float) -> list[str]:

@@ -50,6 +50,35 @@ forty the gutter would be wider than most of the messages.
 ROW_PADDING = 2
 """Pixels added to the font height for the row pitch. Legibility against density."""
 
+STRIP_WIDTH = 64
+"""
+Width of each overview strip in pixels (SPEC 8, FR-32, FR-33).
+
+Wide enough that a stacked severity band is readable -- eight classes at the
+two-pixel minimum need sixteen before any proportion shows at all -- and narrow
+enough that both strips together cost less than a tenth of a 1280px window.
+"""
+
+STRIP_VIEWPORT_BOX = "#8c99ad"
+STRIP_VIEWPORT_FILL = "#59243850"
+"""
+The minimap's viewport box (FR-32): a light outline over a translucent fill.
+
+Translucent, not opaque: the box sits *over* the severity bands and the point
+of the minimap is that you can see what is inside the box as well as where it
+is.
+
+`#AARRGGBB`, which is Qt's order for an eight-digit colour and not the
+`#RRGGBBAA` of CSS -- written the CSS way it is a 14%-opaque teal rather than a
+35%-opaque navy, which looks enough like a deliberate choice to survive review.
+"""
+
+STRIP_MARKER = "#d4d7dd"
+"""Where the view currently is, on the timeline. A single bright line."""
+
+STRIP_SEPARATOR = "#2a2e36"
+"""One-pixel rule between the strips, so two dark columns read as two."""
+
 WHEEL_LINES = 3
 MULTILINE_MARK = "⏎ "   # RETURN SYMBOL, for an entry with continuation lines
 

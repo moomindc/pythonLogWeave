@@ -1,8 +1,8 @@
 {
- "generated_utc": "2026-11-07T20:28:40Z",
+ "generated_utc": "2026-11-08T09:53:10Z",
  "source": "synthetic 64MB",
- "python": "3.14.5",
- "numpy": "2.5.0",
+ "python": "3.14.2",
+ "numpy": "2.5.4",
  "platform": "Windows AMD64",
  "cores": 12,
  "chunk_bytes": 67108897,
@@ -13,112 +13,127 @@
  "severity_offset": 27,
  "results": {
   "split_lines": {
-   "value": 732.6665099575093,
+   "value": 812.425425194378,
    "unit": "MB/s",
    "higher_is_better": true
   },
   "split_lines_lone_cr": {
-   "value": 551.4301547636575,
+   "value": 602.0931330755659,
    "unit": "MB/s",
    "higher_is_better": true
   },
   "detect_format": {
-   "value": 33587.59998809546,
+   "value": 33348.599972669035,
    "unit": "us/call",
    "higher_is_better": false
   },
   "extract_vectorised": {
-   "value": 163.82766636428084,
+   "value": 167.21957478851138,
    "unit": "MB/s",
    "higher_is_better": true
   },
   "extract_vectorised_rows": {
-   "value": 2.6202895703645925,
+   "value": 2.6390116970774864,
    "unit": "Mrow/s",
    "higher_is_better": true
   },
   "extract_vectorised_m0_hardcoded": {
-   "value": 192.0143418746446,
+   "value": 193.81468439374032,
    "unit": "MB/s",
    "higher_is_better": true
   },
   "extract_scalar_regex": {
-   "value": 6.822956405021839,
+   "value": 7.132083315953692,
    "unit": "MB/s",
    "higher_is_better": true
   },
   "extract_scalar_strptime": {
-   "value": 4.654520184655603,
+   "value": 4.62193771381817,
    "unit": "MB/s",
    "higher_is_better": true
   },
   "severity_fixed_offset": {
-   "value": 266.25798085250034,
+   "value": 262.0076468088316,
    "unit": "MB/s",
    "higher_is_better": true
   },
   "severity_regex_insensitive": {
-   "value": 4.942451663440632,
+   "value": 4.945940087768539,
    "unit": "MB/s",
    "higher_is_better": true
   },
   "histogram": {
-   "value": 50.79529731592681,
+   "value": 50.969046892621506,
    "unit": "Mrow/s",
    "higher_is_better": true
   },
   "build_cumulative": {
-   "value": 7400.1000029966235,
+   "value": 7722.900016233325,
    "unit": "us/call",
    "higher_is_better": false
   },
   "strip_repaint_800px": {
-   "value": 73.90003884211183,
+   "value": 77.20000576227903,
+   "unit": "us/call",
+   "higher_is_better": false
+  },
+  "overview_histogram": {
+   "value": 38.128726159068435,
+   "unit": "Mrow/s",
+   "higher_is_better": true
+  },
+  "overview_prefix_sum": {
+   "value": 3340.700000990182,
+   "unit": "us/call",
+   "higher_is_better": false
+  },
+  "strip_repaint_shipped": {
+   "value": 85.60001151636243,
    "unit": "us/call",
    "higher_is_better": false
   },
   "INDEX_TOTAL": {
-   "value": 93.80658655561582,
+   "value": 92.83425970222707,
    "unit": "MB/s",
    "higher_is_better": true
   },
   "INDEX_TOTAL_regex_fallback": {
-   "value": 4.765086025710086,
+   "value": 4.756593486053707,
    "unit": "MB/s",
    "higher_is_better": true
   },
   "merge_build_checkpoints": {
-   "value": 7.7156296678736025,
+   "value": 7.198636290851513,
    "unit": "Mrow/s",
    "higher_is_better": true
   },
   "merge_time_to_row": {
-   "value": 26.577150012599304,
+   "value": 28.0540999956429,
    "unit": "us/call",
    "higher_is_better": false
   },
   "merge_row_at_cold": {
-   "value": 2990.567499946337,
+   "value": 3233.4554998669773,
    "unit": "us/call",
    "higher_is_better": false
   },
   "merge_row_at_warm": {
-   "value": 8.194000110961497,
+   "value": 8.235500135924667,
    "unit": "us/call",
    "higher_is_better": false
   },
   "merge_block_4096": {
-   "value": 4809.904999856371,
+   "value": 5328.9430000586435,
    "unit": "us/call",
    "higher_is_better": false
   },
   "merge_paint_60rows_scrolling": {
-   "value": 49.40214997623116,
+   "value": 53.32169999019243,
    "unit": "us/call",
    "higher_is_better": false
   },
   "merge_paint_60rows_random": {
-   "value": 2766.9513000000734,
+   "value": 2992.242449981859,
    "unit": "us/call",
    "higher_is_better": false
   },
@@ -131,6 +146,21 @@
    "value": 0.985207100591716,
    "unit": "ratio",
    "higher_is_better": true
+  },
+  "cache_first_index": {
+   "value": 58.51191784028171,
+   "unit": "MB/s",
+   "higher_is_better": true
+  },
+  "cache_warm_reopen": {
+   "value": 4204.400000162423,
+   "unit": "us/call",
+   "higher_is_better": false
+  },
+  "cache_bytes_per_entry": {
+   "value": 21.010657987108303,
+   "unit": "B/entry",
+   "higher_is_better": false
   }
  }
 }

@@ -52,6 +52,30 @@ WINDOW_ROWS = 200_000
 BLOCK_CACHE_BLOCKS = 64
 """64 blocks x 4096 rows x ~20 B = ~5 MB, per SPEC 6.2."""
 
+ROW_TIME_ANCHORS = 4096
+"""
+Row-to-time anchors recorded during the checkpoint build, for the minimap.
+
+**A correction to SPEC 8.3**, which said the row-proportional strip converts
+each pixel's row boundaries to times by "`row_to_time` on each boundary (a
+checkpoint lookup)". The checkpoints are too coarse for that, and the failure
+is not subtle. They sit 4096 rows apart, so a strip pixel only contains one
+when the merge is over ~3.3M rows; below that, times between checkpoints are
+interpolated at a constant rate, and a log with a genuine idle gap inside one
+checkpoint block has that gap smeared evenly over the rows around it. The first
+minimap built this way showed a 7000-row merge as ten blank pixels in the
+middle and a solid band at the end -- an idle period the minimap had invented,
+and a thousand rows piled into the last pixel.
+
+So the build records a **fixed number** of row-to-time anchors, spread evenly
+over the merged rows, instead of relying on the checkpoints' spacing. Fixed is
+the point: 4096 anchors is 32 KB whatever the merge's size, where one anchor
+per `n` rows would be 64 MB at NFR-15's ceiling. Against an 800-pixel strip
+every pixel holds about five anchors, so a row's placement is good to a fifth
+of a pixel -- and for any merge under 4096 rows the step is one and the table
+is exact.
+"""
+
 
 @dataclass
 class MergeSource:
@@ -115,6 +139,8 @@ class MergeStats:
     sources: int = 0
     checkpoints: int = 0
     checkpoint_bytes: int = 0
+    row_time_anchors: int = 0
+    anchor_bytes: int = 0
     block_hits: int = 0
     block_misses: int = 0
     notes: list[str] = field(default_factory=list)
@@ -157,6 +183,8 @@ class MergeIndex:
         self._cp_row = np.zeros(0, dtype=np.int64)
         self._cp_ts = np.zeros(0, dtype=np.int64)
         self._cp_cursors = np.zeros((0, 0), dtype=np.int64)
+        self._anchor_row = np.zeros(0, dtype=np.int64)
+        self._anchor_ts = np.zeros(0, dtype=np.int64)
         self._built = False
         self.build_checkpoints()
 
@@ -224,6 +252,44 @@ class MergeIndex:
         block = self.rows(row, 1)
         return int(block.ts[0]) if len(block) else 0
 
+    def row_times(self, rows: np.ndarray) -> np.ndarray:
+        """
+        Wall time at each of many merged rows, from the anchor table.
+
+        What the row-proportional minimap needs (SPEC 8.3): a strip `H` pixels
+        tall converts `H + 1` row boundaries to times on every
+        re-aggregation. Doing that through `row_to_time` would be `H` block
+        replays -- 800 of them, at 1.2 ms cold -- so this reads the anchors
+        recorded during the checkpoint build and interpolates between them,
+        which is one `searchsorted` over at most 4096 values.
+
+        Exact at every anchor, interpolated between them at a constant rate.
+        See `ROW_TIME_ANCHORS` for why the anchors and not the checkpoints, and
+        what the first version of this got visibly wrong.
+        """
+        rows = np.asarray(rows, dtype=np.int64)
+        total = self.total
+        if total == 0:
+            return np.zeros(rows.shape, dtype=np.int64)
+
+        clipped = np.clip(rows, 0, total - 1)
+        xp, fp = self._anchor_row, self._anchor_ts
+        if xp.size == 0:
+            return np.full(rows.shape, self.time_span()[0], dtype=np.int64)
+        if xp.size == 1:
+            return np.full(rows.shape, int(fp[0]), dtype=np.int64)
+
+        # The last anchor is up to `stride` rows short of the end, and without
+        # something past it every row beyond would be given that anchor's
+        # timestamp -- which is how a thousand rows ended up in one minimap
+        # pixel. `time_span` already knows when the merge ends and costs
+        # nothing; the guard is because `np.interp` wants `xp` increasing, and
+        # a merge whose last row *is* an anchor would otherwise get a duplicate.
+        if total - 1 > int(xp[-1]):
+            xp = np.append(xp, total - 1)
+            fp = np.append(fp, self.time_span()[1])
+        return np.interp(clipped, xp, fp).astype(np.int64)
+
     def time_span(self) -> tuple[int, int]:
         lo, hi = None, None
         for i in self.active:
@@ -289,9 +355,15 @@ class MergeIndex:
         rows: list[int] = []
         tss: list[int] = []
         curs: list[np.ndarray] = []
+        anchor_rows: list[np.ndarray] = []
+        anchor_tss: list[np.ndarray] = []
         row = 0
         total = self.total
         take = window
+        # Anchors every `stride` rows, so their count is bounded whatever the
+        # merge's size (see ROW_TIME_ANCHORS). One row per anchor below the
+        # bound, which makes the table exact for a small merge.
+        stride = max(1, -(-total // ROW_TIME_ANCHORS))
 
         while row < total:
             ts_s, s_s, _p_s, bound = self._window(cursors, take)
@@ -320,6 +392,14 @@ class MergeIndex:
                 tss.append(int(ts_s[j]))
                 curs.append(cursors + taken)
 
+            # Row-to-time anchors over the same committed prefix. Read out of
+            # `ts_s` while it is in hand, because reconstructing these later
+            # would mean replaying the merge a second time.
+            local = np.arange((-row) % stride, commit, stride, dtype=np.int64)
+            if local.size:
+                anchor_rows.append(row + local)
+                anchor_tss.append(ts_s[local])
+
             cursors = cursors + np.array(
                 [positions[i].size for i in range(k)], dtype=np.int64
             )
@@ -330,6 +410,10 @@ class MergeIndex:
         self._cp_cursors = (
             np.vstack(curs) if curs else np.zeros((0, k), dtype=np.int64)
         )
+        self._anchor_row = (np.concatenate(anchor_rows) if anchor_rows
+                            else np.zeros(0, dtype=np.int64))
+        self._anchor_ts = (np.concatenate(anchor_tss) if anchor_tss
+                           else np.zeros(0, dtype=np.int64))
         self._built = True
         self._cache.clear()
 
@@ -339,6 +423,12 @@ class MergeIndex:
         self.stats.checkpoint_bytes = int(
             self._cp_row.nbytes + self._cp_ts.nbytes + self._cp_cursors.nbytes
         )
+        # Counted apart from the checkpoints: `checkpoint_bytes` is the figure
+        # SPEC 6.2's 409x memory claim is written against and is asserted in
+        # tests, and the anchor table is a fixed 32 KB that does not scale with
+        # the row count. Folding it in would make that ratio size-dependent.
+        self.stats.row_time_anchors = int(self._anchor_row.size)
+        self.stats.anchor_bytes = int(self._anchor_row.nbytes + self._anchor_ts.nbytes)
 
     @property
     def checkpoint_bytes(self) -> int:

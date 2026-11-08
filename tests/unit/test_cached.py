@@ -409,3 +409,59 @@ def test_a_spliced_index_can_be_written_back_and_appended_to_again(log, root):
     assert out.status == "append"
     assert out.index.layout_json is not None
     assert out.index.severity_offset == built(log).severity_offset
+
+
+# ---------------------------------------------------------------------------
+# the overview histogram across a splice (SPEC 8.1, M5)
+# ---------------------------------------------------------------------------
+
+def test_a_spliced_index_has_the_histogram_a_full_re_index_would(log, root):
+    """
+    The same assertion this file is built on, applied to the histogram: a user
+    must not be able to tell from the overview strips how the index was built.
+
+    The splice *rebuilds* rather than adding the tail's counts to the prefix's,
+    and the reason is in `_splice`: a longer span can widen the bucket, so the
+    grid the prefix was counted on may no longer exist -- and an append that
+    starts before the prefix's `t0`, which an out-of-order append does, has no
+    bucket to be added to at all.
+    """
+    opened(log, root)
+    write(log, lines(1, 55))
+    spliced = opened(log, root)
+    assert spliced.status == "append"
+
+    fresh = built(log)
+    assert spliced.index.hist is not None and fresh.hist is not None
+    assert spliced.index.hist.t0 == fresh.hist.t0
+    assert spliced.index.hist.bucket_us == fresh.hist.bucket_us
+    assert np.array_equal(np.asarray(spliced.index.hist.counts),
+                          np.asarray(fresh.hist.counts))
+    assert spliced.index.hist.total == spliced.index.n
+
+
+def test_a_splice_that_widens_the_span_recounts_on_the_new_grid(log, root):
+    """
+    The case adding would get wrong. The tail is days later, so the span grows
+    past where one-second buckets fit and every bucket boundary moves.
+    """
+    opened(log, root)
+    far = [f"2024-03-09 11:{i % 60:02d}:{i % 60:02d}.000 ERROR late {i}\n"
+           for i in range(20)]
+    write(log, lines(1, 40) + far)
+    spliced = opened(log, root)
+    assert spliced.status == "append"
+
+    fresh = built(log)
+    assert spliced.index.hist.bucket_us == fresh.hist.bucket_us
+    assert np.array_equal(np.asarray(spliced.index.hist.counts),
+                          np.asarray(fresh.hist.counts))
+    assert spliced.index.hist.total == spliced.index.n
+
+
+def test_the_histogram_is_mapped_on_a_hit_and_still_totals_the_entries(log, root):
+    opened(log, root)
+    out = opened(log, root)
+    assert out.status == "hit"
+    assert out.index.hist is not None
+    assert out.index.hist.total == out.index.n

@@ -16,7 +16,8 @@ A length-prefixed JSON header, then the arrays, each page-aligned so
     hlen    4 bytes   little-endian uint32, length of the header
     header  hlen      UTF-8 JSON
     pad               to the next page boundary
-    arrays            off, ts, flags, line_no, and order when present
+    arrays            off, ts, flags, line_no, order when present,
+                      then hist -- the overview histogram (SPEC 8.1)
 
 Page alignment is the whole point of the layout. An unaligned array would have
 to be read and copied; an aligned one is handed to the kernel's page cache and
@@ -66,10 +67,17 @@ from pathlib import Path
 import numpy as np
 
 from .fileindex import FileIndex, IndexStats
+from .histogram import Histogram
 
 MAGIC = b"LWINDEX\x01"
 HEADER_LEN = struct.Struct("<I")
-FORMAT_VERSION = 2
+FORMAT_VERSION = 3
+"""
+Bumped at M5: the overview histogram (SPEC 8.1) is now stored alongside the
+per-entry arrays. A version 2 sidecar has no `hist`, and rebuilding one on open
+would mean reading every timestamp back out of the mapping -- which is the cost
+the cache exists to avoid -- so the older entries are retired instead.
+"""
 
 PARSER_VERSION = 1
 """
@@ -166,9 +174,24 @@ def _header(index: FileIndex, *, path: Path, size: int, mtime_ns: int,
     if index.order is not None:
         arrays.append({"name": "order", "dtype": np.dtype(np.uint64).str,
                        "len": int(index.order.size), "offset": offset})
+        offset = _align(offset + index.order.nbytes)
+
+    # The histogram goes last, and carries a `shape` because it is the one
+    # two-dimensional array in the file. Reading it back as a flat `len` and
+    # reshaping on faith would mean a header that disagreed with the data
+    # produced a silently transposed overview rather than a refusal.
+    hist = index.hist
+    hist_header = None
+    if hist is not None and hist.nbuckets:
+        arrays.append({"name": "hist", "dtype": np.dtype(np.uint32).str,
+                       "len": int(hist.counts.size), "offset": offset,
+                       "shape": list(hist.counts.shape)})
+        hist_header = {"t0": int(hist.t0), "bucket_us": int(hist.bucket_us),
+                       "buckets": int(hist.nbuckets)}
 
     s = index.stats
     return {
+        "hist": hist_header,
         "format_version": FORMAT_VERSION,
         "parser_version": PARSER_VERSION,
         "source": {"path": str(path), "size": size, "mtime_ns": mtime_ns},
@@ -200,6 +223,19 @@ def _header(index: FileIndex, *, path: Path, size: int, mtime_ns: int,
 
 def _align(offset: int) -> int:
     return (offset + PAGE - 1) // PAGE * PAGE
+
+
+def _array_of(index: FileIndex, name: str) -> np.ndarray:
+    """
+    The array a header entry names.
+
+    Every name but one is an attribute of the index; `hist` is a field of the
+    histogram it holds. Resolved here rather than at each call site so the
+    write loop stays a loop over the header it just built.
+    """
+    if name == "hist":
+        return index.hist.counts
+    return getattr(index, name)
 
 
 def write(index: FileIndex, *, path: Path, size: int, mtime_ns: int,
@@ -234,8 +270,7 @@ def write(index: FileIndex, *, path: Path, size: int, mtime_ns: int,
             fh.write(blob)
             for spec in header["arrays"]:
                 fh.write(b"\0" * (spec["offset"] - fh.tell()))
-                arr = getattr(index, spec["name"])
-                fh.write(np.ascontiguousarray(arr).tobytes())
+                fh.write(np.ascontiguousarray(_array_of(index, spec["name"])).tobytes())
         os.replace(tmp, target)
     except BaseException:
         Path(tmp).unlink(missing_ok=True)
@@ -298,9 +333,20 @@ def _load(sidecar: Path, header: dict) -> FileIndex:
                             if k in IndexStats.__dataclass_fields__}),
     )
     for spec in header["arrays"]:
+        shape = tuple(spec.get("shape") or (spec["len"],))
+        if int(np.prod(shape)) != int(spec["len"]):
+            raise ValueError(f"{spec['name']}: shape {shape} is not {spec['len']} items")
         arr = np.memmap(sidecar, dtype=np.dtype(spec["dtype"]), mode="r",
-                        offset=spec["offset"], shape=(spec["len"],))
-        setattr(index, spec["name"], arr)
+                        offset=spec["offset"], shape=shape)
+        if spec["name"] == "hist":
+            meta = header.get("hist") or {}
+            if int(meta.get("buckets", 0)) != shape[0]:
+                raise ValueError("hist header and array disagree on bucket count")
+            index.hist = Histogram(t0=int(meta["t0"]),
+                                   bucket_us=int(meta["bucket_us"]),
+                                   counts=arr)
+        else:
+            setattr(index, spec["name"], arr)
     index.stats.notes = list(index.stats.notes) + ["loaded from sidecar cache"]
     return index
 

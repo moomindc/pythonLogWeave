@@ -566,14 +566,21 @@ so they can be `np.memmap`-ed directly with zero copy.
 }
 ```
 
-**As built (M2b).** The header above is the full design. What
+**As built (M5).** The header above is the full design. What
 `logweave/index/sidecar.py` writes today is that minus the fields no
-implemented feature reads: `file_id`, `lineno_saturated`, `open_method` and
-`hist` (the minimap histogram, M5) are absent, and `layout`, `message_offset`
-and `severity_offset` are present -- the layout because an append has to index
-the tail with the *same* layout the prefix was indexed with (§5.4 below), the
-offsets because they are what the view slices a row by. A `format_version` bump
-retires every older sidecar, so the header may grow freely.
+implemented feature reads: `file_id`, `lineno_saturated` and `open_method` are
+absent, and `layout`, `message_offset` and `severity_offset` are present -- the
+layout because an append has to index the tail with the *same* layout the
+prefix was indexed with (§5.4 below), the offsets because they are what the
+view slices a row by. `hist` arrived at M5 and carries `{t0, bucket_us,
+buckets}` plus a `hist` entry in `arrays`, which is the one two-dimensional
+array in the file and so the one that records its `shape` -- a header
+disagreeing with its data is refused rather than reshaped on faith, because a
+silently transposed overview looks like data and is noise. A `format_version`
+bump retires every older sidecar, so the header may grow freely; M5 bumped it
+to 3, because rebuilding a missing histogram on open means reading every
+timestamp back out of the mapping, which is the work the cache exists to
+avoid.
 
 **Validation and partial reuse.** A sidecar is reusable if `parser_version`,
 `format_version` and `head_sha` match. Then:
@@ -799,20 +806,40 @@ a scan of the log.
 Built during indexing, per source, stored in the sidecar:
 
 ```
-bucket_us = max(1_000_000, span_us // 1_000_000)      # ≥1s, ≤1M buckets
-hist      = uint32[buckets, 8]                         # counts per severity class
+bucket_us = max(1_000_000, ceil((span_us + 1) / 65_536))   # ≥1s, whole seconds
+hist      = uint32[buckets, 8]                              # counts per severity class
 ```
 
-Computed per chunk, vectorised: `b = (ts - t0) // bucket_us`, then `np.bincount` on
-`b * 8 + sev` (measured 46M entries/s, and faster than `np.add.at`). Cost is a few
-MB per source and a single pass folded into the indexing pass that already touches
-every entry.
+Computed vectorised: `b = (ts - t0) // bucket_us`, then `np.bincount` on
+`b * 8 + sev` (measured 50.8M entries/s in the prototype and 38.2M/s shipped,
+and faster either way than `np.add.at`).
+
+**Corrected at M5, twice.**
+
+**(1) The bucket cap is 65,536, not a million.** This section originally said
+`span_us // 1_000_000`, capped at 1M buckets, and in the same breath that the
+cost was "a few MB per source". Those are not compatible: a million buckets is
+32 MB of counts plus 64 MB of prefix sum, which is 96 MB a source and 770 MB
+across eight — against NFR-7's 500 MB for the whole application. Nothing is
+lost by the cap, because the buckets exist to be aggregated onto pixels and
+65,536 is still 32× the height of a 2000-pixel strip. Measured on a 64 MB
+chunk: 48,637 buckets of 2s, **4.67 MB** including the prefix sum.
+
+**(2) It is built after the chunk loop, not inside it.** This section said the
+pass was "folded into the indexing pass". It cannot be: `bucket_us` comes from
+the file's whole time span and `t0` from its first entry, neither known until
+the last chunk is read — and for a yearless or dateless format (§4.5) the
+timestamps do not exist in final form until the inference has run. So it is one
+extra vectorised pass over `ts` and `severity` in `_finish`, both already in
+cache, at ~3% of the indexing budget.
 
 **Alongside it, a prefix sum `cum = cumsum(hist)` is kept, rebuilt only when the
 histogram changes — that is, on append.** M0 measured a repaint that re-ran the
-`cumsum` over a 1M-bucket histogram at **8.3ms**, half a 60fps frame (NFR-5),
+`cumsum` over a 1M-bucket histogram at **7.7ms**, half a 60fps frame (NFR-5),
 spent re-deriving data that had not changed. With the prefix sum prepared, a
-repaint is **74µs**: two fancy-index reads and a subtraction.
+repaint is **83µs**: two fancy-index reads and a subtraction. It is built
+lazily, because a source indexed and written straight to a sidecar never needs
+it and it is twice the size of the counts it comes from.
 
 ### 8.2 Timeline strip (time-proportional)
 
@@ -826,10 +853,29 @@ maps a pixel to a time and calls `time_to_row` (§6.2).
 ### 8.3 Minimap strip (row-proportional)
 
 Vertical axis is merged row index. Pixel `p` covers rows
-`[p·N/H, (p+1)·N/H)`; `row_to_time` on each boundary (a checkpoint lookup) converts
-that to a time range, and the same `hist` range-sum gives its colours. So the
-second strip costs one extra array of H time values — no second data structure, no
-second indexing pass.
+`[p·N/H, (p+1)·N/H)`; those row boundaries are converted to times, and the same
+`hist` range-sum gives the colours. So the second strip costs one extra array of
+H time values — no second data structure, no second indexing pass.
+
+**Corrected at M5: the conversion is not a checkpoint lookup.** This section
+said `row_to_time` on each boundary, "a checkpoint lookup", and the checkpoints
+are too coarse for it. They sit 4096 rows apart (§6.2), so a strip pixel only
+contains one when the merge is over ~3.3M rows; below that, times between
+checkpoints are interpolated at a constant rate, and a log with a genuine idle
+gap *inside* one checkpoint block has that gap smeared over the rows around it.
+Built that way, a 7000-row merge showed ten blank minimap pixels in the middle
+and a thousand rows piled into the last one — an idle period the minimap had
+invented, next to a burst that was not there.
+
+`build_checkpoints` therefore also records a **fixed-size row-to-time anchor
+table**: 4096 anchors spread evenly over the merged rows, read straight out of
+the merge window while it is already in hand. Fixed is the point — 32 KB
+whatever the merge's size, where one anchor per *n* rows would be 64 MB at
+NFR-15's ceiling. Against an 800-pixel strip every pixel holds about five
+anchors, so a row is placed to a fifth of a pixel, and for any merge under 4096
+rows the stride is one and the table is exact. It is counted separately from
+`checkpoint_bytes`, so §6.2's 409× memory claim stays a statement about the
+checkpoints.
 
 The minimap drives the vertical scrollbar and draws the viewport box; the timeline
 is purely a seek control.
@@ -1698,6 +1744,45 @@ Getting the span cost there took two changes, described in §9.3, from a startin
 point 4× higher. The headline is the same as M3's: the cost is per glyph, so the
 win came from not drawing any character twice, not from batching calls.
 
+### 14.1d Measured — M5 result (the overview strips, risk R3)
+
+`python tools/bench.py` and `python tools/bench_ui.py`, same machine, font and
+method as §14.1b/c. The strips were measured at 844 px tall, which is what a
+1080p screen allows a top-level widget; a strip's cost is linear in its height,
+and the bench says when a request was clamped.
+
+| What | Cost | Against |
+|---|---|---|
+| Build the histogram | 38.2 M entries/s | ~3% of the indexing budget |
+| Build the prefix sum | 3.24 ms | once per index or append, never a repaint |
+| Range-sum one strip, 800px | **83 µs** | SPEC 8's claim, confirmed |
+| **Repaint both strips (a scroll)** | **0.63 ms** | **26× under** the 16 ms frame |
+| **Re-aggregate both strips (a resize)** | **3.85 ms** | **4× under** |
+| Histogram in memory, 64 MB chunk | 4.67 MB | "a few MB a source" |
+
+**Risk R3 is contained, and not for the reason the spec expected.** §8 worried
+about the aggregation, and the aggregation is 0.15 ms — a rounding error. The
+cost was entirely in turning it into pixels, and the first version of
+`render_rgba` took **5.65 ms a strip**: two strips at 11.3 ms left 4.7 ms of a
+frame for the view beside them, which is R3 arriving by a door the spec was not
+watching.
+
+Two changes, both in `session/overview.py`, took it to 0.84 ms:
+
+- A pixel row is eight contiguous severity runs plus a background run, so
+  `np.repeat` builds the whole row-major class map in one call. The version it
+  replaced ran eight broadcast comparisons over the entire buffer to work out
+  which class owned each pixel: 1.2 ms of the old figure, for an answer that
+  was already implicit in the widths.
+- `np.take(..., out=buf)` writes colours straight into the destination.
+  Indexing a three-channel *view* of the RGBA buffer instead allocated the
+  result and copied it across a stride of four — 1.5 ms of its own, for a
+  slicing convenience.
+
+The lesson is the same one M3 and M4 both produced from the other direction:
+the cost in this application is never where the data structure is, it is in the
+per-pixel or per-glyph work at the end of it.
+
 ### 14.2 Remaining performance work
 
 In priority order. Native code stays off the table until these are exhausted (D8).
@@ -1762,7 +1847,7 @@ logmerger's own test fixtures (`tests/log1_ooo_*.txt`, `log0_no_timestamps.txt`,
 | Integration | Open → index → merge → read, headless, no Qt. Append, rotate, truncate via `tools/rotate_sim.py`. Disconnecting a share. Vanishing files |
 | Rotation matrix | Copy-truncate, rename-create, move-to-dated-name, delete-recreate, writer holding an exclusive lock, antivirus-induced sharing violations |
 | Performance | §14, in CI, with regression gates |
-| GUI | Plain `pytest` with a module-scoped `QApplication` fixture, on the offscreen platform, covering the view's row arithmetic, damage regions, selection, keyboard navigation, copy, and drag-and-drop. `pytest-qt` is not used — nothing here needs to wait on a signal or pump an event loop, so it would be a dependency for the sake of it. A small set of screenshot comparisons follows for the strips (M5). Four cautions, all learned the hard way. (1) The offscreen platform has **no fonts**, so it cannot measure text (§14.1b) — and it therefore cannot see a *wrong* font either, which is how the §9.1 painter defect survived a green suite; defects of that kind are asserted by spying on the painter, which works on any backend. (2) A `QDropEvent` holds a **non-owning** pointer to its `QMimeData` — letting that fall out of scope in a test is an access violation that takes the interpreter down rather than an exception. (3) `QSettings` must be redirected to a temporary file per test, or the suite reads and writes the real user's preferences (§12.3). (4) A `QThread` parented to a window and destroyed while still running **aborts** the process at interpreter shutdown rather than raising, so the window joins its indexing thread in `closeEvent` and the test fixture joins it too |
+| GUI | Plain `pytest` with a module-scoped `QApplication` fixture, on the offscreen platform, covering the view's row arithmetic, damage regions, selection, keyboard navigation, copy, and drag-and-drop. `pytest-qt` is not used — nothing here needs to wait on a signal or pump an event loop, so it would be a dependency for the sake of it. The strips (M5) are checked on their **exact pixels** instead of by screenshot comparison, which is possible because `session.overview` renders them into an RGBA buffer with NumPy and the widget only blits it: a wrong colour or a missing error mark fails with a pixel coordinate rather than a similarity score, and it runs in the engine job with no Qt at all. Four cautions, all learned the hard way. (1) The offscreen platform has **no fonts**, so it cannot measure text (§14.1b) — and it therefore cannot see a *wrong* font either, which is how the §9.1 painter defect survived a green suite; defects of that kind are asserted by spying on the painter, which works on any backend. (2) A `QDropEvent` holds a **non-owning** pointer to its `QMimeData` — letting that fall out of scope in a test is an access violation that takes the interpreter down rather than an exception. (3) `QSettings` must be redirected to a temporary file per test, or the suite reads and writes the real user's preferences (§12.3). (4) A `QThread` parented to a window and destroyed while still running **aborts** the process at interpreter shutdown rather than raising, so the window joins its indexing thread in `closeEvent` and the test fixture joins it too |
 
 CI runs every non-GUI test on both Windows and Linux from the first commit (NFR-18).
 
@@ -1804,7 +1889,7 @@ dependency may be added without an ADR.
 | **M2b** ✅ | Sidecar cache, parallel indexer, indexing off the UI thread | **NFR-4 met with two orders of magnitude to spare**: a warm reopen is 6.6 ms per file and does not scale with size, so a 10 GB set in 10 files reopens in 0.07 s against a 2.0 s budget (§5.4). Parallel indexing measured at 2.21x on four files, bounded by memory bandwidth rather than scheduling (§5.3). Found three cache bugs that each produced a *correct* index while silently halving or removing the speedup, and one where the test suite was being served by its own previous runs. Within-file chunk parallelism remains unbuilt and is not needed for NFR-5. **Done.** |
 | **M3** ✅ | Qt shell: `MergedLogView`, scrolling, timestamp and message columns, drag-and-drop, source lanes, source dock, copy with attribution | **NFR-5 measured (§14.1b): a scroll step is 0.98 ms, 16× under the frame budget.** First genuinely usable build. Found and fixed an unreachable-last-rows scrollbar bug and an unbounded paint cost on long lines; left one measured breach, a full repaint of long lines at 18.5 ms, with the fix scoped in §14.2 item 4. **Done.** |
 | **M4** ✅ | Highlighting, severity classes, source lanes, aliases, text size, copy in two modes | **FR-28 to FR-31, FR-38 (size and zoom) and FR-46a met.** Highlighting is not measurable on ordinary lines (within the run-to-run spread) and costs **+3.09 ms** on a synthetic corpus averaging six spans a row, against a worst scroll step of 1.48 ms — 11× under budget (§14.1c). The span-heavy full repaint is over budget at 23.1 ms, but 20.1 ms of that is M3's glyph-cost breach with every rule off, so §14.2 item 4 remains the fix and nothing new is owed. Established that one-pass alternation scanning cannot style nested spans, and documented it as a limitation rather than hiding it (§10.1); found that overlap resolution was ignoring `priority` entirely, that the shipped severity rules were contributing nothing to the index-time classifier, and that overdrawing spans cost 4× what segmenting them does. The `highlight` package is Qt-free and enforced as an engine layer. Two further defects surfaced in use rather than in the suite and are recorded in §9.1: the painter was never handed the view's font, so the merged view drew in the application's proportional UI face and a zoom changed no glyph; and the line-number column had been built on the right instead of the left. **Done.** |
-| **M5** | Both strips (D4) | FR-32 to FR-34; confirms risk R3 is contained |
+| **M5** ✅ | Both strips (D4), the density histogram and its sidecar entry | **FR-32 to FR-34 met, and risk R3 is contained with margin**: a scroll repaints both strips in 0.63 ms and a resize re-aggregates them in 3.85 ms, against a 16 ms frame (§14.1d). Rewrote §8.1 twice — the millionth bucket cost 96 MB a source against a "few MB" claim in the same paragraph, and the pass cannot be folded into the chunk loop because the bucket width is not known until the file has been read — and §8.3, whose checkpoint lookup was too coarse and made the minimap invent an idle gap. Found that the frame cost was never in the aggregation but in the per-pixel work after it (5.65 ms a strip, now 0.84), and two Qt defects of the kind SPEC 9.1 already argues about: `Signal(int)` is a 32-bit int, so every timeline seek truncated a `wall_us` and landed on row 0; and a menu built before the window is shown reads `isVisible()` False for a strip that is on. **Done.** |
 | **M6** | Follow engine, rotation matrix green | FR-21 to FR-26, NFR-8, NFR-20. **Retires risk R5** |
 | **M7** | Search, filters, selection, copy, export | FR-41 to FR-48, NFR-9, NFR-10 |
 | **M8** | Profiles, settings, file association, recent lists; the highlight-rule editing dialog and TOML ruleset import/export left over from M4 (§10.1) | FR-49 to FR-54, and FR-31 completed |

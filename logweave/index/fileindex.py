@@ -32,6 +32,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
+from .histogram import Histogram
 from .layouts import (
     FLAG_MULTILINE,
     FLAG_SCALAR_FALLBACK,
@@ -155,6 +156,21 @@ class FileIndex:
     severity_offset: int | None = None
     """Fixed column the level word was found at, or None if there was none."""
 
+    hist: Histogram | None = None
+    """
+    The density histogram both overview strips are drawn from (SPEC 8.1).
+
+    Part of the index rather than derived at display time because it has to be
+    *cached*: the point of the sidecar is that reopening a 10 GB log reads
+    nothing, and a histogram rebuilt on open would mean reading every timestamp
+    back out of the mapping to count it. A few MB in the sidecar buys that.
+
+    None for a source with no entries, and for an index built before the
+    histogram existed. Every consumer treats that as "no overview available"
+    rather than as an error, because a file with no recognisable timestamps
+    (FR-19) is still a file someone is entitled to scroll.
+    """
+
     @property
     def n(self) -> int:
         return int(self.ts.size)
@@ -204,8 +220,14 @@ class FileIndex:
         Using the index after this is undefined -- not an exception, a crash --
         so it is called only on an index that has just been spliced away.
         """
-        for name in ("off", "ts", "flags", "line_no", "order"):
-            arr = getattr(self, name, None)
+        arrays = [getattr(self, name, None)
+                  for name in ("off", "ts", "flags", "line_no", "order")]
+        if self.hist is not None:
+            # The histogram's counts are mapped out of the sidecar like any
+            # other array, and are just as capable of keeping the file
+            # undeletable on Windows. Its prefix sum is always our own memory.
+            arrays.append(self.hist.counts)
+        for arr in arrays:
             mapped = getattr(arr, "_mmap", None)
             if mapped is not None:
                 mapped.close()
@@ -231,3 +253,16 @@ class FileIndex:
 
     def bytes_per_entry(self) -> float:
         return self.nbytes() / self.n if self.n else 0.0
+
+    def overview_bytes(self) -> int:
+        """
+        What the histogram costs (SPEC 8.1).
+
+        Deliberately *not* part of `nbytes`. That number is the per-entry index
+        cost -- the 21 bytes an entry of SPEC 2.3 -- and it is checked against
+        the corpus in tests. The histogram is a fixed few MB that does not
+        scale with the entry count, so folding it in would make
+        `bytes_per_entry` say something untrue about small files and something
+        different again about large ones.
+        """
+        return self.hist.nbytes() if self.hist is not None else 0

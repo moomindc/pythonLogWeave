@@ -34,6 +34,7 @@ from ..index.fileindex import FileIndex
 from ..source import encoding
 from ..source.base import LogSource, SourceError, SourceMeta
 from . import palette
+from .overview import Overview
 
 TEXT_CACHE_ROWS = 4096
 """
@@ -158,6 +159,7 @@ class Session:
         self.cache_root = cache_root
         self.sources: list[SessionSource] = []
         self._merge = None
+        self._overview: Overview | None = None
         self._text: OrderedDict[tuple[int, int], str] = OrderedDict()
 
     # ------------------------------------------------------------------
@@ -281,17 +283,51 @@ class Session:
             for s in self.sources
         ])
         self._text.clear()
+        # The strips' memo is keyed on a generation that covers skews, enabled
+        # flags and the row count, but not on the merge object itself -- so a
+        # rebuild that leaves all three unchanged (a rename) would otherwise be
+        # served a strip aggregated against the previous MergeIndex.
+        if self._overview is not None:
+            self._overview.invalidate()
 
     def close(self) -> None:
         for s in self.sources:
             s.source.close()
         self.sources.clear()
         self._merge = None
+        self._overview = None
         self._text.clear()
 
     # ------------------------------------------------------------------
     # what the view asks for
     # ------------------------------------------------------------------
+
+    @property
+    def merge(self) -> object | None:
+        """
+        The `MergeIndex`, for the one consumer that legitimately needs it.
+
+        The overview strips convert row boundaries to times through the
+        checkpoint table (SPEC 8.3), which is a merge-layer operation with no
+        per-row equivalent up here -- `row_to_time` exists, and eight hundred
+        calls to it is eight hundred block replays. Read-only, and read by
+        `session.overview` alone; the view still never sees it.
+        """
+        return self._merge
+
+    @property
+    def overview(self) -> Overview:
+        """
+        Both strips over this session (SPEC 8, FR-32, FR-33).
+
+        One instance per session, holding the aggregation memo. Handed out
+        rather than rebuilt because the memo is the thing that keeps a scroll
+        from re-aggregating: what moves when you scroll is the viewport box,
+        and the histogram underneath it has not changed.
+        """
+        if self._overview is None:
+            self._overview = Overview(self)
+        return self._overview
 
     @property
     def total_rows(self) -> int:

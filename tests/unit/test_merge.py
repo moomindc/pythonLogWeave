@@ -367,3 +367,119 @@ def test_a_source_with_no_entries_is_skipped():
     m = merge_of([fake_index([]), fake_index([5, 6])])
     assert m.total == 2
     assert merged_pairs(m) == [(1, 0), (1, 1)]
+
+
+# ---------------------------------------------------------------------------
+# row-to-time anchors, for the minimap (SPEC 8.3, M5)
+# ---------------------------------------------------------------------------
+
+def test_row_times_is_exact_at_every_anchor():
+    """
+    The anchors are read straight out of the merge while it is being walked, so
+    there is no reason for any of them to be approximate -- and the minimap's
+    accuracy is bounded by them being right.
+    """
+    m = merge_of([fake_index(np.arange(0, 20_000, 2) * 1_000_000),
+                  fake_index(np.arange(1, 20_000, 2) * 1_000_000)])
+    exact = m.materialise().ts
+    rows = m._anchor_row
+    assert rows.size > 0
+    assert np.array_equal(m._anchor_ts, exact[rows])
+
+
+def test_row_times_is_exact_everywhere_for_a_small_merge():
+    """
+    Below the anchor bound the stride is one, so the table holds every row and
+    there is nothing to interpolate. Small and medium merges are the common
+    case, and they are the ones checkpoint interpolation got visibly wrong.
+    """
+    m = merge_of([fake_index(np.arange(1000) * 1_000_000)])
+    exact = m.materialise().ts
+    assert np.array_equal(m.row_times(np.arange(1000)), exact)
+
+
+def test_row_times_places_an_idle_gap_where_it_actually_is():
+    """
+    The defect that put the anchor table in. With a gap inside one checkpoint
+    block, interpolating between checkpoints smears it over the surrounding
+    rows: the minimap showed ten blank pixels in the middle of a 7000-row merge
+    and a thousand rows piled into the last pixel, neither of which was real.
+
+    The gap here is deliberately inside a single 4096-row block.
+    """
+    ts = np.concatenate([
+        np.arange(0, 1000) * 1_000_000,
+        np.arange(0, 1000) * 1_000_000 + 10 * 3600 * 1_000_000,
+    ])
+    m = merge_of([fake_index(ts)])
+    got = m.row_times(np.array([0, 999, 1000, 1999]))
+    exact = m.materialise().ts
+    assert got[0] == exact[0]
+    assert got[1] == exact[999]
+    assert got[2] == exact[1000]
+    assert got[3] == exact[1999]
+    # The jump belongs between rows 999 and 1000 and nowhere else.
+    steps = np.diff(m.row_times(np.arange(2000)))
+    assert int(np.argmax(steps)) == 999
+
+
+def test_the_anchor_table_is_a_fixed_size_whatever_the_merge():
+    """
+    The reason the anchors exist at all rather than one per `n` rows: at
+    NFR-15's two-billion-row ceiling that would be 64 MB against NFR-7's
+    500 MB for everything, and this is 64 KB.
+    """
+    small = merge_of([fake_index(np.arange(5_000) * 1_000_000)])
+    large = merge_of([fake_index(np.arange(0, 2_000_000, 2) * 1_000_000),
+                      fake_index(np.arange(1, 2_000_000, 2) * 1_000_000)])
+    assert large.total == 2_000_000
+    assert large.stats.anchor_bytes <= 64 * 1024
+    assert large.stats.anchor_bytes <= small.stats.anchor_bytes * 2
+
+
+def test_the_anchors_are_not_counted_as_checkpoint_bytes():
+    """
+    SPEC 6.2's 409x memory claim is written against `checkpoint_bytes` and is
+    asserted above. The anchor table is a fixed cost that does not scale with
+    rows, so folding it in would make that ratio depend on the merge's size.
+    """
+    m = merge_of([fake_index(np.arange(2_000_000) * 1_000_000)])
+    assert m.stats.anchor_bytes > 0
+    assert m.checkpoint_bytes == (m._cp_row.nbytes + m._cp_ts.nbytes
+                                 + m._cp_cursors.nbytes)
+
+
+def test_row_times_is_monotonic_and_clamped():
+    m = merge_of([fake_index(np.arange(10_000) * 1_000_000)])
+    got = m.row_times(np.array([-100, 0, 5000, 9999, 10_000, 99_999_999]))
+    assert (np.diff(got) >= 0).all()
+    assert got[0] == got[1]
+    assert got[-1] == got[-2] == got[3]
+
+
+def test_row_times_on_an_empty_merge_is_zeros():
+    m = merge_of([])
+    assert not m.row_times(np.arange(5)).any()
+
+
+def test_row_times_on_a_single_row_merge_is_that_row():
+    m = merge_of([fake_index([1234])])
+    assert m.row_times(np.arange(4)).tolist() == [1234] * 4
+
+
+def test_row_times_error_is_bounded_by_the_anchor_stride():
+    """
+    Between anchors the rate is assumed constant, which is what makes this
+    cheap. The error that buys is what matters: against an 800-pixel strip,
+    every pixel holds about five anchors, so a row's placement is good to a
+    fifth of a pixel.
+    """
+    rng = np.random.default_rng(5)
+    ts = np.sort(rng.integers(0, 10**12, size=200_000)).astype(np.int64)
+    m = merge_of([fake_index(ts)])
+    rows = np.linspace(0, m.total - 1, 801).astype(np.int64)
+    got = m.row_times(rows)
+    want = ts[rows]
+    span = int(ts[-1] - ts[0])
+    # Each strip pixel covers 250 rows; the anchors are 49 rows apart.
+    assert np.abs(got - want).max() < span / 800

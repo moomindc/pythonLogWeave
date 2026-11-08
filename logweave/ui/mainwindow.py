@@ -16,6 +16,7 @@ from PySide6.QtGui import QAction, QActionGroup, QColor, QKeySequence, QPixmap
 from PySide6.QtWidgets import (
     QDockWidget,
     QFileDialog,
+    QHBoxLayout,
     QLabel,
     QListWidget,
     QListWidgetItem,
@@ -24,6 +25,7 @@ from PySide6.QtWidgets import (
     QPushButton,
     QStatusBar,
     QStyledItemDelegate,
+    QWidget,
 )
 
 from ..highlight import default_group
@@ -33,6 +35,7 @@ from ..session import Session
 from . import settings, theme
 from .indexing import IndexWorker, start
 from .mergedview import MergedLogView
+from .strips import MinimapStrip, TimelineStrip
 
 SWATCH = 10
 
@@ -125,7 +128,9 @@ class MainWindow(QMainWindow):
         """
 
         self.view = MergedLogView(self.session)
-        self.setCentralWidget(self.view)
+        self.minimap = MinimapStrip(self.session)
+        self.timeline = TimelineStrip(self.session)
+        self.setCentralWidget(self._build_centre())
         self.view.currentRowChanged.connect(self._update_position)
         self.view.copied.connect(self._report_copied)
         self.view.copyRefused.connect(self._report_copy_refused)
@@ -142,6 +147,86 @@ class MainWindow(QMainWindow):
         self._build_menus()
         self._build_status()
         self.refresh()
+
+    # ------------------------------------------------------------------
+    # the central layout (D4)
+    # ------------------------------------------------------------------
+
+    def _build_centre(self) -> QWidget:
+        """
+        The merged view with both overview strips beside it (D4, FR-32, FR-33).
+
+        Order, left to right: view, minimap, timeline. The minimap is next to
+        the view because it is the thing you scroll with -- it is a readable
+        scrollbar, and a scrollbar belongs against the content it moves. The
+        timeline goes outside it, where its blank stretches read as the edge of
+        the window rather than as a gap between the view and its scrollbar.
+
+        A plain `QHBoxLayout` and not a splitter: the strips are a fixed 64
+        pixels and there is nothing to negotiate. A splitter would offer a drag
+        handle for a width that is not meant to vary and would need its state
+        remembered alongside the two booleans that actually matter (FR-34).
+        """
+        centre = QWidget(self)
+        layout = QHBoxLayout(centre)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+        layout.addWidget(self.view, 1)
+        layout.addWidget(self.minimap)
+        layout.addWidget(self.timeline)
+
+        self.minimap.rowSought.connect(self._seek_row)
+        self.timeline.timeSought.connect(self._seek_time)
+        # The strips need the viewport box kept in step with the view, and the
+        # view does not know they exist. Both signals matter: `rowsChanged`
+        # covers a resize or a file opening, `currentRowChanged` a keyboard
+        # move, and the scrollbar covers the wheel -- which emits neither.
+        self.view.rowsChanged.connect(self._sync_strips)
+        self.view.currentRowChanged.connect(lambda _row: self._sync_strips())
+        self.view.verticalScrollBar().valueChanged.connect(
+            lambda _value: self._sync_strips())
+        return centre
+
+    def _seek_row(self, row: int) -> None:
+        """A click on the minimap (FR-32)."""
+        self.view.scroll_to_row(row)
+        self.view.set_current_row(row)
+
+    def _seek_time(self, wall_us: int) -> None:
+        """
+        A click on the timeline (FR-33).
+
+        `scroll_to_time` is `time_to_row`, measured at 27 us with no block
+        replay (NFR-6), which is why a drag down the timeline can seek on every
+        mouse-move event rather than only on release.
+        """
+        self.view.scroll_to_time(wall_us)
+        self.view.set_current_row(self.session.time_to_row(wall_us))
+
+    def _sync_strips(self) -> None:
+        """
+        Tell the strips where the view is.
+
+        Cheap on purpose -- it runs on every wheel step. `set_viewport` repaints
+        without re-aggregating, and the timeline's marker is one row lookup, so
+        a scroll costs a blit and not a strip rebuild.
+        """
+        top = self.view.top_row()
+        page = self.view.visible_rows()
+        self.minimap.set_viewport(top, page)
+        self.timeline.set_viewport(top, page)
+        self.timeline.set_marker_time(
+            self.session.row_to_time(top) if self.session.total_rows else None)
+
+    def _set_strips_visible(self, *, minimap: bool | None = None,
+                            timeline: bool | None = None) -> None:
+        """FR-34. Hidden rather than removed, so the layout keeps its order."""
+        if minimap is not None:
+            self.minimap.setVisible(bool(minimap))
+            settings.write(settings.SHOW_MINIMAP, bool(minimap))
+        if timeline is not None:
+            self.timeline.setVisible(bool(timeline))
+            settings.write(settings.SHOW_TIMELINE, bool(timeline))
 
     # ------------------------------------------------------------------
     # preferences (FR-38)
@@ -161,6 +246,11 @@ class MainWindow(QMainWindow):
         self.view.set_show_timestamp(settings.read_bool(settings.SHOW_TIMESTAMP, True))
         self.view.set_show_alias(settings.read_bool(settings.SHOW_ALIAS, False))
         self.view.set_show_line_no(settings.read_bool(settings.SHOW_LINE_NO, False))
+        # Both strips on by default: D4's whole claim is that you want the two
+        # of them, and a feature nobody finds in a menu is a feature that was
+        # not built.
+        self.minimap.setVisible(settings.read_bool(settings.SHOW_MINIMAP, True))
+        self.timeline.setVisible(settings.read_bool(settings.SHOW_TIMELINE, True))
 
         remembered = settings.store().value(settings.HIGHLIGHTS)
         if isinstance(remembered, str):
@@ -265,6 +355,37 @@ class MainWindow(QMainWindow):
             "position in the merged view")
         self.line_no_act.toggled.connect(self._line_no_toggled)
         view_menu.addAction(self.line_no_act)
+
+        view_menu.addSeparator()
+        self.minimap_act = QAction("&Minimap", self)
+        self.minimap_act.setCheckable(True)
+        # `isVisibleTo`, not `isVisible`. The menus are built before the window
+        # is shown, and a child of an unmapped window reports `isVisible()`
+        # False however many times `setVisible(True)` was called on it -- so
+        # both strips would be ticked off in the menu and drawn on the screen
+        # the moment the window appeared. That is the M4 lane-width trap in a
+        # new place: a menu built from one source of truth and a widget set
+        # from another. `isVisibleTo(self)` asks the question actually being
+        # asked -- would this be visible once its ancestors are.
+        self.minimap_act.setChecked(self.minimap.isVisibleTo(self))
+        self.minimap_act.setShortcut("Ctrl+M")
+        self.minimap_act.setStatusTip(
+            "Row-proportional overview of the whole merged stream; click or "
+            "drag it to scroll (FR-32)")
+        self.minimap_act.toggled.connect(
+            lambda on: self._set_strips_visible(minimap=on))
+        view_menu.addAction(self.minimap_act)
+
+        self.timeline_act = QAction("Time&line", self)
+        self.timeline_act.setCheckable(True)
+        self.timeline_act.setChecked(self.timeline.isVisibleTo(self))
+        self.timeline_act.setShortcut("Ctrl+L")
+        self.timeline_act.setStatusTip(
+            "Wall-clock overview: idle gaps show as blank, bursts as dense "
+            "bands; click to seek to a time (FR-33)")
+        self.timeline_act.toggled.connect(
+            lambda on: self._set_strips_visible(timeline=on))
+        view_menu.addAction(self.timeline_act)
 
         view_menu.addSeparator()
         self._build_zoom_menu(view_menu)
@@ -579,6 +700,8 @@ class MainWindow(QMainWindow):
         self.session.close()
         self.session = Session()
         self.view.session = self.session
+        self.minimap.session = self.session
+        self.timeline.session = self.session
         self.refresh()
         self._status_msg.setText("No logs open")
 
@@ -610,6 +733,9 @@ class MainWindow(QMainWindow):
 
     def refresh(self) -> None:
         self.view.refresh()
+        self.minimap.refresh()
+        self.timeline.refresh()
+        self._sync_strips()
         self._reload_source_list()
         self._update_span()
         self._update_position(self.view.current_row())
@@ -671,6 +797,10 @@ class MainWindow(QMainWindow):
             return
         self.session.set_enabled(int(idx), item.checkState() == Qt.CheckState.Checked)
         self.view.refresh()
+        # A source going out of the merge changes what both strips aggregate
+        # (FR-9), so this is a rebuild and not a repaint.
+        self.minimap.refresh()
+        self.timeline.refresh()
         self._update_span()
 
     def _update_span(self) -> None:
