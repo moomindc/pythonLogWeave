@@ -28,9 +28,9 @@ from collections import OrderedDict
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from ..index.cached import CacheOutcome, open_index
 from ..index.detect import Detection
 from ..index.fileindex import FileIndex
-from ..index.indexer import build_index
 from ..source import encoding
 from ..source.base import LogSource, SourceError, SourceMeta
 from . import palette
@@ -86,6 +86,8 @@ class SessionSource:
     meta: SourceMeta
     detection: Detection | None = None
     error: str = ""
+    cache: CacheOutcome | None = None
+    """What the sidecar cache did for this source (SPEC 5.4). None if unused."""
 
     @property
     def alias(self) -> str:
@@ -117,6 +119,8 @@ class OpenResult:
     failed: list[tuple[str, str]] = field(default_factory=list)
     no_format: list[str] = field(default_factory=list)
     low_confidence: list[tuple[str, float]] = field(default_factory=list)
+    cached: int = 0
+    """How many of the opened files came wholly or partly from the sidecar cache."""
 
     @property
     def ok(self) -> bool:
@@ -125,7 +129,8 @@ class OpenResult:
     def summary(self) -> str:
         bits = []
         if self.opened:
-            bits.append(f"{len(self.opened)} opened")
+            cached = f", {self.cached} cached" if self.cached else ""
+            bits.append(f"{len(self.opened)} opened{cached}")
         if self.no_format:
             bits.append(f"{len(self.no_format)} with no recognised timestamp")
         if self.low_confidence:
@@ -148,7 +153,9 @@ class Session:
     twice, and at M1's measured throughput a 64 MB log indexes in under a second.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, *, use_cache: bool = True, cache_root: Path | None = None):
+        self.use_cache = use_cache
+        self.cache_root = cache_root
         self.sources: list[SessionSource] = []
         self._merge = None
         self._text: OrderedDict[tuple[int, int], str] = OrderedDict()
@@ -188,13 +195,17 @@ class Session:
         except OSError:
             mtime = 0
 
-        index = build_index(src, mtime_wall_us=mtime)
+        outcome = open_index(src, mtime_wall_us=mtime, path=path,
+                             use_cache=self.use_cache, root=self.cache_root)
+        index = outcome.index
         meta = src.meta
         meta.alias = meta.alias or path.stem
         meta.colour = meta.colour or palette.lane_colour(order)
 
-        self.sources.append(SessionSource(source=src, index=index, meta=meta))
+        self.sources.append(SessionSource(source=src, index=index, meta=meta,
+                                          cache=outcome))
         result.opened.append(str(path))
+        result.cached += outcome.status in ("hit", "append")
 
         if not index.format_name:
             result.no_format.append(str(path))

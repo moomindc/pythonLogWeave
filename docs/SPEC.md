@@ -475,6 +475,32 @@ Files are indexed concurrently, and chunks within a file are indexed concurrentl
 > solid, this becomes a thread pool with no other change. The process pool is the
 > portable choice today.
 
+**As built (M2b).** `logweave/session/prepare.py`, one file per worker. A worker
+does not write into arrays the parent holds; it calls `open_index`, which writes
+a sidecar, and returns a `Prepared` summary of a few hundred bytes. The parent
+then opens the same path and maps that sidecar. The effect SPEC asked for --
+bulk data never crossing a process boundary -- holds literally, and the parent
+never has to coordinate concurrent writers into one array.
+
+Measured on 4 x 104.9MB (12 cores, 4 workers): **27.9MB/s in process, 61.7MB/s
+pooled, a 2.21x speedup.** Not 4x, because once a few cores are reading the
+build is memory-bandwidth-bound, and the four workers share one disk.
+
+The pool is **not** created warm at application start. It is started per batch,
+and only when there are at least 32MB to index across more than one file
+(`PARALLEL_THRESHOLD`): below that, spawning an interpreter and importing NumPy
+costs more than the indexing. Starting it warm would pay the spawn cost on every
+launch including the overwhelmingly common one -- reopening a cached set, which
+indexes nothing at all.
+
+**Chunks within a file are still indexed serially.** A chunk cannot be indexed
+without the carry state from the chunk before it: the open multi-line entry, the
+inferred year, the rollover count (§5.2). Splitting one file means either
+speculating about the carry or stitching it afterwards, and neither is needed to
+meet NFR-5 -- the window stays responsive because the work is in another
+process, not because it is spread across cores. A single multi-gigabyte file
+therefore still indexes at one-core speed, which is the honest limit of M2b.
+
 ### 5.4 Sidecar cache (PRD Q8)
 
 Location: `%LOCALAPPDATA%\LogWeave\index\` (`$XDG_CACHE_HOME/logweave/index` on
@@ -488,8 +514,8 @@ so they can be `np.memmap`-ed directly with zero copy.
 ```json
 { "format_version": 1, "parser_version": 7,
   "source": {"path": "...", "size": 2147483648, "mtime_ns": ..., "file_id": "..."},
-  "head_sha": "<blake2b-16 of the first 64KB>",
-  "tail_sha": "<blake2b-16 of the last 64KB of the indexed region>",
+  "head_sha": "<blake2b-16 of the first 64KB, or of the whole file if smaller>",
+  "head_len": 65536,
   "ts_format": "YMDHMSdotF", "confidence": 0.997, "encoding": "utf-8",
   "entries": 10342118, "lines": 11904233, "indexed_to": 2147483648,
   "monotonic": true, "has_order": false, "lineno_saturated": false,
@@ -502,6 +528,15 @@ so they can be `np.memmap`-ed directly with zero copy.
 }
 ```
 
+**As built (M2b).** The header above is the full design. What
+`logweave/index/sidecar.py` writes today is that minus the fields no
+implemented feature reads: `file_id`, `lineno_saturated`, `open_method` and
+`hist` (the minimap histogram, M5) are absent, and `layout`, `message_offset`
+and `severity_offset` are present -- the layout because an append has to index
+the tail with the *same* layout the prefix was indexed with (§5.4 below), the
+offsets because they are what the view slices a row by. A `format_version` bump
+retires every older sidecar, so the header may grow freely.
+
 **Validation and partial reuse.** A sidecar is reusable if `parser_version`,
 `format_version` and `head_sha` match. Then:
 
@@ -513,7 +548,44 @@ so they can be `np.memmap`-ed directly with zero copy.
 - size **shrank**, or `head_sha` changed → discarded, full re-index.
 
 An LRU sweep enforces a configurable cap (default 10GB), with "clear cache" in the
-UI (NFR-22).
+UI (NFR-22). Eviction is by access time, not creation time: the set of logs
+someone keeps coming back to predicts what they will open next far better than
+the order they first opened them in.
+
+**`head_len`, and why the head hash is not a fixed window.** The digest is
+compared over the number of bytes the sidecar recorded, not over a fixed 64KB.
+A log under 64KB would otherwise hash its entire contents, so appending a line
+would change the digest, growth would be indistinguishable from rotation, and
+the append path could never fire for a young file -- precisely the file someone
+is tailing. The size comparison is made *before* the head comparison, so a
+truncated file is reported as "file shrank" rather than as a changed head.
+
+**Retiring a superseded sidecar.** Size and mtime are in the filename, so a
+growing log earns a new sidecar on each reopen; the old one is pruned after a
+successful write. On Windows that prune fails silently while the old sidecar is
+still memory-mapped, so `FileIndex.release()` drops the mappings as soon as the
+prefix has been spliced into the new index. Without it a log revisited a few
+times leaves a near-full-size cache entry per visit and the LRU sweep spends its
+whole budget on dead copies of one file.
+
+**Measured (M2b).** On a 104.9MB, 1,580,073-entry log:
+
+| | measured |
+|---|---|
+| First index (cold, single process) | 3.91s, 26.8MB/s |
+| Warm reopen, steady state | **6.6ms** per file, independent of size |
+| Sidecar size | 33.2MB, **21.0 bytes/entry** |
+| 10GB set, warm, 10 files | 0.07s (NFR-4 budget 2.0s) |
+| 10GB set, warm, 100 files | 0.66s (NFR-4 budget 2.0s) |
+
+A warm reopen costs a stat, a 64KB hash and a memory map -- all per *file*, none
+per byte -- which is why the budget is met with two orders of magnitude to spare
+and why the number of files matters and their size does not.
+
+21.0 bytes/entry is exactly `off` (8) + `ts` (8) + `flags` (1) + `line_no` (4).
+The sidecar's size relative to the log therefore depends entirely on mean entry
+length: 32% of this corpus, whose entries average 66 bytes, and about 4% of a
+production log averaging 500.
 
 ---
 
@@ -1524,7 +1596,7 @@ dependency may be added without an ADR.
 | **M0** ✅ | Corpus generator, bench harness, CI on Windows + Linux | The ground truth and the performance gate exist before the code they judge. **Done.** Retired risk R1 ahead of schedule and rewrote §4.4, §8.1–8.2, §10.3 and §4.3 on the evidence (§14.1) |
 | **M1** ✅ | Format detection + vectorised extraction + `FileIndex`, headless; plus the whole source layer (§3, §7.1.1) | **Retires risk R4.** All 15 catalogue formats detect and index with `wall_us`, `line_no` and `byte_off` matching corpus ground truth exactly, at 21.0 bytes/entry. 128 MB/s single-core (§14.1). **Done.** |
 | **M2a** ✅ | `MergeIndex` with checkpoints and a block cache, headless | **NFR-6 measured at 26.6 µs**, merged order matches corpus ground truth row for row, 409× memory saving confirmed (§14.1). **Done.** |
-| **M2b** | Sidecar cache, parallel indexer | NFR-4. Deferred behind M3: both are pure speedups with no design risk, whereas the UI's frame budget is the biggest remaining unknown |
+| **M2b** ✅ | Sidecar cache, parallel indexer, indexing off the UI thread | **NFR-4 met with two orders of magnitude to spare**: a warm reopen is 6.6 ms per file and does not scale with size, so a 10 GB set in 10 files reopens in 0.07 s against a 2.0 s budget (§5.4). Parallel indexing measured at 2.21x on four files, bounded by memory bandwidth rather than scheduling (§5.3). Found three cache bugs that each produced a *correct* index while silently halving or removing the speedup, and one where the test suite was being served by its own previous runs. Within-file chunk parallelism remains unbuilt and is not needed for NFR-5. **Done.** |
 | **M3** ✅ | Qt shell: `MergedLogView`, scrolling, timestamp and message columns, drag-and-drop, source lanes, source dock, copy with attribution | **NFR-5 measured (§14.1b): a scroll step is 0.98 ms, 16× under the frame budget.** First genuinely usable build. Found and fixed an unreachable-last-rows scrollbar bug and an unbounded paint cost on long lines; left one measured breach, a full repaint of long lines at 18.5 ms, with the fix scoped in §14.2 item 4. **Done.** |
 | **M4** | Highlighting, severity classes, source lanes, aliases | FR-28 to FR-31 |
 | **M5** | Both strips (D4) | FR-32 to FR-34; confirms risk R3 is contained |

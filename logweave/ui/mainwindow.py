@@ -20,12 +20,16 @@ from PySide6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QMainWindow,
+    QProgressBar,
+    QPushButton,
     QStatusBar,
 )
 
+from ..index import sidecar
 from ..index.civil import format_wall_us
 from ..session import Session
 from . import theme
+from .indexing import IndexWorker, start
 from .mergedview import MergedLogView
 
 SWATCH = 10
@@ -67,9 +71,18 @@ def expand(paths: list[Path]) -> list[Path]:
 class MainWindow(QMainWindow):
     """One window, one session. Multiple windows are independent (FR-33)."""
 
-    def __init__(self, session: Session | None = None):
+    def __init__(self, session: Session | None = None, *,
+                 background: bool = True):
         super().__init__()
         self.session = session or Session()
+        self.background_indexing = background
+        """
+        Whether `open_paths` warms the cache on a worker thread (NFR-5).
+
+        Off makes opening synchronous, which is what a test wants -- and what a
+        future headless export mode would want -- without having to drive an
+        event loop to find out whether a file opened.
+        """
 
         self.setWindowTitle("LogWeave")
         self.resize(1280, 800)
@@ -81,6 +94,11 @@ class MainWindow(QMainWindow):
         self.view.currentRowChanged.connect(self._update_position)
         self.view.copied.connect(self._report_copied)
         self.view.copyRefused.connect(self._report_copy_refused)
+
+        self._worker: IndexWorker | None = None
+        self._thread = None
+        self._pending: list[Path] = []
+        self._queued: list[Path] = []
 
         self._build_sources_dock()
         self._build_menus()
@@ -102,6 +120,15 @@ class MainWindow(QMainWindow):
         close_act = QAction("Close &All", self)
         close_act.triggered.connect(self.close_all)
         file_menu.addAction(close_act)
+
+        file_menu.addSeparator()
+        self.cache_act = QAction("Clear &Index Cache", self)
+        self.cache_act.setStatusTip(
+            "Delete the saved indexes. Files already open keep working; the "
+            "next open of a large log will be slow again"
+        )
+        self.cache_act.triggered.connect(self.clear_cache)
+        file_menu.addAction(self.cache_act)
 
         file_menu.addSeparator()
         quit_act = QAction("E&xit", self)
@@ -135,7 +162,22 @@ class MainWindow(QMainWindow):
         self._status_msg = QLabel("No logs open")
         self._status_pos = QLabel("")
         self._status_span = QLabel("")
+
+        # The progress bar lives in the status bar rather than a modal: the
+        # window stays usable while a drop indexes, which is the whole point of
+        # moving the work off this thread.
+        self._progress = QProgressBar()
+        self._progress.setMaximumWidth(180)
+        self._progress.setTextVisible(True)
+        self._progress.hide()
+        self._cancel_btn = QPushButton("Cancel")
+        self._cancel_btn.setFlat(True)
+        self._cancel_btn.clicked.connect(self.cancel_indexing)
+        self._cancel_btn.hide()
+
         bar.addWidget(self._status_msg, 1)
+        bar.addWidget(self._progress)
+        bar.addWidget(self._cancel_btn)
         bar.addPermanentWidget(self._status_span)
         bar.addPermanentWidget(self._status_pos)
 
@@ -164,7 +206,8 @@ class MainWindow(QMainWindow):
         if paths:
             self.open_paths([Path(p) for p in paths])
 
-    def open_paths(self, paths: list[Path]) -> None:
+    def open_paths(self, paths: list[Path], *,
+                   background: bool | None = None) -> None:
         """
         Open files and report honestly what happened (FR-19).
 
@@ -176,9 +219,86 @@ class MainWindow(QMainWindow):
         file order with its entries carrying no time -- because "we could not
         parse it" is information the user should see next to the data, not a
         reason to refuse the file.
+
+        The indexing itself happens on a worker thread (NFR-5): what returns
+        here is only the knowledge that a sidecar now exists, after which the
+        files are opened on this thread as cache hits. `background=False` does
+        the lot inline, which is what the tests and the headless paths want.
         """
-        result = self.session.add_files(expand(paths))
+        if background is None:
+            background = self.background_indexing
+        files = expand(paths)
+        if not files:
+            self._status_msg.setText("nothing to open")
+            return
+        if not background or not self.session.use_cache:
+            self._finish_open(files)
+            return
+
+        if self._worker is not None:
+            # Already indexing. Queue the new paths rather than starting a
+            # second pool: two pools on one machine fight for the same disk and
+            # the same cores, and finish later than either would alone.
+            self._queued.extend(files)
+            self._status_msg.setText(
+                f"indexing... {len(self._queued)} more file(s) queued")
+            return
+
+        self._begin_indexing(files)
+
+    def _begin_indexing(self, files: list[Path]) -> None:
+        self._pending = files
+        self._progress.setRange(0, len(files))
+        self._progress.setValue(0)
+        self._progress.setFormat("%v / %m")
+        self._progress.show()
+        self._cancel_btn.show()
+        self._status_msg.setText(f"indexing {len(files)} file(s)...")
+
+        self._worker = IndexWorker(files, root=self.session.cache_root,
+                                   use_cache=self.session.use_cache)
+        self._worker.progress.connect(self._indexing_progress)
+        self._worker.finished.connect(self._indexing_finished)
+        self._thread = start(self._worker, self)
+
+    def _indexing_progress(self, done: int, total: int, name: str,
+                           status: str) -> None:
+        self._progress.setValue(done)
+        self._status_msg.setText(f"indexing {name} ({status})")
+
+    def _indexing_finished(self, result) -> None:
+        self._worker = None
+        self._thread = None
+        self._progress.hide()
+        self._cancel_btn.hide()
+
+        files, self._pending = self._pending, []
+        if result.cancelled:
+            # Whatever finished before the cancel is in the cache and costs
+            # nothing to open, so the files that did get indexed are still
+            # opened. Nothing is discarded for having been interrupted.
+            done = {f.path for f in result.files}
+            files = [p for p in files if str(p) in done]
+            self._status_msg.setText("indexing cancelled")
+            if not files:
+                return
+
+        self._finish_open(files, prepared=result)
+
+        queued, self._queued = self._queued, []
+        if queued:
+            self._begin_indexing(queued)
+
+    def cancel_indexing(self) -> None:
+        self._queued.clear()
+        if self._worker is not None:
+            self._worker.cancel()
+            self._cancel_btn.setEnabled(False)
+
+    def _finish_open(self, files: list[Path], prepared=None) -> None:
+        result = self.session.add_files(files)
         self.refresh()
+        self._cancel_btn.setEnabled(True)
 
         parts = [result.summary()]
         if result.no_format:
@@ -190,6 +310,8 @@ class MainWindow(QMainWindow):
         if result.failed:
             parts.append("failed: " + ", ".join(
                 Path(p).name for p, _ in result.failed))
+        if prepared is not None and prepared.indexed_bytes:
+            parts.append(prepared.summary())
 
         # Reported in the status bar, not a modal dialog. Dropping a folder of
         # fifty logs where three are locked by another process is an ordinary
@@ -201,6 +323,30 @@ class MainWindow(QMainWindow):
             "\n".join(f"{p}: {why}" for p, why in result.failed)
             if result.failed else ""
         )
+
+    def clear_cache(self) -> None:
+        """
+        NFR-22: the saved indexes are the user's disk, so they get a way to
+        reclaim it.
+
+        Files already open are unaffected -- their arrays are mapped, and on
+        Windows a mapped sidecar simply refuses to be deleted, so the count
+        reported is what actually went.
+        """
+        root = self.session.cache_root or sidecar.cache_root()
+        before, bytes_before = sidecar.usage(root)
+        freed = sidecar.clear(root)
+        after, _ = sidecar.usage(root)
+        gone = before - after
+        if not before:
+            self._status_msg.setText("index cache is already empty")
+            return
+        kept = (f", {after} still in use" if after else "")
+        self._status_msg.setText(
+            f"cleared {gone} of {before} cached index(es), "
+            f"{freed / 1e6:.1f} MB freed{kept}")
+        self._status_msg.setToolTip(
+            f"{root}\n{bytes_before / 1e6:.1f} MB before")
 
     def close_all(self) -> None:
         self.session.close()

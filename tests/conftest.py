@@ -13,6 +13,7 @@ sys.path.insert(0, str(ROOT / "tools"))
 
 import gen_corpus  # noqa: E402
 
+from logweave.index import sidecar  # noqa: E402
 from logweave.index.civil import epoch_us_to_wall_us  # noqa: E402
 from logweave.index.indexer import build_index  # noqa: E402
 from logweave.source import encoding  # noqa: E402
@@ -107,3 +108,38 @@ def index_of(path: Path, **kwargs):
     """Index one corpus file through the real pipeline."""
     src = BytesSource(path)
     return build_index(src, mtime_wall_us=src.mtime_wall_us, **kwargs)
+
+
+REAL_CACHE_ROOT = sidecar.cache_root
+"""The unpatched default, kept because `isolated_cache` below replaces it."""
+
+
+@pytest.fixture
+def real_cache_root():
+    """The genuine per-user cache root, for the one test that is about it."""
+    return REAL_CACHE_ROOT
+
+
+@pytest.fixture(scope="session")
+def cache_base(tmp_path_factory) -> Path:
+    """One directory for the whole session; `isolated_cache` subdivides it."""
+    return tmp_path_factory.mktemp("sidecars")
+
+
+@pytest.fixture(autouse=True)
+def isolated_cache(request, cache_base, monkeypatch):
+    """
+    Point the sidecar cache at a per-test directory for every test.
+
+    Without this, anything that opens a `Session` writes real sidecars into the
+    user's own cache directory, and -- far worse -- a later test can get a
+    cache *hit* from an earlier one's leftovers, so the miss path silently
+    stops being tested. Each test gets its own empty root, which is both
+    isolation and a guarantee that a cache-hit assertion earned its hit.
+
+    The directory is named, not created: this runs before all 500-odd tests and
+    almost none of them touch the cache, so creating and cleaning a temp
+    directory each time would cost more than the tests it protects.
+    """
+    name = "".join(c if c.isalnum() or c in "-_" else "_" for c in request.node.nodeid)
+    monkeypatch.setattr(sidecar, "cache_root", lambda: cache_base / name[-120:])

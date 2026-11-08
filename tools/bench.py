@@ -25,6 +25,7 @@ import json
 import os
 import platform
 import sys
+import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -378,6 +379,67 @@ def run_merge_benches(b: Bench, rows: int, k: int, seed: int = 7) -> None:
 # reporting
 # ---------------------------------------------------------------------------
 
+def run_cache_benches(b: Bench, chunk: bytes) -> None:
+    """
+    The sidecar cache -- NFR-4 (SPEC 5.4).
+
+    Measured on a real file, because the whole claim is about what the OS does
+    with a page-aligned mapping and the thing being measured is *not reading*.
+    A warm reopen's cost is per file -- a stat, a 64 KB hash, a memmap -- so it
+    is reported as a latency and not a throughput: the figure that matters is
+    milliseconds per file, and it should not move when the file gets bigger.
+    """
+    from logweave.index.cached import open_index
+    from logweave.index.civil import epoch_us_to_wall_us
+    from logweave.source.file import FileSource
+
+    with tempfile.TemporaryDirectory(prefix="logweave-bench-") as tmp:
+        work = Path(tmp)
+        log = work / "bench.log"
+        log.write_bytes(chunk)
+        root = work / "cache"
+        mtime = epoch_us_to_wall_us(int(log.stat().st_mtime * 1_000_000))
+
+        def once():
+            src = FileSource(log)
+            src.open()
+            try:
+                out = open_index(src, mtime_wall_us=mtime, path=log, root=root)
+                out.index.release()
+                return out
+            finally:
+                src.close()
+
+        t0 = time.perf_counter()
+        cold = once()
+        cold_s = time.perf_counter() - t0
+        if cold.status != "miss":
+            raise SystemExit(f"cache bench did not start cold: {cold.status}")
+
+        # Once only, and not best-of-three: the second run would be a hit.
+        b.results.append(Result(
+            "cache_first_index", "MB/s",
+            len(chunk) / (1 << 20) / cold_s, cold_s, True,
+            note=f"one run, cold; {cold.index.n:,} entries, includes writing "
+                 f"the sidecar"))
+
+        warm = once()
+        if warm.status != "hit":
+            raise SystemExit(f"cache bench did not warm: {warm.status}")
+
+        # One call per rep, and the best of them: a warm open is a few
+        # milliseconds, so an average would mostly report the scheduler.
+        b.latency("cache_warm_reopen", once, 1,
+                  note="NFR-4: per file, not per byte; budget 2.0s for a "
+                       "whole 10GB set")
+
+        size = sum(p.stat().st_size for p in root.glob("*.lwi"))
+        b.results.append(Result(
+            "cache_bytes_per_entry", "B/entry", size / max(1, warm.index.n),
+            0.0, False,
+            note=f"off+ts+flags+line_no; {size / (1 << 20):.1f}MB sidecar"))
+
+
 def report(results: list[Result], baseline: dict | None, tolerance: float) -> list[str]:
     name_w = max(len(r.name) for r in results) + 1
     print(f"\n{'benchmark':<{name_w}} {'value':>12} {'unit':<9} {'time':>9}  "
@@ -407,6 +469,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--merge-rows", type=int, default=2_000_000)
     ap.add_argument("--merge-sources", type=int, default=8)
     ap.add_argument("--skip-merge", action="store_true")
+    ap.add_argument("--skip-cache", action="store_true",
+                    help="skip the sidecar cache benches, which write to a "
+                         "temporary directory")
     ap.add_argument("--json", type=Path, default=None)
     ap.add_argument("--baseline", type=Path,
                     default=Path(__file__).resolve().parent / "bench_baseline.json")
@@ -432,6 +497,8 @@ def main(argv: list[str] | None = None) -> int:
           f"({len(chunk) / max(1, info['lines']):.0f} bytes/line)")
     if not args.skip_merge:
         run_merge_benches(b, args.merge_rows, args.merge_sources)
+    if not args.skip_cache:
+        run_cache_benches(b, chunk)
 
     # A baseline is only comparable to a run of the same shape. Several
     # benchmarks (histogram, build_cumulative) scale with bucket count rather

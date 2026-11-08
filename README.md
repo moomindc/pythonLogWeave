@@ -158,6 +158,25 @@ like logs, one level deep.
 | Ctrl+T | Hide the timestamp column — see below |
 | Arrows, PgUp/PgDn, Home/End | Move; hold Shift to extend the selection |
 | Scrollbar at the bottom | Scrolls the message only; timestamp and lanes stay put |
+| File ▸ Clear Index Cache | Delete the saved indexes — see below |
+
+**The index cache.** The first open of a large log has to read all of it; after
+that the index is saved beside the cache and reopening the same file costs about
+7 ms however big it is. A file that has merely *grown* since — a production log
+you keep coming back to — only has its new tail read. Nothing is reused unless
+the file's head still hashes the same, so a rotated log is re-indexed rather
+than mis-read.
+
+The saved indexes cost about 21 bytes an entry and live in
+`%LOCALAPPDATA%\LogWeave\index` (`$XDG_CACHE_HOME/logweave/index` on Linux,
+`~/Library/Caches/LogWeave/index` on macOS) — never beside the log, which is
+often read-only or on a share. They are capped and swept oldest-used-first, and
+**File ▸ Clear Index Cache** deletes them and reports what it freed. Files
+already open keep working.
+
+Indexing happens in worker processes while the window stays usable, with
+progress and a Cancel in the status bar. Cancelling keeps whatever had already
+finished — those files are in the cache, so they cost nothing to open.
 
 **The timestamp column.** LogWeave shows the timestamp it parsed in its own
 column, in grey, and greyer still when it had to infer the value rather than
@@ -199,8 +218,8 @@ living record — updated as each lands.
 | **M1** | Format detection, vectorised extraction, `FileIndex`, headless — plus the whole source layer | ✅ **done** |
 | **M2a** | Checkpointed `MergeIndex` with a block cache | ✅ **done** |
 | **M3** | Qt shell: merged view, scrolling, drag-and-drop | ✅ **done** |
-| **M2b** | Sidecar cache, parallel indexer | ⬜ next |
-| **M4** | Highlighting, severity classes, source lanes, aliases | ⬜ |
+| **M2b** | Sidecar cache, parallel indexer, indexing off the UI thread | ✅ **done** |
+| **M4** | Highlighting, severity classes, source lanes, aliases | ⬜ next |
 | **M5** | Minimap and timeline strips | ⬜ |
 | **M6** | Follow engine; rotation matrix green | ⬜ |
 | **M7** | Search, filters, selection, copy, export | ⬜ |
@@ -403,6 +422,94 @@ M7 extends it rather than replacing it.
 
 ---
 
+## M2b — what it delivers and what it found
+
+Reopening a log you have already indexed costs a memory map and nothing else, a
+drop no longer freezes the window, and the saved indexes have a size, a cap and
+a button to delete them.
+
+### Reopening is 122× faster, and the size of the file stops mattering
+
+On a 104.9MB, 1,580,073-entry log:
+
+| | Measured | Budget |
+|---|---|---|
+| First index (cold, one process) | 3.91 s, 26.8 MB/s | — |
+| Warm reopen, steady state | **6.6 ms** | — |
+| 10 GB set, warm, in 10 files | **0.07 s** | NFR-4: 2.0 s |
+| 10 GB set, warm, in 100 files | **0.66 s** | NFR-4: 2.0 s |
+| Sidecar on disk | 33.2 MB, **21.0 bytes/entry** | — |
+
+A warm reopen is a stat, a 64 KB hash and an `np.memmap`. Every one of those is
+per *file*; none is per byte. That is why the NFR-4 budget is met with two
+orders of magnitude to spare, and why the number of files matters while their
+size does not.
+
+21.0 bytes/entry is exactly `off` (8) + `ts` (8) + `flags` (1) + `line_no` (4),
+so what the cache costs relative to the log depends entirely on mean entry
+length: 32% of this corpus, whose entries average 66 bytes, and around 4% of a
+production log averaging 500.
+
+### Parallel indexing: 2.21×, not 4×
+
+Four 104.9MB files, four workers on twelve cores: **27.9 MB/s in process,
+61.7 MB/s pooled.** The shortfall against a notional 4× is memory bandwidth and
+one shared disk, not scheduling, and it is recorded rather than tuned around.
+
+Chunks *within* a file are still indexed serially, because a chunk cannot be
+indexed without the carry state from the one before it — the open multi-line
+entry, the inferred year, the rollover count. A single multi-gigabyte file
+therefore still indexes at one-core speed. That is the honest limit of M2b, and
+it is not what NFR-5 is about: the window stays responsive because the work is
+in another process, not because it is spread across cores.
+
+### The window stays usable because the session stays single-threaded
+
+The obvious implementation — run `Session.add_files` on a worker thread — is a
+data race on every array the view paints from. So the work is split instead of
+moved: the worker only guarantees **a sidecar exists** for each path, sharing no
+object with the window and returning a few hundred bytes of summary, and the GUI
+thread then opens the same files as cache hits at ~7 ms each. Progress and a
+cancel live in the status bar rather than a modal, so the window answers
+throughout. A second drop while indexing is queued, not raced: two pools on one
+machine fight for the same disk and finish later than either alone.
+
+### Four bugs found by building it
+
+- **Every *second* append quietly became a full re-index.** The splice that
+  joins a cached prefix to a freshly indexed tail dropped `layout_json`, so the
+  sidecar written from a spliced index carried no layout, so the next append
+  could not rebuild the detection it needed. One append always worked; two in a
+  row did not. Found by a test that appends three times and demands each result
+  be byte-identical to a full re-index.
+- **The append path could never fire for a file under 64 KB.** The head digest
+  covered a fixed 64 KB window, which for a small file is the whole of it, so
+  appending a line looked exactly like log rotation. The hash is now compared
+  over the length that was recorded — which is the case of a young log being
+  tailed, the one that matters most.
+- **A superseded sidecar would not delete on Windows.** Size and mtime are in
+  the filename, so a growing log earns a new sidecar on each reopen and the old
+  one is pruned — except that the prune fails silently while the old sidecar is
+  still mapped. A log revisited a few times left a near-full-size cache entry
+  per visit. The mappings are now released once the prefix has been spliced.
+- **The test suite was getting cache hits from previous runs.** Tests wrote
+  real sidecars into the user's own cache directory, so a later test could be
+  served by an earlier one's leftovers and the miss path silently stopped being
+  tested. Every test now gets its own empty cache root.
+
+### What a worker may not do
+
+`prepare` is an optimisation that runs in other processes on someone else's
+machine, where pools break, sandboxes forbid spawning and files vanish between
+the stat and the read. Every one of those comes back as a missed speedup, never
+a log the user cannot see: the session opens the same path straight afterwards
+and reports any real error against the file it belongs to. `BrokenProcessPool`
+is a `RuntimeError` rather than an `OSError`, which the obvious `except OSError`
+would miss — and it is what happens when antivirus or an OOM killer takes a
+worker.
+
+---
+
 ## Layout
 
 ```
@@ -425,21 +532,26 @@ logweave/
     lines.py         line splitting and entry grouping
     indexer.py       chunked build and rollover inference
     fileindex.py     the four parallel arrays, 21 bytes an entry
+    sidecar.py       the on-disk index cache: format, validation, LRU sweep
+    cached.py        hit / append / miss -- indexing only what is not cached
+    layoutio.py      the proven layout, serialised so an append can reuse it
   merge/       layer 3: k-way merge over the indexes, Qt-free
     mergeindex.py    checkpointed cursors, block cache, random access by row
   session/     layer 4: what the UI asks for, still Qt-free
     session.py       open files, rebuild the merge, hand out decoded rows
+    prepare.py       warm the cache in worker processes, before opening
     rowformat.py     copy and export formatting, with attribution (D9)
     palette.py       severity ramp and source-lane colours
   ui/          layer 5: the only layer allowed to import Qt
     mergedview.py    QAbstractScrollArea, custom paint, int64 row space
     mainwindow.py    drag-and-drop, source dock, status reporting
+    indexing.py      the worker thread that keeps the window answering
     theme.py         fonts, chrome colours, stylesheet
     app.py           QApplication entry point
   highlight/   layer 5: M4
 tools/
   gen_corpus.py      corpus + ground truth generator, with ground truth
-  make_test_logs.py  realistic logs to try the GUI on, written to C:	emp
+  make_test_logs.py  realistic logs to try the GUI on, written to C:/temp
   bench.py           benchmark harness and regression gate (no Qt, by test)
   bench_ui.py        the paint budget; the one tool that needs Qt
   _prototypes.py     M0 kernels kept only as reference rows in the gate

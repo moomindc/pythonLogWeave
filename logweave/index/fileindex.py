@@ -140,6 +140,21 @@ class FileIndex:
     line_no: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=np.uint32))
     order: np.ndarray | None = None
 
+    layout_json: dict | None = None
+    """
+    The proven layout, as plain data, for resuming this index later.
+
+    Carried so that an append -- a reopen of a grown file, or a follow tick --
+    indexes the new bytes with the layout the rest of the file was indexed
+    with. Re-detecting on a short tail can land on a different member of the
+    ISO family, and the two halves of the index would then disagree about where
+    the timestamp is (SPEC 5.4). Plain data rather than a `Layout` so it
+    survives a round trip through the sidecar and a process boundary.
+    """
+
+    severity_offset: int | None = None
+    """Fixed column the level word was found at, or None if there was none."""
+
     @property
     def n(self) -> int:
         return int(self.ts.size)
@@ -174,6 +189,26 @@ class FileIndex:
         copy; for a file that needed reordering it is the permuted view.
         """
         return self.ts if self.order is None else self.ts[self.order]
+
+    def release(self) -> None:
+        """
+        Drop any memory mappings this index holds.
+
+        A sidecar is served by mapping it (SPEC 5.4), and on Windows an open
+        mapping makes the file undeletable: the prune that is supposed to
+        retire a superseded sidecar fails silently, and a log reopened a few
+        times accumulates a near-full-size cache entry per visit. The arrays
+        are copied out before this is called, so the index that survives owns
+        its memory outright.
+
+        Using the index after this is undefined -- not an exception, a crash --
+        so it is called only on an index that has just been spliced away.
+        """
+        for name in ("off", "ts", "flags", "line_no", "order"):
+            arr = getattr(self, name, None)
+            mapped = getattr(arr, "_mmap", None)
+            if mapped is not None:
+                mapped.close()
 
     def entry_range(self, i: int) -> tuple[int, int]:
         """Byte range of entry `i`, including its continuation lines (FR-7)."""

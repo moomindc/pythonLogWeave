@@ -39,6 +39,7 @@ import numpy as np
 from ..source import encoding
 from ..source.base import LogSource
 from . import extract as ex
+from . import layoutio
 from .civil import US_PER_DAY, US_PER_SEC, civil_from_days
 from .detect import Detection, detect
 from .fileindex import FileIndex, IndexStats, _Growable
@@ -186,6 +187,7 @@ def build_index(
     ruleset: SeverityRuleset = DEFAULT_RULESET,
     start_at: int | None = None,
     limit: int | None = None,
+    first_line: int = 1,
 ) -> FileIndex:
     """
     Index a source from `start_at` to its current extent.
@@ -203,6 +205,12 @@ def build_index(
 
     `detection` may be supplied to skip re-detection -- which is what a follow
     append does, since a file does not change format mid-stream.
+
+    `first_line` is the 1-based line number of the first line at `start_at`.
+    It only matters when resuming: `line_no` is a position within the whole
+    file (D9), so an append that restarted the count at 1 would attribute a
+    copied row to the wrong line of the file, which is the one thing
+    attribution must never do.
     """
     # A source with a byte-order mark reports content starting past it, so the
     # mark is never indexed as part of the first entry (see LogSource.data_start).
@@ -224,6 +232,9 @@ def build_index(
     idx.stats.notes = list(detection.notes)
     idx.stats.used_fast_path = detection.fast_path
     idx.message_offset = message_offset(detection)
+    idx.severity_offset = detection.severity_offset
+    if detection.layout is not None:
+        idx.layout_json = layoutio.to_json(detection.layout)
 
     if not detection.ok:
         # FR-19: a file with no recognisable format is still listed, still
@@ -243,7 +254,7 @@ def build_index(
     days = _Growable(np.int64) if detection.fmt.infer_year else None
     sods = _Growable(np.int64) if needs_parts else None
 
-    carry = _Carry(tail_off=start_at)
+    carry = _Carry(tail_off=start_at, line_base=max(0, first_line - 1))
     lone_cr: bool | None = None
     pos = start_at
     stride = enc.terminator_width

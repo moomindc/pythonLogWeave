@@ -29,7 +29,15 @@ def app():
 
 @pytest.fixture
 def window(app):
-    w = MainWindow()
+    """
+    A window that opens files synchronously.
+
+    Most of what is tested here is what opening *produces* -- rows, the dock,
+    the status bar -- not that it happens on a thread. Driving an event loop in
+    every one of those tests would make them slow and flaky to no purpose; the
+    background path has its own tests at the end of this file.
+    """
+    w = MainWindow(background=False)
     w.resize(1200, 800)
     yield w
     w.session.close()
