@@ -42,10 +42,36 @@ from ..session.overview import (
 )
 from . import theme
 
+DRAG_PIXELS = 4
+"""
+Movement that turns a click on the timeline into a range selection (FR-48).
+
+Four, because a click with a mouse is rarely a click with *no* movement -- a
+one- or two-pixel twitch on the way up is normal, and at a threshold of one
+every seek would also set a filter covering a sliver of time.
+"""
+
 
 def _rgb(hex_str: str) -> tuple[int, int, int]:
     h = hex_str.lstrip("#")
     return (int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16))
+
+
+def _same_layers(a, b) -> bool:
+    """
+    Whether two mark-layer tuples are the same layers, by identity.
+
+    By identity on purpose. `MarkLayer` is a frozen dataclass holding NumPy
+    arrays, so `==` on two distinct but equal layers compares arrays
+    element-wise and then asks for the truth of the result -- which raises
+    `ValueError: truth value of an array is ambiguous`, inside `paintEvent`.
+    Every layer the strips are given is produced once by a scan and assigned
+    wholesale, so identity is both safe and exactly the question being asked:
+    has the thing I drew been replaced?
+    """
+    if b is None or len(a) != len(b):
+        return False
+    return all(x is y for x, y in zip(a, b, strict=True))
 
 
 class OverviewStrip(QWidget):
@@ -80,6 +106,17 @@ class OverviewStrip(QWidget):
         identity rather than diffing two count arrays.
         """
         self._drawn_marks: tuple | None = None
+        self._find = None
+        """
+        The find's hits as a `MarkLayer` (FR-44), or None.
+
+        Held apart from `_marks` rather than appended to it so that the find
+        column is always the rightmost one. A find is transient and the rules
+        are not: if it shared the rule gutter its column would move whenever a
+        rule was toggled, and a mark that moves for an unrelated reason is
+        unreadable even when every pixel in it is right.
+        """
+        self._find_time: int | None = None
         self._top_row = 0
         self._page_rows = 1
         self._marker_time: int | None = None
@@ -150,10 +187,43 @@ class OverviewStrip(QWidget):
         timestamps plus a colour. Takes effect on the next paint.
         """
         layers = tuple(layers)
-        if layers == self._marks:
+        if _same_layers(layers, self._marks):
             return
         self._marks = layers
         self.update()
+
+    def set_find_marks(self, layer) -> None:
+        """The find's hits, as the rightmost gutter column (FR-44)."""
+        if layer is self._find:
+            return
+        self._find = layer
+        self.update()
+
+    def set_find_current(self, wall_us: int | None) -> None:
+        """Merged time of the hit the user is standing on, or None."""
+        if wall_us == self._find_time:
+            return
+        self._find_time = wall_us
+        self.update()
+
+    def _gutter_layers(self) -> tuple:
+        return self._marks + ((self._find,) if self._find is not None else ())
+
+    def _paint_find_current(self, painter: QPainter, strip: Strip) -> None:
+        """
+        The current hit, as a line across the strip.
+
+        Positioned through `strip.times` rather than through either strip's own
+        row or time mapping, because that array is the axis both strips already
+        share -- so this one method is correct on a row-proportional minimap
+        and on a wall-clock timeline without knowing which it is on.
+        """
+        if self._find_time is None or strip.height <= 0:
+            return
+        y = int(np.searchsorted(strip.times, int(self._find_time)))
+        y = max(0, min(y, strip.height - 1))
+        painter.setPen(QColor(theme.FIND_CURRENT))
+        painter.drawLine(0, y, self.width() - 2, y)
 
     def refresh(self) -> None:
         """The session changed: drop the cached image and repaint."""
@@ -191,9 +261,10 @@ class OverviewStrip(QWidget):
         refreshed, and reused otherwise -- so a scroll, which only moves the
         viewport box, costs one `drawImage` and no NumPy at all.
         """
+        layers = self._gutter_layers()
         stale = (self._buffer is None
                  or self._drawn is not strip
-                 or self._marks != self._drawn_marks
+                 or not _same_layers(layers, self._drawn_marks)
                  or self._buffer.shape[:2] != (height, width))
         if stale:
             self._buffer = np.ascontiguousarray(self._compose(strip, width))
@@ -205,7 +276,7 @@ class OverviewStrip(QWidget):
             # it has not changed. That makes "is this buffer still current" a
             # pointer comparison rather than a diff of two count arrays.
             self._drawn = strip
-            self._drawn_marks = self._marks
+            self._drawn_marks = layers
         if self._image is not None:
             painter.drawImage(0, 0, self._image)
 
@@ -218,12 +289,13 @@ class OverviewStrip(QWidget):
         of information. With nothing marked the gutter is zero wide and this is
         the single `_render_pixels` call it was before.
         """
-        gutter = mark_gutter(self._marks, width)
+        layers = self._gutter_layers()
+        gutter = mark_gutter(layers, width)
         bands = self._render_pixels(strip, width - gutter)
         if not gutter:
             return bands
         return np.concatenate([bands, render_mark_gutter(
-            self._marks, strip.times, strip.height, gutter,
+            layers, strip.times, strip.height, gutter,
             theme=self._theme, fallback=_rgb(theme.FOREGROUND))], axis=1)
 
     # ------------------------------------------------------------------
@@ -334,6 +406,7 @@ class MinimapStrip(OverviewStrip):
         painter.fillRect(box, self._fill)
         painter.setPen(self._box)
         painter.drawRect(box.adjusted(0, 0, -1, -1))
+        self._paint_find_current(painter, strip)
 
 
 class TimelineStrip(OverviewStrip):
@@ -362,6 +435,20 @@ class TimelineStrip(OverviewStrip):
     `QModelIndex.row()`; a timestamp is further over the line than a row.
     """
 
+    rangeSelected = Signal("qlonglong", "qlonglong")
+    """
+    A dragged time window, `(since, until)` in merged `wall_us`.
+
+    `qlonglong` twice, for the reason `timeSought` gives at length.
+    """
+
+    def __init__(self, session: Session, parent: QWidget | None = None):
+        super().__init__(session, parent)
+        self._anchor_px: int | None = None
+        self._drag_px: int | None = None
+        self._window: tuple[int, int] | None = None
+        self._shade = QColor(theme.STRIP_EXCLUDED)
+
     def strip(self, height: int) -> Strip:
         return self.session.overview.timeline(height)
 
@@ -380,6 +467,112 @@ class TimelineStrip(OverviewStrip):
             return
         self.timeSought.emit(self.session.overview.time_at_pixel(pixel, h))
 
+    # ------------------------------------------------------------------
+    # selecting a time range (FR-48)
+    # ------------------------------------------------------------------
+
+    def mousePressEvent(self, event) -> None:  # noqa: N802
+        """
+        A press is a seek *and* the start of a possible range.
+
+        The two gestures share a button because the strip has only one, and
+        because the distinction is unambiguous once the mouse moves: a click
+        seeks, a drag selects. The seek happens on the press rather than the
+        release so that clicking still feels immediate, and once a drag passes
+        `DRAG_PIXELS` the seeking stops -- dragging out a filter must not also
+        scrub the view through every time it passes over.
+
+        Scrubbing is what is given up, and it is the right thing to give up
+        here: SPEC 8.2 already says this strip is a seek control and
+        deliberately does not drive the scrollbar, because a drag down a
+        wall-clock axis advances through rows at wildly uneven rates. The
+        minimap is the strip to scrub on.
+        """
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._anchor_px = int(event.position().y())
+            self._drag_px = None
+            self._seek_to(self._anchor_px)
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:  # noqa: N802
+        if (event.buttons() & Qt.MouseButton.LeftButton
+                and self._anchor_px is not None):
+            at = int(event.position().y())
+            if (self._drag_px is not None
+                    or abs(at - self._anchor_px) >= DRAG_PIXELS):
+                self._drag_px = at
+                self.update()
+            else:
+                self._seek_to(at)
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:  # noqa: N802
+        if (event.button() == Qt.MouseButton.LeftButton
+                and self._anchor_px is not None and self._drag_px is not None):
+            lo, hi = sorted((self._anchor_px, self._drag_px))
+            self._anchor_px = self._drag_px = None
+            self.update()
+            h = self.height()
+            if h > 0 and self.session.total_rows:
+                ov = self.session.overview
+                # The *end* of the last pixel, not its start: a one-pixel band
+                # covers a slice of time, and a window ending at the start of
+                # it would exclude everything the user dragged over.
+                since = int(ov.time_at_pixel(lo, h))
+                until = int(ov.time_at_pixel(min(hi + 1, h - 1), h))
+                if until < since:
+                    since, until = until, since
+                self.rangeSelected.emit(since, until)
+            event.accept()
+            return
+        self._anchor_px = self._drag_px = None
+        super().mouseReleaseEvent(event)
+
+    def set_window(self, window: tuple[int, int] | None) -> None:
+        """The time filter in force, drawn as a band (FR-45, FR-48)."""
+        if window == self._window:
+            return
+        self._window = window
+        self.update()
+
+    def _paint_window(self, painter: QPainter, strip: Strip) -> None:
+        """
+        The dragged or committed time window.
+
+        Drawn as *shade over the excluded time* rather than as a box round the
+        included time, because that is what the filter does: the rows outside
+        the window are gone from the view, and showing them shaded on the
+        timeline is the one place a reader can still see how much of the log
+        they have put aside.
+        """
+        band = self._drag_band()
+        if band is not None:
+            top, bottom = band
+        elif self._window is not None:
+            times = strip.times
+            top = int(np.searchsorted(times, self._window[0]))
+            bottom = int(np.searchsorted(times, self._window[1]))
+        else:
+            return
+        top = max(0, min(top, strip.height))
+        bottom = max(top, min(bottom, strip.height))
+        w = max(1, self.width() - 1)
+        painter.fillRect(QRect(0, 0, w, top), self._shade)
+        painter.fillRect(QRect(0, bottom, w, strip.height - bottom), self._shade)
+        painter.setPen(self._box)
+        painter.drawLine(0, top, w, top)
+        painter.drawLine(0, bottom, w, bottom)
+
+    def _drag_band(self) -> tuple[int, int] | None:
+        if self._anchor_px is None or self._drag_px is None:
+            return None
+        lo, hi = sorted((self._anchor_px, self._drag_px))
+        return lo, hi
+
     def _paint_overlay(self, painter: QPainter, strip: Strip) -> None:
         """
         Where the view is, as a line rather than a box.
@@ -389,6 +582,8 @@ class TimelineStrip(OverviewStrip):
         during a burst, an hour during a quiet patch. A single line says "you
         are here" without claiming to say how much you can see.
         """
+        self._paint_window(painter, strip)
+        self._paint_find_current(painter, strip)
         if self._marker_time is None:
             return
         y = self.session.overview.pixel_of_time(self._marker_time, strip.height)

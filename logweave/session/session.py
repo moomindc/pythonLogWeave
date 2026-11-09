@@ -98,6 +98,33 @@ class SessionSource:
     def colour(self) -> str:
         return self.meta.colour
 
+    citation_note: str = ""
+    """
+    Why this source's line numbers may no longer resolve (PRD risk R10).
+
+    Empty for every ordinary source. Set by the follow engine when the file
+    under this source stops being the file its path names -- a rotation leaves
+    the content perfectly readable through the handle we already hold, but
+    `app.log:7` is then a reference a colleague following it would not find.
+    `rowformat` marks those citations rather than printing a number that points
+    somewhere else.
+    """
+
+    view_hist: object | None = None
+    """
+    The histogram the overview strips should draw for this source (FR-45).
+
+    Set when a filter is in force, because the one in the index counts every
+    entry and the strips would otherwise describe rows the view does not
+    contain. See `session.filters.histograms` for why nearly every filter can
+    produce this for nothing.
+    """
+
+    @property
+    def hist(self):
+        """What the strips aggregate -- the filtered histogram if there is one."""
+        return self.view_hist if self.view_hist is not None else self.index.hist
+
     @property
     def message_offset(self) -> int:
         """
@@ -159,6 +186,15 @@ class Session:
         self.cache_root = cache_root
         self.sources: list[SessionSource] = []
         self._merge = None
+        self._filtered = None
+        """
+        The merge over the rows a filter passed, or None (FR-45).
+
+        Kept *beside* the unfiltered one rather than replacing it, which is the
+        whole of FR-45's "reversible without re-indexing": clearing a filter is
+        dropping this reference, and costs nothing.
+        """
+        self._filter = None
         self._overview: Overview | None = None
         self._text: OrderedDict[tuple[int, int], str] = OrderedDict()
 
@@ -283,6 +319,15 @@ class Session:
             for s in self.sources
         ])
         self._text.clear()
+        # A filter's masks are one per source and sized to that source's entry
+        # count, so a rebuild -- a file dropped in, a source closed -- has
+        # invalidated them. Dropped rather than re-evaluated, because
+        # re-evaluating a tier-2 filter means reading every byte again and that
+        # is the caller's decision to make, not this method's.
+        self._filtered = None
+        self._filter = None
+        for s in self.sources:
+            s.view_hist = None
         # The strips' memo is keyed on a generation that covers skews, enabled
         # flags and the row count, but not on the merge object itself -- so a
         # rebuild that leaves all three unchanged (a rename) would otherwise be
@@ -303,20 +348,80 @@ class Session:
         window in which they disagree.
         """
         self.sources[source].index = index
-        if self._merge is not None:
-            self._merge.sources[source].index = index
+        for merge in self._merges():
+            merge.sources[source].set_index(index)
+
+    def _merges(self):
+        """Every merge that has to be told about a change: the unfiltered one
+        and, if a filter is in force, the view over it."""
+        return [m for m in (self._merge, self._filtered) if m is not None]
 
     def close(self) -> None:
         for s in self.sources:
             s.source.close()
         self.sources.clear()
         self._merge = None
+        self._filtered = None
+        self._filter = None
         self._overview = None
         self._text.clear()
 
     # ------------------------------------------------------------------
     # what the view asks for
     # ------------------------------------------------------------------
+
+    # ------------------------------------------------------------------
+    # filtering (FR-45)
+    # ------------------------------------------------------------------
+
+    def set_filter(self, filtered) -> None:
+        """
+        Show only the rows a filter passed, or clear it with None (FR-45).
+
+        Takes an evaluated `filters.Filtered` rather than a predicate, because
+        evaluating one can mean reading every byte of every file (tier 2) and
+        that does not belong on the thread that paints. `ui.findscan` runs the
+        evaluation and hands the result here.
+
+        The filtered merge is **derived** from the unfiltered one's checkpoints
+        rather than built, which is what keeps this inside NFR-9's 500 ms at
+        any size -- see `MergeIndex.derive_checkpoints`.
+        """
+        self._filter = filtered
+        if filtered is None or not filtered.filt.active:
+            self._filter = None
+            self._filtered = None
+            for ss in self.sources:
+                ss.view_hist = None
+        else:
+            masks = list(filtered.masks) + [None] * (
+                len(self.sources) - len(filtered.masks))
+            self._filtered = (self._merge.filtered(masks[:len(self.sources)])
+                              if self._merge is not None else None)
+            for i, ss in enumerate(self.sources):
+                ss.view_hist = (filtered.hists[i]
+                                if i < len(filtered.hists) else None)
+        # The decoded-text cache is keyed on (source, entry), which a filter
+        # does not change -- so it is deliberately *not* cleared here. What has
+        # to go is the strips' aggregation memo, whose generation covers the
+        # histograms this just swapped.
+        if self._overview is not None:
+            self._overview.invalidate()
+
+    @property
+    def filter(self):
+        """The `filters.Filtered` in force, or None."""
+        return self._filter
+
+    @property
+    def is_filtered(self) -> bool:
+        return self._filtered is not None
+
+    @property
+    def unfiltered_rows(self) -> int:
+        """Rows the merge would have with no filter -- the denominator the
+        status bar shows beside the filtered count."""
+        return self._merge.total if self._merge else 0
 
     @property
     def merge(self) -> object | None:
@@ -327,8 +432,20 @@ class Session:
         checkpoint table (SPEC 8.3), which is a merge-layer operation with no
         per-row equivalent up here -- `row_to_time` exists, and eight hundred
         calls to it is eight hundred block replays. Read-only, and read by
-        `session.overview` alone; the view still never sees it.
+        `session.overview` and the search's row locator; the view still never
+        sees it.
+
+        **The filtered merge when there is one**, because every consumer wants
+        the stream as displayed: a minimap of rows the view does not contain
+        would scroll to the wrong place, and a hit's row number has to be a row
+        number in the view the user is looking at.
         """
+        return self._filtered if self._filtered is not None else self._merge
+
+    @property
+    def base_merge(self) -> object | None:
+        """The unfiltered merge, for the one caller that means it: building a
+        filtered view over it (`set_filter`)."""
         return self._merge
 
     @property
@@ -347,26 +464,31 @@ class Session:
 
     @property
     def total_rows(self) -> int:
-        return self._merge.total if self._merge else 0
+        m = self.merge
+        return m.total if m else 0
 
     @property
     def is_empty(self) -> bool:
         return self.total_rows == 0
 
     def time_span(self) -> tuple[int, int]:
-        return self._merge.time_span() if self._merge else (0, 0)
+        m = self.merge
+        return m.time_span() if m else (0, 0)
 
     def time_to_row(self, wall_us: int) -> int:
-        return self._merge.time_to_row(wall_us) if self._merge else 0
+        m = self.merge
+        return m.time_to_row(wall_us) if m else 0
 
     def row_to_time(self, row: int) -> int:
-        return self._merge.row_to_time(row) if self._merge else 0
+        m = self.merge
+        return m.row_to_time(row) if m else 0
 
     def set_skew(self, source: int, skew_us: int) -> None:
         """D2 / FR-18. Rebuilds checkpoints; does not re-index."""
         self.sources[source].meta.skew_us = skew_us
+        for merge in self._merges():
+            merge.set_skew(source, skew_us)
         if self._merge:
-            self._merge.set_skew(source, skew_us)
             self._text.clear()
 
     def set_enabled(self, source: int, enabled: bool) -> None:
@@ -378,8 +500,9 @@ class Session:
         Distinct from `follow`, which is about tailing, not visibility.
         """
         self.sources[source].meta.enabled = enabled
+        for merge in self._merges():
+            merge.set_enabled(source, enabled)
         if self._merge:
-            self._merge.set_enabled(source, enabled)
             self._text.clear()
 
     def rows(self, start: int, count: int) -> list[Row]:
@@ -390,9 +513,10 @@ class Session:
         raising -- a view scrolled to the bottom asks for more rows than exist
         on every frame, and that is not an error.
         """
-        if not self._merge or count <= 0:
+        m = self.merge
+        if m is None or count <= 0:
             return []
-        got = self._merge.rows(start, count)
+        got = m.rows(start, count)
         out: list[Row] = []
         for i in range(len(got)):
             si = int(got.source[i])

@@ -426,12 +426,15 @@ class _AppearancePage(QWidget):
 _SET_HELP = {
     "severity": "ERROR, WARN, INFO and the rest, pointed at the eight severity "
                 "classes. These also drive the minimap's colours and the "
-                "severity mark in the gutter.",
+                "severity mark in the gutter. Only WARNING and above colour "
+                "the message text — colouring INFO as well would colour "
+                "every row — but all eight are still classified.",
     "shapes": "What a failure looks like when no line says ERROR: exception "
               "class names, Java and Python stack frames, 'Caused by:'.",
-    "syslog": "Leading <0> to <7> priorities, for a raw syslog capture. Off by "
-              "default because the pattern is rare elsewhere and every rule "
-              "costs a branch in the scan.",
+    "syslog": "Leading <0> to <4> priorities — emergency through warning "
+              "— for a raw syslog capture. Off by default because the "
+              "pattern is rare elsewhere and every rule costs a branch in "
+              "the scan.",
 }
 
 

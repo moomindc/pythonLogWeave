@@ -586,6 +586,146 @@ def run_mark_benches(b: Bench, chunk: bytes) -> None:
                       f"opt-in per rule (FR-31a) rather than a global switch")
 
 
+def run_scan_benches(b: Bench, chunk: bytes) -> None:
+    """
+    The three find/filter kernels -- SPEC 11.1, FR-44, FR-45, NFR-10.
+
+    NFR-10 is "a literal search across a 10 GB merged set in under five
+    seconds", and these rows are what says whether that holds: at 64 MB a
+    subject, 10 GB is 160 chunks, so a row's MB/s divides straight into a
+    projected whole-set time.
+
+    Every row searches for a needle that is **not there**, which is the shape
+    of a search someone is actually hunting with -- a term they expect to be
+    rare. A needle that matched everywhere would measure match bookkeeping
+    instead of scanning.
+    """
+    import mmap
+    import re as _re
+
+    from logweave.session.scan import fold_ascii
+
+    nbytes = len(chunk)
+    needle = b"NoSuchTokenHere"
+
+    # In place, out of a real mapping: this is `LogSource.find`, which is the
+    # path NFR-10 depends on. Nothing is copied, which is the whole point --
+    # the chunked row below pays a memcpy per chunk and that is the 1.6x.
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "subject.log"
+        path.write_bytes(chunk)
+        with path.open("rb") as handle:
+            mapped = mmap.mmap(handle.fileno(), 0, access=mmap.ACCESS_READ)
+            try:
+                b.throughput("find_literal_in_place",
+                             lambda: mapped.find(needle, 0, nbytes), nbytes,
+                             note="`mmap.find` over the mapping -- "
+                                  "`LogSource.find`, and what NFR-10 rests on")
+            finally:
+                mapped.close()
+
+    step = 4 * 1024 * 1024
+
+    def chunked():
+        for at in range(0, nbytes, step):
+            bytes(chunk[at:at + step]).find(needle)
+
+    b.throughput("find_literal_chunked", chunked, nbytes,
+                 note="the same literal with the bytes copied out 4 MB at a "
+                      "time: what a gzipped or non-mapped source has to do")
+
+    folded_needle = fold_ascii(needle)
+
+    def folded():
+        for at in range(0, nbytes, step):
+            fold_ascii(chunk[at:at + step]).find(folded_needle)
+
+    b.throughput("find_literal_folded_ci", folded, nbytes,
+                 note="case-insensitive the way `session.scan` does it: fold "
+                      "the chunk, search for a pre-folded needle")
+
+    ci = _re.compile(_re.escape(needle), _re.IGNORECASE)
+    b.throughput("find_literal_regex_ci",
+                 lambda: sum(1 for _ in ci.finditer(chunk)), nbytes,
+                 note="the same question via `re.IGNORECASE`, which is why it "
+                      "is not used: the fast substring path is gone")
+
+    pattern = _re.compile(rb"NoSuch[A-Z][a-z]+Here\d{3}")
+    b.throughput("find_regex",
+                 lambda: sum(1 for _ in pattern.finditer(chunk)), nbytes,
+                 note="a real regex (FR-44's regex mode), unchunked")
+
+
+def run_filter_benches(b: Bench, rows: int, k: int, seed: int = 11) -> None:
+    """
+    What applying a filter costs -- FR-45, NFR-9, SPEC 11.2.
+
+    NFR-9 is "toggle a filter on a 100M-row merged set in under 500 ms". The
+    masks were never the problem; **the filtered merge's checkpoints were**, and
+    SPEC 11.2 did not account for them at all. Two ways to get them are
+    measured against the same masks:
+
+    * `filter_derive_*` derives the table from the parent's checkpoint times
+      (`MergeIndex.derive_checkpoints`), which is a few passes over the keep
+      masks and is therefore **independent of how much the filter keeps**;
+    * `filter_build_*` merges the kept rows from nothing, which is linear in
+      them.
+
+    Both selectivities are measured because that is where the two diverge. A
+    filter that keeps a tenth is the one people picture; the common one in
+    practice -- "hide DEBUG" -- keeps nearly everything, and that is exactly
+    where a rebuild is worst.
+
+    Every rate is over the **parent's** row count, not the kept count: the job
+    is "apply this filter to this merged set", and charging the rebuild only
+    for the rows it happened to keep would make the slower arrangement look
+    faster.
+    """
+    rng = np.random.default_rng(seed)
+    per = max(2, rows // k)
+    arrays = []
+    for _ in range(k):
+        steps = rng.integers(1, 200_000, size=per, dtype=np.int64)
+        arrays.append(np.cumsum(steps) + 1_791_500_000_000_000)
+    total = sum(a.size for a in arrays)
+
+    indexes = [fake_index(a) for a in arrays]
+    parent = merge_of(indexes)
+    assert parent.total == total      # forces the checkpoints to be built
+
+    severity = [np.asarray(ix.severity) for ix in indexes]
+    wanted = np.array([3], dtype=np.uint8)
+
+    def masks():
+        return [np.isin(sev, wanted) for sev in severity]
+
+    b.rowrate("filter_tier1_masks", masks, total,
+              note="FR-45's metadata predicate: one vectorised test per "
+                   "source, nothing read from disk. NFR-9's cheap half")
+
+    for frac in (0.1, 0.9):
+        keeps = [rng.random(a.size) < frac for a in arrays]
+        kept = sum(int(m.sum()) for m in keeps)
+        tag = f"keep{int(frac * 100)}"
+
+        b.rowrate(f"filter_derive_checkpoints_{tag}",
+                  lambda keeps=keeps: parent.filtered(
+                      [m.copy() for m in keeps]).total,
+                  total, reps=1,
+                  note=f"derived from the parent's checkpoints "
+                       f"({kept / total:.0%} kept). This is the row NFR-9 "
+                       f"rests on, and it does not move with selectivity")
+
+        def build(keeps=keeps):
+            reduced = [fake_index(np.ascontiguousarray(a[m]))
+                       for a, m in zip(arrays, keeps, strict=True)]
+            return merge_of(reduced).total
+
+        b.rowrate(f"filter_build_checkpoints_{tag}", build, total, reps=1,
+                  note=f"the same filtered view merged from nothing, which is "
+                       f"what SPEC 11.2 implied ({kept / total:.0%} kept)")
+
+
 def run_follow_benches(b: Bench, rows: int, sources: int) -> None:
     """
     What a follow tick costs -- SPEC 7, NFR-8, M6.
@@ -740,6 +880,10 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--update-baseline", action="store_true")
     ap.add_argument("--skip-follow", action="store_true",
                     help="skip the follow-tick benchmarks (SPEC 7, NFR-8)")
+    ap.add_argument("--skip-scan", action="store_true",
+                    help="skip the find/filter scan benchmarks (SPEC 11, "
+                         "FR-44, FR-45); the in-place row writes the subject "
+                         "to a temporary file")
     ap.add_argument("--gate", action="store_true", help="exit non-zero on regression")
     ap.add_argument("--tolerance", type=float, default=0.25)
     ap.add_argument("--cores", type=int, default=0,
@@ -767,6 +911,10 @@ def main(argv: list[str] | None = None) -> int:
         run_follow_benches(b, args.merge_rows, args.merge_sources)
     if not args.skip_follow:
         run_mark_benches(b, chunk)
+    if not args.skip_scan:
+        run_scan_benches(b, chunk)
+        if not args.skip_merge:
+            run_filter_benches(b, args.merge_rows, args.merge_sources)
 
     # A baseline is only comparable to a run of the same shape. Several
     # benchmarks (histogram, build_cumulative) scale with bucket count rather

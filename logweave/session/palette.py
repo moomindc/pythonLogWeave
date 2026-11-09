@@ -36,6 +36,30 @@ lightness as well as hue, so they remain distinct under the common red-green
 deficiencies and in a 2px minimap row where hue alone is unreliable.
 """
 
+COLOUR_FROM = Severity.WARNING
+"""
+The lowest class anything in the view colours by default.
+
+One constant, in the palette rather than in any of the three places that act on
+it, because it is one decision: the message text (`highlight.builtins`), the
+severity mark in the gutter and the minimap's bands all read it, and a floor
+that disagreed between them would be worse than no floor at all.
+
+Why there is a floor. A healthy service writes almost nothing but INFO, so
+colouring that class colours *every* row -- and a view in which everything is
+coloured is a view in which nothing stands out. The same argument had already
+been made twice here before it was named: `SEVERITY_BACKGROUNDS` stops at
+WARNING ("tinting INFO too would mean every row is tinted"), and the minimap
+dims `Severity.NONE` for exactly the reason that the widest band must not be
+the loudest (`overview.ORDINARY`).
+
+What it does *not* touch is classification. Every one of the eight classes is
+still computed for every row, so the severity filter, the "next error" jump and
+the band proportions on the strips are unchanged -- only the paint stops. A
+reader who wants INFO back in blue adds a rule for it (FR-31); this is a
+default, not a limit.
+"""
+
 SEVERITY_BACKGROUNDS: dict[int, str] = {
     Severity.WARNING: "#2e2410",
     Severity.ERROR: "#331a14",
@@ -78,3 +102,8 @@ def severity_colour(level: int) -> str:
 
 def severity_background(level: int) -> str | None:
     return SEVERITY_BACKGROUNDS.get(int(level))
+
+
+def is_loud(level: int) -> bool:
+    """Whether this class is coloured by default -- see `COLOUR_FROM`."""
+    return int(level) >= int(COLOUR_FROM)

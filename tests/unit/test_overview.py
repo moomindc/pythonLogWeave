@@ -32,7 +32,7 @@ from logweave.session.overview import (
     MARK_COLUMN_PX,
     MARK_GUTTER_MAX,
     MIN_MARK_PX,
-    UNCLASSIFIED,
+    ORDINARY,
     StripTheme,
     _rgb,
     band_widths,
@@ -413,17 +413,20 @@ def test_every_class_present_starts_at_the_left_edge_in_turn(needle):
     pixel row, the class at x=0 is the highest class in that row -- which is
     exactly what `Strip.top_severity` reports, so the picture and the tooltip
     cannot disagree.
+
+    Asserted forwards, colour-of-class rather than class-of-colour, because the
+    five quiet classes share one grey (`ORDINARY`) and so a reverse lookup is
+    no longer a function.
     """
     s = session_over(needle)
     strip = s.overview.minimap(HEIGHT)
     buf = render_rgba(strip, WIDTH, fill=True)
     th = StripTheme()
-    lut = {th.severity[i]: i for i in range(CLASSES)}
     top = strip.top_severity()
     for p in range(strip.height):
         if top[p] < 0:
             continue
-        assert lut[tuple(buf[p, 0, 0:3])] == int(top[p])
+        assert tuple(buf[p, 0, 0:3]) == th.severity[int(top[p])]
     s.close()
 
 
@@ -608,11 +611,48 @@ def test_unclassified_entries_recede_rather_than_flood_the_minimap():
     """
     th = StripTheme()
     none = th.severity[int(Severity.NONE)]
-    assert none == UNCLASSIFIED
+    assert none == ORDINARY
     assert sum(none) < sum(th.density), "unclassified must be dimmer than the bars"
     assert sum(none) > sum(th.background), "but still distinct from idle"
     assert none != _rgb(palette.SEVERITY_COLOURS[Severity.NONE]), \
-        "the strip overrides the palette here; the row mark still uses it"
+        "the strip overrides the palette here"
+
+
+def test_the_minimap_only_colours_warning_and_above():
+    """
+    The second half of the same argument, and the one that was missed first
+    time: of the rows that *are* classified, a healthy service writes almost
+    nothing but INFO, so a saturated blue band floods the strip exactly as the
+    palette's NONE grey did. Everything below `palette.COLOUR_FROM` is drawn as
+    ordinary traffic; the three classes worth finding keep the ramp.
+    """
+    th = StripTheme()
+    quiet = [Severity.NONE, Severity.TRACE, Severity.DEBUG,
+             Severity.INFO, Severity.NOTICE]
+    loud = [Severity.WARNING, Severity.ERROR, Severity.CRITICAL]
+
+    for sev in quiet:
+        assert th.severity[int(sev)] == ORDINARY, f"{sev.name} should recede"
+    for sev in loud:
+        want = _rgb(palette.SEVERITY_COLOURS[sev])
+        assert th.severity[int(sev)] == want, f"{sev.name} keeps the palette"
+
+    # One grey for all five, not five dim shades: four greys are not
+    # distinguishable at two pixels a row.
+    assert len({th.severity[int(s)] for s in quiet}) == 1
+
+
+def test_dimming_a_class_does_not_change_the_band_it_gets():
+    """
+    The floor is a colour decision and nothing else. Every class is still
+    counted separately, so an INFO-heavy minute still spends the same width on
+    INFO -- which is what keeps the severity filter and the strip agreeing.
+    """
+    totals = np.zeros((2, CLASSES), dtype=np.int64)
+    totals[0, int(Severity.INFO)] = 90
+    totals[0, int(Severity.ERROR)] = 10
+    widths = widths_for(totals, 100, fill=True)
+    assert widths[0, int(Severity.INFO)] > widths[0, int(Severity.ERROR)]
 
 
 def test_an_unclassified_pixel_is_still_not_an_idle_one(tmp_path):

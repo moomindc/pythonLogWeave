@@ -152,12 +152,16 @@ class Overview:
         A source with no recognisable timestamp format indexes fine and has no
         histogram (FR-19), and one that is switched off (FR-9) must not appear
         in an overview of what is being shown. Both simply do not contribute.
+
+        `SessionSource.hist` and not `index.hist`, so that a filter in force
+        (FR-45) is reflected here: under one, the strips have to describe the
+        rows the view actually contains.
         """
         out = []
         for s in self.session.sources:
             if not s.meta.enabled:
                 continue
-            hist = s.index.hist
+            hist = s.hist
             if hist is not None and hist.nbuckets:
                 out.append((hist, int(s.meta.skew_us)))
         return out
@@ -178,7 +182,7 @@ class Overview:
         """
         return (
             self.session.total_rows,
-            tuple((id(s.index.hist), int(s.meta.skew_us), bool(s.meta.enabled))
+            tuple((id(s.hist), int(s.meta.skew_us), bool(s.meta.enabled))
                   for s in self.session.sources),
         )
 
@@ -347,28 +351,42 @@ class StripTheme:
     """
 
 
-UNCLASSIFIED = (0x39, 0x3f, 0x4a)
+ORDINARY = (0x39, 0x3f, 0x4a)
 """
-What `Severity.NONE` is drawn as **on a strip**, overriding the palette.
+What every class below `palette.COLOUR_FROM` is drawn as **on a strip**.
 
-The palette's NONE is a mid grey, which is right where it means "no severity
-mark on this row". On a 64-pixel strip it is wrong twice over. Most entries in
-most logs carry no level word at all -- an access log has none by construction
--- so NONE is usually the widest band, and at mid grey it floods the minimap
-and leaves the colours that matter as a fringe. It also lands close enough to
-the timeline's density grey that the two strips start resembling each other
-again, which is the thing the split was for.
+That is `NONE`, `TRACE`, `DEBUG`, `INFO` and `NOTICE` -- between them nearly
+every row of nearly every log -- against the palette's own colours for them.
 
-Dimmed to just above the background, it recedes into "ordinary traffic" and the
-saturated classes read as marks on it. Nothing is hidden: an unclassified
-stretch is still visibly distinct from an idle one, which is blank.
+The argument is the same one twice over. Most entries in most logs carry no
+level word at all (an access log has none by construction), so `NONE` is
+usually the widest band; and of the rows that *are* classified, a healthy
+service writes almost nothing but INFO. Drawn in the palette's mid grey and
+saturated blue, those two between them flood the minimap and leave the colours
+that matter -- the whole point of the strip -- as a fringe. The greys also land
+close enough to the timeline's density grey that the two strips start
+resembling each other again, which is the thing the split was for.
+
+Dimmed to just above the background they recede into "ordinary traffic", and
+WARNING, ERROR and CRITICAL read as marks on it. Nothing is hidden: an ordinary
+stretch is still visibly distinct from an idle one, which is blank, and the
+*proportions* are untouched -- every class is still counted separately, so the
+bands are the same widths they always were and the severity filter still sees
+all eight.
+
+One colour for all five, not five dim shades: at two pixels a row a reader
+cannot tell four greys apart, and the question a strip answers is "where is the
+trouble", not "how much of this was DEBUG". The row-level answer to that is the
+severity filter, which is exact.
 """
 
 
 def _strip_severity() -> tuple[tuple[int, int, int], ...]:
-    colours = [_rgb(palette.SEVERITY_COLOURS[Severity(i)]) for i in range(CLASSES)]
-    colours[int(Severity.NONE)] = UNCLASSIFIED
-    return tuple(colours)
+    return tuple(
+        _rgb(palette.SEVERITY_COLOURS[Severity(i)]) if palette.is_loud(i)
+        else ORDINARY
+        for i in range(CLASSES)
+    )
 
 
 def _rgb(hex_str: str) -> tuple[int, int, int]:
@@ -556,7 +574,7 @@ The severity classes **highest first**, then the background, as palette rows.
 Descending, and that is the whole of the fix for a strip that read as
 right-justified. The bands were emitted in class order, 0 to 7, which puts
 `NONE` -- usually most of a log, and deliberately dimmed to near the background
-(see `UNCLASSIFIED`) -- along the left edge and pushes WARNING, ERROR and
+(see `ORDINARY`) -- along the left edge and pushes WARNING, ERROR and
 CRITICAL out to the right. The strip was then a wide dark band with the only
 colours that matter as a fringe against the far edge, varying in position from
 pixel row to pixel row as the unclassified share moved.
@@ -569,8 +587,8 @@ is the actual reason:
 * **It agrees with everything beside it.** `overlay_marks` draws at the left
   edge, and the timeline's bars are left-justified; a severity map justified the
   other way was the only thing in the overview growing rightwards.
-* **The widest band is the one that can afford to be clipped.** `NONE` now runs
-  to the right edge, where the viewport box and the strip's separator rule sit.
+* **The widest band is the one that can afford to be clipped.** The quiet
+  classes now run to the right edge, where the viewport box and the strip's separator rule sit.
 
 Nothing about the proportions changes -- `widths_for` still divides by
 composition and still applies `MIN_MARK_PX`. Only the order they are laid down

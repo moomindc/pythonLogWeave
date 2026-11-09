@@ -413,6 +413,10 @@ class FollowEngine:
             return
         state.stale = True
         state.stale_reason = reason
+        # Copy attribution has to know (PRD risk R10): the rows are still
+        # readable, but their `path:line` citations now point at whatever took
+        # the path over.
+        self.session.sources[pos].citation_note = reason
         self._unwatch(state)
         tick.went_stale.append(pos)
 

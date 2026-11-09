@@ -30,6 +30,7 @@ from logweave.highlight import (
     default_group,
     default_ruleset,
 )
+from logweave.highlight.builtins import _syslog_rules
 from logweave.highlight.rules import SCAN_LIMIT
 from logweave.index.severity import Severity
 
@@ -411,12 +412,11 @@ def test_an_empty_style_is_recognised_as_empty():
 @pytest.mark.parametrize(("text", "expected"), [
     ("2026-01-01 00:00:00 ERROR connection reset", Severity.ERROR),
     ("2026-01-01 00:00:00 WARN pool at 85 percent", Severity.WARNING),
-    ("2026-01-01 00:00:00 INFO started", Severity.INFO),
-    ("2026-01-01 00:00:00 DEBUG cache probe", Severity.DEBUG),
     ("2026-01-01 00:00:00 FATAL out of memory", Severity.CRITICAL),
-    ("2026-01-01 00:00:00 TRACE entering", Severity.TRACE),
+    ("2026-01-01 00:00:00 CRITICAL disk gone", Severity.CRITICAL),
+    ("2026-01-01 00:00:00 WARNING pool at 85 percent", Severity.WARNING),
 ])
-def test_the_shipped_rules_colour_each_severity_from_the_shared_palette(text, expected):
+def test_the_loud_rules_colour_from_the_shared_palette(text, expected):
     """
     The colours come from `session.palette`, so the message text, the severity
     mark and later the minimap agree. A rule with its own red would make the
@@ -426,6 +426,48 @@ def test_the_shipped_rules_colour_each_severity_from_the_shared_palette(text, ex
 
     st = default_ruleset().style_of(text)
     assert st.line.fg == pal.severity_colour(expected)
+
+
+@pytest.mark.parametrize(("text", "expected"), [
+    ("2026-01-01 00:00:00 NOTICE config reloaded", Severity.NOTICE),
+    ("2026-01-01 00:00:00 INFO started", Severity.INFO),
+    ("2026-01-01 00:00:00 DEBUG cache probe", Severity.DEBUG),
+    ("2026-01-01 00:00:00 TRACE entering", Severity.TRACE),
+])
+def test_below_warning_a_shipped_rule_classifies_without_colouring(text, expected):
+    """
+    The floor, and what it does *not* cost. A healthy service writes almost
+    nothing but INFO, so colouring that class colours every row -- which is the
+    same as colouring none (`builtins.COLOUR_FROM`).
+
+    The rule is still there and still carries its severity, because that is
+    what the index-time classifier, the gutter mark, the minimap bands and the
+    severity filter are built on. Only the paint went.
+    """
+    word = text.split()[2]
+
+    st = default_ruleset().style_of(text)
+    assert st.rule == f"severity:{word.lower()}", "the word still matches"
+    assert st.is_plain, "and that rule leaves the text alone"
+
+    words = default_ruleset().severity_words()
+    assert word in words[int(expected)], "and still classifies the row"
+
+
+def test_the_floor_is_one_constant_and_it_is_warning():
+    """
+    One decision, in one place -- the palette, because the message text, the
+    gutter mark and the minimap all read it and a floor that disagreed between
+    them would be worse than no floor. This test fails loudly if someone moves
+    it rather than silently disagreeing with the SPEC.
+    """
+    from logweave.session import palette as pal
+
+    assert pal.COLOUR_FROM is Severity.WARNING
+    assert pal.is_loud(Severity.WARNING) and not pal.is_loud(Severity.INFO)
+    coloured = {r.severity for r in default_ruleset().rules
+                if r.severity is not None and not Style(fg=r.fg, bg=r.bg).is_empty}
+    assert coloured == {Severity.WARNING, Severity.ERROR, Severity.CRITICAL}
 
 
 @pytest.mark.parametrize("text", [
@@ -495,6 +537,44 @@ def test_syslog_priorities_are_available_but_off_by_default():
     assert group.flatten().style_of("<3>kernel: oops").is_plain
     group.active.add(SYSLOG_SET)
     assert group.flatten().style_of("<3>kernel: oops").rule == "syslog:<3>"
+
+
+@pytest.mark.parametrize(("line", "expected"), [
+    ("<0>kernel: machine check", Severity.CRITICAL),
+    ("<1>kernel: act now", Severity.CRITICAL),
+    ("<2>kernel: disk failing", Severity.CRITICAL),
+    ("<3>kernel: oops", Severity.ERROR),
+    ("<4>kernel: temperature high", Severity.WARNING),
+])
+def test_the_syslog_set_colours_emergency_through_warning(line, expected):
+    """
+    RFC 5424 counts down, so the loud priorities are the low numbers: 0
+    emergency, 1 alert, 2 critical, 3 error, 4 warning. All five are coloured,
+    from the same palette as everything else.
+    """
+    from logweave.session import palette as pal
+
+    rs = Ruleset(_syslog_rules())
+    st = rs.style_of(line)
+    assert st.line.fg == pal.severity_colour(expected)
+
+
+@pytest.mark.parametrize("line", [
+    "<5>kernel: config reloaded",
+    "<6>kernel: started",
+    "<7>kernel: probing",
+])
+def test_the_syslog_set_leaves_notice_and_below_out_altogether(line):
+    """
+    Not shipped uncoloured but *absent*, which is the difference between these
+    and the quiet severity words. A syslog rule is a regex and so cannot carry
+    a `severity` (SPEC 10.3), so an uncoloured one would do nothing at all
+    while still costing a branch in the one regex every row is scanned with.
+    """
+    rs = Ruleset(_syslog_rules())
+    assert rs.style_of(line).is_plain
+    assert rs.style_of(line).rule == "", "no rule matched at all"
+    assert {r.name for r in rs.rules} == {f"syslog:<{p}>" for p in range(5)}
 
 
 def test_turning_a_set_off_removes_exactly_its_rules():

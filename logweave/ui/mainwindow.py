@@ -14,6 +14,7 @@ from pathlib import Path
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QAction, QActionGroup, QColor, QKeySequence, QPixmap
 from PySide6.QtWidgets import (
+    QDialog,
     QDockWidget,
     QFileDialog,
     QHBoxLayout,
@@ -26,6 +27,7 @@ from PySide6.QtWidgets import (
     QPushButton,
     QStatusBar,
     QStyledItemDelegate,
+    QVBoxLayout,
     QWidget,
 )
 
@@ -35,10 +37,19 @@ from ..highlight.builtins import USER_SET
 from ..highlight.rules import Ruleset
 from ..index import sidecar
 from ..index.civil import format_wall_us
-from ..session import Session
+from ..index.severity import Severity
+from ..session import Session, nav
+from ..session import filters as filtering
 from ..session.follow import FollowEngine
+from ..session.nav import AT_LEAST
+from ..session.rowformat import PRESET_LABELS, Preset
 from . import settings, theme
+from .exportdialog import ExportDialog, ExportRun
+from .filterbar import FilterBar
+from .findbar import FindBar
+from .findscan import FilterScanner, FindScanner
 from .followui import FollowNotifier, NewLinesButton
+from .gotodialog import GoToTimeDialog
 from .indexing import IndexWorker, start
 from .markscan import MarkScanner
 from .mergedview import MergedLogView
@@ -148,6 +159,27 @@ class MainWindow(QMainWindow):
         self.view = MergedLogView(self.session)
         self.minimap = MinimapStrip(self.session)
         self.timeline = TimelineStrip(self.session)
+        self.finder = FindScanner(self.session, self)
+        self.filterer = FilterScanner(self.session, self)
+        """
+        The two background scans M7 adds (FR-44, FR-45).
+
+        Separate runners rather than one queue, because a find and a filter are
+        not alternatives: a reader filters to the subsystem they care about and
+        *then* searches inside it, and a shared runner would make the second
+        request cancel the first.
+        """
+        self.finder.updated.connect(self._hits_ready)
+        self.finder.partial.connect(self._hits_partial)
+        self.finder.progress.connect(self._find_progress)
+        self.filterer.updated.connect(self._filter_ready)
+        self.filterer.partial.connect(self._filter_partial)
+        self.filterer.progress.connect(self._filter_progress)
+        self._export: ExportRun | None = None
+        self._current_hit = -1
+        """Row of the hit the reader is standing on, or -1. See `_step_hit`."""
+        self._query = None
+        """The last query handed to the finder, for spotting a new question."""
         self.setCentralWidget(self._build_centre())
         self.view.currentRowChanged.connect(self._update_position)
         self.view.copied.connect(self._report_copied)
@@ -165,6 +197,7 @@ class MainWindow(QMainWindow):
         self.marks.updated.connect(self._marks_ready)
         self.marks.progress.connect(self._marks_progress)
         self.marks.started.connect(self._marks_started)
+
         self._restore_preferences()
 
         self._worker: IndexWorker | None = None
@@ -218,16 +251,42 @@ class MainWindow(QMainWindow):
         handle for a width that is not meant to vary and would need its state
         remembered alongside the two booleans that actually matter (FR-34).
         """
-        centre = QWidget(self)
-        layout = QHBoxLayout(centre)
+        rows = QWidget(self)
+        layout = QHBoxLayout(rows)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
         layout.addWidget(self.view, 1)
         layout.addWidget(self.minimap)
         layout.addWidget(self.timeline)
 
+        # The two bars go *under* the strips and across the full width, not
+        # beside the view: both of them talk about the whole merged stream,
+        # and a filter count tucked into the view's width would sit above the
+        # strips that the same filter has just redrawn.
+        self.findbar = FindBar(self)
+        self.findbar.hide()
+        self.findbar.queryChanged.connect(self._find_query)
+        self.findbar.stepped.connect(self._step_hit)
+        self.findbar.closed.connect(self.close_find)
+        self.findbar.cancelRequested.connect(self.finder.cancel)
+
+        self.filterbar = FilterBar(self)
+        self.filterbar.hide()
+        self.filterbar.filterChanged.connect(self._filter_changed)
+        self.filterbar.closed.connect(self.close_filter)
+        self.filterbar.cancelRequested.connect(self.filterer.cancel)
+
+        centre = QWidget(self)
+        stack = QVBoxLayout(centre)
+        stack.setContentsMargins(0, 0, 0, 0)
+        stack.setSpacing(0)
+        stack.addWidget(rows, 1)
+        stack.addWidget(self.filterbar)
+        stack.addWidget(self.findbar)
+
         self.minimap.rowSought.connect(self._seek_row)
         self.timeline.timeSought.connect(self._seek_time)
+        self.timeline.rangeSelected.connect(self._time_range_selected)
         # The strips need the viewport box kept in step with the view, and the
         # view does not know they exist. Both signals matter: `rowsChanged`
         # covers a resize or a file opening, `currentRowChanged` a keyboard
@@ -588,6 +647,381 @@ class MainWindow(QMainWindow):
             f"{name} highlighting {'on' if on else 'off'}, {rules} rules active")
 
     # ------------------------------------------------------------------
+    # find (FR-44)
+    # ------------------------------------------------------------------
+
+    def open_find(self) -> None:
+        """
+        Show the find bar and put the cursor in it (Ctrl+F).
+
+        Ctrl+F is the find key everywhere else, which is why following gave it
+        up for Ctrl+Shift+F in M7: a reader who hits Ctrl+F expecting a search
+        box and gets the view scrolled to the tail has lost their place in
+        exchange for something they did not ask for.
+        """
+        self.findbar.show()
+        self.findbar.focus()
+
+    def close_find(self) -> None:
+        """
+        Esc or the bar's ✕: stop searching and take the marks away.
+
+        The result is *kept* -- `FindScanner` caches it against the shape of
+        the session, so re-opening the bar on the same term costs nothing and
+        reads no bytes.
+        """
+        self.finder.cancel()
+        self.findbar.hide()
+        self.findbar.set_scanning(False)
+        self._current_hit = -1
+        self.view.set_find(None)
+        for strip in (self.minimap, self.timeline):
+            strip.set_find_marks(None)
+            strip.set_find_current(None)
+        self.view.setFocus(Qt.FocusReason.OtherFocusReason)
+
+    def _find_query(self, query) -> None:
+        """A new (debounced) query from the bar."""
+        if query != self._query:
+            # A different question: the hit the reader was standing on is not a
+            # hit any more, so stepping must start from the cursor again.
+            self._query = query
+            self._current_hit = -1
+        self.view.set_find(query, self._current_hit)
+        started = self.finder.request(query)
+        self.findbar.set_scanning(started)
+        if started:
+            self._status_msg.setText(f"Searching for {query.describe()}...")
+
+    def _find_progress(self, done: int, total: int) -> None:
+        self.findbar.set_progress(done, total)
+
+    def _hits_partial(self, hits) -> None:
+        """A snapshot from a scan still running -- NFR-10's "incremental"."""
+        self._hits_ready(hits, final=False)
+
+    def _hits_ready(self, hits, *, final: bool = True) -> None:
+        self.findbar.set_scanning(not final or self.finder.running)
+        self.findbar.set_hits(hits, self._current_hit)
+        layer = hits.layer(theme.FIND_MARK) if hits.count else None
+        for strip in (self.minimap, self.timeline):
+            strip.set_find_marks(layer)
+        self.view.set_find(hits.query, self._current_hit)
+        if hits.count and self._current_hit < 0:
+            # The first result moves the cursor to the first match at or after
+            # where the reader already is -- that is what makes an incremental
+            # find incremental. Later snapshots do not, because `_current_hit`
+            # is then set and a view that re-jumped every 120 ms would be
+            # unusable while a 10 GB scan finished.
+            self._step_hit(1)
+        if final:
+            self._report_hits(hits)
+
+    def _report_hits(self, hits) -> None:
+        if hits.query.empty:
+            return
+        if why := hits.query.validate():
+            self._status_msg.setText(why)
+            return
+        bits = [f"{hits.count:,} match{'' if hits.count == 1 else 'es'} "
+                f"for {hits.query.describe()}"]
+        if hits.hidden:
+            bits.append(f"{hits.hidden:,} in rows the view is not showing")
+        if hits.truncated:
+            bits.append("stopped at the hit limit")
+        if hits.bytes_scanned:
+            bits.append(f"{hits.bytes_scanned / 1e6:,.0f} MB in "
+                        f"{hits.elapsed_ms / 1000:.1f}s")
+        bits.extend(hits.notes)
+        self._status_msg.setText("   ".join(bits))
+
+    def _step_hit(self, delta: int) -> None:
+        """
+        Next or previous match (F3 / Shift+F3, and the bar's arrows).
+
+        Stepping is relative to the hit the reader is standing on when there is
+        one, and to the cursor when there is not -- so F3 after scrolling
+        somewhere else carries on from where they are looking rather than from
+        where they last pressed it.
+        """
+        hits = self.finder.result
+        if not hits.count:
+            if not hits.query.empty and hits.complete:
+                self._status_msg.setText(
+                    f"No matches for {hits.query.describe()}")
+            return
+        if self._current_hit >= 0:
+            row = (hits.next_after(self._current_hit) if delta >= 0
+                   else hits.prev_before(self._current_hit))
+        else:
+            # Inclusive of the cursor's own row, which `next_after` and
+            # `prev_before` are not: a match on the row being looked at is the
+            # first thing F3 should land on, not the thing it skips.
+            at = self.view.current_row()
+            row = (hits.next_after(at - 1) if delta >= 0
+                   else hits.prev_before(at + 1))
+        if row is None:
+            return
+        self._goto_hit(int(row))
+
+    def _goto_hit(self, row: int) -> None:
+        self._current_hit = int(row)
+        self.view.set_current_row(row)
+        self.view.set_current_hit(row)
+        self.findbar.set_hits(self.finder.result, row)
+        when = self.session.row_to_time(row) if self.session.total_rows else None
+        for strip in (self.minimap, self.timeline):
+            strip.set_find_current(when)
+
+    # ------------------------------------------------------------------
+    # filtering (FR-45, FR-48)
+    # ------------------------------------------------------------------
+
+    def open_filter(self) -> None:
+        self.filterbar.set_sources([s.alias for s in self.session.sources])
+        self.filterbar.show()
+        self.filterbar.focus()
+
+    def close_filter(self) -> None:
+        """
+        Esc or the bar's ✕: drop the filter as well as hiding the bar.
+
+        Hiding a filter that is still in force would leave the view showing
+        some of the log with nothing on screen saying so -- the one state
+        `filterbar`'s docstring calls the way this application could mislead
+        someone badly. So closing the bar is `clear()`, which re-emits an empty
+        filter and takes this back through `_filter_changed`.
+        """
+        self.filterer.cancel()
+        self.filterbar.clear()
+        self.filterbar.hide()
+        self.filterbar.set_scanning(False)
+        self.view.setFocus(Qt.FocusReason.OtherFocusReason)
+
+    def clear_filter(self) -> None:
+        """Menu and Ctrl+Shift+Backspace: show everything again (FR-45)."""
+        if self.filterbar.isVisibleTo(self) or self.session.is_filtered:
+            self.close_filter()
+
+    def _filter_changed(self, filt) -> None:
+        """
+        A filter to evaluate. Tier 1 here, tier 2 on the scanner's thread.
+
+        The split is NFR-9's 500 ms. A severity, source or time-window filter
+        is a few vectorised comparisons per source plus a *derived* set of
+        checkpoints (`MergeIndex.derive_checkpoints`), so it is applied in the
+        same turn as the click that asked for it -- going through a thread
+        would add a round trip to something already finished. A text filter has
+        to read every byte, so it does not come near this thread.
+        """
+        if why := filt.validate():
+            self.filterbar.set_result(None)
+            self._status_msg.setText(why)
+            return
+        if filt.tier <= 1:
+            self.filterer.cancel()
+            self.filterbar.set_scanning(False)
+            self._filter_ready(filtering.apply(self.session, filt))
+            return
+        self.filterbar.set_scanning(True)
+        self._status_msg.setText(f"Filtering: {filt.describe()}...")
+        self.filterer.request(filt)
+
+    def _filter_progress(self, done: int, total: int) -> None:
+        self.filterbar.set_progress(done, total)
+
+    def _filter_partial(self, result) -> None:
+        self._filter_ready(result, final=False)
+
+    def _filter_ready(self, result, *, final: bool = True) -> None:
+        """
+        Apply an evaluated filter to the session and put the view back.
+
+        **Row numbers move when a filter changes and times do not**, so the
+        reader's place is kept in time: where they were is read before the
+        filter is applied and sought again afterwards. Without this, filtering
+        a 10M-row log while reading row 4,000,000 leaves the view at whatever
+        is now four million rows in, which is somewhere else entirely.
+
+        Only on a completed pass. A partial result lands here every 120 ms
+        while a text filter scans (NFR-10), and a view that re-sought on each
+        one would pull the rows out from under anyone reading them.
+        """
+        active = result.filt.active
+        was = (self.session.row_to_time(self.view.current_row())
+               if final and self.session.total_rows else None)
+        self.session.set_filter(result if active else None)
+        self.filterbar.set_result(result if active else None)
+        self.filterbar.set_scanning(not final)
+        self.timeline.set_window(
+            (result.filt.since, result.filt.until)
+            if active and (result.filt.since is not None
+                           or result.filt.until is not None) else None)
+        self.refresh()
+        if was is not None and self.session.total_rows:
+            self.view.scroll_to_time(was)
+            self.view.set_current_row(self.session.time_to_row(was))
+        # The hits survive a filter -- they are `(source, entry)` pairs -- but
+        # their row numbers do not, so they are re-derived rather than rescanned
+        # (`Hits.locate`). Same for the rule marks, which are already in time.
+        self.finder.relocate()
+        self._update_filter_status(result if active else None)
+
+    def _update_filter_status(self, result) -> None:
+        """
+        Repeat the filter in the status bar, in `theme.FILTER_ACTIVE`.
+
+        Twice on screen on purpose: the bar can be scrolled past, closed or
+        simply not looked at, and "some rows are missing" is the one fact about
+        this view that a reader must not be able to miss.
+        """
+        if result is None:
+            self._status_filter.setText("")
+            self._status_msg.setText("Filter cleared")
+            return
+        text = result.describe()
+        self._status_filter.setText(f"   {text}   ")
+        self._status_msg.setText(
+            f"Filter: {result.filt.describe()} -- {text}"
+            + ("   " + "   ".join(result.notes) if result.notes else ""))
+
+    def _time_range_selected(self, since: int, until: int) -> None:
+        """
+        A range dragged down the timeline strip (FR-48).
+
+        Opens the filter bar if it was closed, because the drag has just set a
+        filter and the bar is where that is visible and reversible.
+        """
+        if not self.filterbar.isVisibleTo(self):
+            self.filterbar.set_sources([s.alias for s in self.session.sources])
+            self.filterbar.show()
+        self.filterbar.set_window(int(since), int(until))
+
+    # ------------------------------------------------------------------
+    # navigating (FR-41, FR-42, FR-43)
+    # ------------------------------------------------------------------
+
+    def go_to_time(self) -> None:
+        """FR-41 and FR-43: ask for a time and seek to it."""
+        if self.session.is_empty:
+            self._status_msg.setText("No logs open")
+            return
+        anchor = self.session.row_to_time(self.view.current_row())
+        dialog = GoToTimeDialog(self, anchor_wall_us=anchor,
+                                span=self.session.time_span())
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            when = dialog.wall_us()
+            if when is not None:
+                self._seek_time(int(when))
+                self._status_msg.setText(
+                    f"Moved to {format_wall_us(when, micros=False)}")
+
+    def _jump(self, *, severities=None, source: int | None = None,
+              back: bool = False, what: str = "") -> None:
+        """
+        FR-42's next/previous, by severity or by file.
+
+        One pass over the entries actually skipped, in each source's own
+        arrays, and nothing decoded -- see `session.nav`. Not wrapped: silently
+        going back to the top when you ask for the next error is how you read
+        the same error twice and think there are two, so the end of the log is
+        reported instead.
+        """
+        if self.session.is_empty:
+            return
+        row = nav.next_row(self.session, self.view.current_row(),
+                           severities=severities, source=source, back=back)
+        if row is None:
+            self._status_msg.setText(
+                f"No {what} {'before' if back else 'after'} this row")
+            return
+        self.view.set_current_row(row)
+        self._status_msg.setText(f"Moved to the {'previous' if back else 'next'} "
+                                 f"{what}")
+
+    def _jump_severity(self, level: int, *, back: bool = False) -> None:
+        self._jump(severities=AT_LEAST[int(level)], back=back,
+                   what=f"{Severity(level).name} or worse")
+
+    def _jump_source(self, *, back: bool = False) -> None:
+        """
+        Next or previous row from the file the cursor is on (FR-42).
+
+        The current row's source rather than a chosen one: "show me this file's
+        next line" is the question someone has while reading a row, and
+        answering it needs no dialog.
+        """
+        rows = self.session.rows(self.view.current_row(), 1)
+        if not rows:
+            return
+        pos = int(rows[0].source)
+        self._jump(source=pos, back=back,
+                   what=f"row from {self.session.sources[pos].alias}")
+
+    # ------------------------------------------------------------------
+    # exporting (FR-47)
+    # ------------------------------------------------------------------
+
+    def export_view(self) -> None:
+        """
+        Write the view -- or the selection -- to a file.
+
+        The run is driven by `ExportRun` off a zero-delay timer rather than a
+        thread, for the reason `session.export` gives: `session.rows()` mutates
+        the decoded-text LRU and the merge's block cache, so reading rows off
+        the UI thread while the view paints is a data race on every row.
+        """
+        if self.session.is_empty:
+            self._status_msg.setText("No logs open to export")
+            return
+        if self._export is not None:
+            self._status_msg.setText("An export is already running")
+            return
+        lo, hi = self.view.selection()
+        dialog = ExportDialog(
+            self, rows=self.session.total_rows,
+            selection=(lo, hi), filtered=self.session.is_filtered,
+            columns=self.view.displayed_columns())
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        spec = dialog.spec()
+        self._export = ExportRun(self.session, dialog.formatter(self.session),
+                                 spec, self)
+        self._export.progress.connect(self._export_progress)
+        self._export.finished.connect(self._export_finished)
+        self._export_bar.setRange(0, 1000)
+        self._export_bar.setValue(0)
+        self._export_bar.show()
+        self._export_cancel.show()
+        self._status_msg.setText(f"Exporting to {spec.path.name}...")
+        self._export.start()
+
+    def cancel_export(self) -> None:
+        if self._export is not None:
+            self._export.cancel()
+
+    def _export_progress(self, step) -> None:
+        self._export_bar.setValue(int(1000 * step.fraction))
+
+    def _export_finished(self, step) -> None:
+        self._export = None
+        self._export_bar.hide()
+        self._export_cancel.hide()
+        if step.error:
+            self._status_msg.setText(f"Export failed: {step.error}")
+            return
+        if step.cancelled:
+            self._status_msg.setText(
+                f"Export cancelled after {step.written:,} rows -- the part "
+                f"written is still on disk")
+            return
+        size = f"{step.bytes_written / 1e6:,.1f} MB" if step.bytes_written > 1e6 \
+            else f"{step.bytes_written:,} bytes"
+        notes = ("   " + "   ".join(step.notes)) if step.notes else ""
+        self._status_msg.setText(
+            f"Exported {step.written:,} rows ({size}){notes}")
+
+    # ------------------------------------------------------------------
     # chrome
     # ------------------------------------------------------------------
 
@@ -602,6 +1036,15 @@ class MainWindow(QMainWindow):
         close_act = QAction("Close &All", self)
         close_act.triggered.connect(self.close_all)
         file_menu.addAction(close_act)
+
+        file_menu.addSeparator()
+        self.export_act = QAction("&Export View...", self)
+        self.export_act.setShortcut("Ctrl+E")
+        self.export_act.setStatusTip(
+            "Write the view -- or just the selection -- to a text, CSV or "
+            "Markdown file. Filters apply; the whole view streams (FR-47)")
+        self.export_act.triggered.connect(self.export_view)
+        file_menu.addAction(self.export_act)
 
         file_menu.addSeparator()
         self.cache_act = QAction("Clear &Index Cache", self)
@@ -634,6 +1077,31 @@ class MainWindow(QMainWindow):
             "with no timestamp column and no attribution")
         copy_plain_act.triggered.connect(self.view.copy_selection_plain)
         edit_menu.addAction(copy_plain_act)
+
+        # FR-46b: the same rows in whatever shape the destination wants. A
+        # submenu rather than a dialog, because the choice is remembered by the
+        # reader and not by the application -- someone pasting into a
+        # spreadsheet wants CSV every time, and a dialog in the way of Ctrl+C
+        # would be the thing they complain about.
+        copy_as = edit_menu.addMenu("Copy &As")
+        self.copy_as_acts = {}
+        for preset in Preset:
+            if preset is Preset.TEMPLATE:
+                # A template needs somewhere to type it, which is the export
+                # dialog's job. Offering it here would be a menu item that
+                # silently used whatever the default template happens to be.
+                continue
+            act = QAction(PRESET_LABELS[preset], self)
+            act.triggered.connect(
+                lambda _c=False, preset=preset: self.view.copy_as(preset))
+            copy_as.addAction(act)
+            self.copy_as_acts[preset] = act
+
+        select_all_act = QAction("Select &All", self)
+        select_all_act.setShortcut(QKeySequence.StandardKey.SelectAll)
+        select_all_act.triggered.connect(self.view.select_all)
+        edit_menu.addAction(select_all_act)
+        self.select_all_act = select_all_act
         edit_menu.addSeparator()
 
         settings_act = QAction("&Settings…", self)
@@ -647,6 +1115,8 @@ class MainWindow(QMainWindow):
         self.settings_act = settings_act
         edit_menu.addAction(settings_act)
         self.copy_act, self.copy_plain_act = copy_act, copy_plain_act
+
+        self._build_search_menu()
 
         view_menu = self.menuBar().addMenu("&View")
         view_menu.addAction(self.sources_dock.toggleViewAction())
@@ -713,7 +1183,12 @@ class MainWindow(QMainWindow):
         view_menu.addSeparator()
         self.follow_act = QAction("&Follow New Lines", self)
         self.follow_act.setCheckable(True)
-        self.follow_act.setShortcut("Ctrl+F")
+        # Ctrl+Shift+F, not Ctrl+F. M7 gave Ctrl+F to the find bar, which is
+        # what that key does in every other application a log reader has open:
+        # someone pressing it for a search box and getting the view dragged to
+        # the tail has lost their place in exchange for something they did not
+        # ask for.
+        self.follow_act.setShortcut("Ctrl+Shift+F")
         self.follow_act.setStatusTip(
             "Watch every open file for new lines and keep the view at the end; "
             "scroll up to pause, End to resume (FR-21, FR-22)")
@@ -725,6 +1200,99 @@ class MainWindow(QMainWindow):
         view_menu.addSeparator()
         self._build_lane_menu(view_menu)
         self._build_highlight_menu(view_menu)
+
+    def _build_search_menu(self) -> None:
+        """
+        Find, filter and go-to, on one menu -- FR-41 to FR-45.
+
+        Its own menu rather than more of Edit: these are the five things a
+        reader does *to find out where to look*, and they are the only commands
+        in the window with a mode attached (a bar open, a filter in force). A
+        menu that says so is also where the shortcuts are discoverable, which
+        for F3 and Ctrl+G is the only place they can be.
+        """
+        menu = self.menuBar().addMenu("&Search")
+
+        self.find_act = QAction("&Find...", self)
+        self.find_act.setShortcut(QKeySequence.StandardKey.Find)
+        self.find_act.setStatusTip(
+            "Search every open file as you type; hits are marked in the view "
+            "and on both strips (FR-44)")
+        self.find_act.triggered.connect(self.open_find)
+        menu.addAction(self.find_act)
+
+        # F3 and Shift+F3 spelled out, **not** `StandardKey.FindNext`. That
+        # standard key expands to two sequences on Windows -- F3 *and* Ctrl+G
+        # -- which broke stepping twice over: listing it beside an explicit F3
+        # registered F3 on this action twice, and Qt answers a shortcut it
+        # holds two bindings for with `QAction::event: Ambiguous shortcut
+        # overload: F3` and then does nothing; and its Ctrl+G is the key this
+        # window gives to Go to Timestamp (FR-41), so that was ambiguous
+        # between two different actions as well. An explicit sequence has
+        # exactly the binding it says.
+        self.find_next_act = QAction("Find &Next", self)
+        self.find_next_act.setShortcut(QKeySequence("F3"))
+        self.find_next_act.triggered.connect(lambda: self._step_hit(1))
+        menu.addAction(self.find_next_act)
+
+        self.find_prev_act = QAction("Find &Previous", self)
+        self.find_prev_act.setShortcut(QKeySequence("Shift+F3"))
+        self.find_prev_act.triggered.connect(lambda: self._step_hit(-1))
+        menu.addAction(self.find_prev_act)
+
+        menu.addSeparator()
+        self.filter_act = QAction("Fi&lter...", self)
+        self.filter_act.setShortcut("Ctrl+Shift+L")
+        self.filter_act.setStatusTip(
+            "Show only the rows matching a severity, source, time window or "
+            "text; reversible without re-indexing (FR-45)")
+        self.filter_act.triggered.connect(self.open_filter)
+        menu.addAction(self.filter_act)
+
+        self.clear_filter_act = QAction("&Clear Filter", self)
+        self.clear_filter_act.setShortcut("Ctrl+Shift+K")
+        self.clear_filter_act.triggered.connect(self.clear_filter)
+        menu.addAction(self.clear_filter_act)
+
+        menu.addSeparator()
+        self.goto_act = QAction("&Go to Timestamp...", self)
+        self.goto_act.setShortcut("Ctrl+G")
+        self.goto_act.setStatusTip(
+            "Jump to a time: a whole timestamp, a time of day, or a step "
+            "like +5m from where you are (FR-41, FR-43)")
+        self.goto_act.triggered.connect(self.go_to_time)
+        menu.addAction(self.goto_act)
+
+        menu.addSeparator()
+        # FR-42, as four keys rather than a submenu per severity. "At least
+        # WARNING" and "at least ERROR" are what people mean nine times out of
+        # ten -- the same judgement the filter bar's quick items make.
+        for level, key in ((Severity.ERROR, "F8"),
+                           (Severity.WARNING, "Ctrl+F8")):
+            nxt = QAction(f"Next {level.name} or Worse", self)
+            nxt.setShortcut(key)
+            nxt.triggered.connect(
+                lambda _c=False, level=level: self._jump_severity(int(level)))
+            menu.addAction(nxt)
+            prv = QAction(f"Previous {level.name} or Worse", self)
+            prv.setShortcut(f"Shift+{key}" if key == "F8" else "Ctrl+Shift+F8")
+            prv.triggered.connect(
+                lambda _c=False, level=level: self._jump_severity(
+                    int(level), back=True))
+            menu.addAction(prv)
+
+        menu.addSeparator()
+        self.next_source_act = QAction("Next Row From &This File", self)
+        self.next_source_act.setShortcut("Alt+Down")
+        self.next_source_act.triggered.connect(lambda: self._jump_source())
+        menu.addAction(self.next_source_act)
+
+        self.prev_source_act = QAction("Previous Row From This &File", self)
+        self.prev_source_act.setShortcut("Alt+Up")
+        self.prev_source_act.triggered.connect(
+            lambda: self._jump_source(back=True))
+        menu.addAction(self.prev_source_act)
+        self.search_menu = menu
 
     def _build_zoom_menu(self, view_menu) -> None:
         """
@@ -845,6 +1413,25 @@ class MainWindow(QMainWindow):
         self._status_span = QLabel("")
         self._status_follow = QLabel("")
         self._status_follow.setStyleSheet(f"color: {theme.FOLLOW_ACTIVE};")
+        self._status_filter = QLabel("")
+        self._status_filter.setStyleSheet(f"color: {theme.FILTER_ACTIVE};")
+        """
+        What the filter is keeping out, permanently on show while one is in
+        force (FR-45). See `_update_filter_status` for why it is said twice.
+        """
+
+        # The export gets its own bar and button rather than sharing the
+        # indexing pair: a drop can be indexing while an export runs, and one
+        # Cancel button wired to whichever started last is the kind of control
+        # that loses someone an hour of writing.
+        self._export_bar = QProgressBar()
+        self._export_bar.setMaximumWidth(180)
+        self._export_bar.setTextVisible(True)
+        self._export_bar.hide()
+        self._export_cancel = QPushButton("Stop Export")
+        self._export_cancel.setFlat(True)
+        self._export_cancel.clicked.connect(self.cancel_export)
+        self._export_cancel.hide()
 
         # FR-26, in the status bar rather than floated over the last row: an
         # overlay would sit on top of the text someone scrolled up to read,
@@ -868,6 +1455,9 @@ class MainWindow(QMainWindow):
         bar.addWidget(self._new_lines)
         bar.addWidget(self._progress)
         bar.addWidget(self._cancel_btn)
+        bar.addWidget(self._export_bar)
+        bar.addWidget(self._export_cancel)
+        bar.addPermanentWidget(self._status_filter)
         bar.addPermanentWidget(self._status_follow)
         bar.addPermanentWidget(self._status_span)
         bar.addPermanentWidget(self._status_pos)
@@ -1040,6 +1630,19 @@ class MainWindow(QMainWindow):
         # something is actually marked.
         self.marks.invalidate()
         self.marks.request(self.view.highlights.rules)
+        # Same for the find and the filter, and for the same reason -- but they
+        # are handled differently because they fail differently. The hits are
+        # `(source, entry)` pairs that are still true of the files they came
+        # from, so the scan is re-run and the new file searched too. A filter's
+        # masks are per-source and one source long, so an evaluation that
+        # predates the new file cannot be stretched over it: it is re-evaluated
+        # from the bar, which is the only place that still knows what was
+        # asked.
+        self.finder.invalidate()
+        if self.findbar.isVisibleTo(self):
+            self._find_query(self.findbar.query())
+        if self.session.is_filtered or self.filterbar.isVisibleTo(self):
+            self._filter_changed(self.filterbar.filter())
         self._cancel_btn.setEnabled(True)
 
         parts = [result.summary()]
@@ -1110,6 +1713,15 @@ class MainWindow(QMainWindow):
         self.marks.invalidate()
         self.minimap.set_marks(())
         self.timeline.set_marks(())
+        for scanner in (self.finder, self.filterer):
+            scanner.stop()
+            scanner.session = self.session
+        self.finder.invalidate()
+        self.close_find()
+        self.filterbar.hide()
+        self.filterbar.set_sources([])
+        self.timeline.set_window(None)
+        self._status_filter.setText("")
         self.view.set_tailing(False)
         self._new_lines.clear()
         self.follow.set_global_follow(self.follow_act.isChecked())
@@ -1148,6 +1760,7 @@ class MainWindow(QMainWindow):
         self.minimap.refresh()
         self.timeline.refresh()
         self._sync_strips()
+        self.filterbar.set_sources([s.alias for s in self.session.sources])
         self._reload_source_list()
         self._update_span()
         self._update_position(self.view.current_row())
@@ -1322,5 +1935,11 @@ class MainWindow(QMainWindow):
         self._join_thread()
         self.follow.stop()
         self.marks.stop()
+        # Both scanners, and the export: a worker still reading a source's
+        # bytes when `session.close()` unmaps them is a segfault, not an
+        # exception.
+        self.finder.stop()
+        self.filterer.stop()
+        self.cancel_export()
         self.session.close()
         super().closeEvent(event)

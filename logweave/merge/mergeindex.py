@@ -36,6 +36,7 @@ from dataclasses import dataclass, field
 import numpy as np
 
 from ..index.fileindex import FileIndex
+from .selection import Selection, sorted_mask
 
 CHECKPOINT = 4096
 """
@@ -87,6 +88,22 @@ class MergeSource:
     with no special case here. The price is that positions in `ts` are positions
     in the *sorted* order, so they must be mapped back through the permutation
     before they mean anything to a caller -- `to_entries` does that.
+
+    ## Two position spaces, and why the distinction is load-bearing (M7)
+
+    A filtered source (FR-45) presents only the entries a predicate passed, so
+    there are two kinds of position and the merge uses both:
+
+    * a **raw** position, into `index.ts_sorted` -- what `to_entries` maps and
+      what a byte range is found from;
+    * a **view** position, counting only the entries that pass -- what a cursor
+      holds and what a merged row number is a sum of.
+
+    They are the same thing when nothing is filtered, which is why every method
+    here has a branch that costs nothing in that case. Confusing the two in
+    either direction produces a merge that reads plausible text under the wrong
+    row number, so the names say which is which and nothing returns a bare
+    "position".
     """
 
     index: FileIndex
@@ -95,14 +112,163 @@ class MergeSource:
     it rebuilds checkpoints and touches nothing else."""
     enabled: bool = True
     name: str = ""
+    keep: np.ndarray | None = None
+    """
+    Entry-order mask of the entries a filter passed (FR-45), or None for all.
+
+    Entry order, not sorted order, because that is the space a filter is
+    evaluated in -- `flags` and `ts` are entry-ordered arrays -- and because an
+    append extends it at the end. `Selection` holds the permuted copy.
+    """
+
+    def __post_init__(self) -> None:
+        self._sel: Selection | None = None
+        self._rank_of_entry: np.ndarray | None = None
+        self._build_selection()
+
+    def _build_selection(self) -> None:
+        self._sel = (None if self.keep is None
+                     else Selection(sorted_mask(self.keep, self.index.order)))
+
+    def set_keep(self, keep: np.ndarray | None) -> None:
+        """Replace the filter mask. The only way it may change, so that the
+        derived `Selection` can never be left describing a previous one."""
+        self.keep = keep
+        self._build_selection()
+
+    def set_index(self, index: FileIndex) -> None:
+        """Swap in a re-read index -- the follow path (SPEC 6.4, M6)."""
+        self.index = index
+        self._rank_of_entry = None
+        self._build_selection()
+
+    @property
+    def selection(self) -> Selection | None:
+        return self._sel
 
     @property
     def ts(self) -> np.ndarray:
+        """
+        Every ascending timestamp, filter or no filter.
+
+        Deliberately the *unfiltered* array: it is what a raw position indexes
+        and what a time is searched in, and a filtered copy of it is exactly the
+        8-bytes-a-row allocation `Selection` exists to avoid.
+        """
         return self.index.ts_sorted
 
     @property
     def n(self) -> int:
+        """Rows this source contributes -- a **view** count."""
+        return self.index.n if self._sel is None else self._sel.count
+
+    @property
+    def raw_n(self) -> int:
+        """Entries indexed, filtered or not. What growth is detected against."""
         return self.index.n
+
+    def search(self, wall_us: int, *, after: bool = False) -> int:
+        """
+        View position of the first entry at or after `wall_us` (`after`: strictly
+        after). The primitive `time_to_row` sums.
+        """
+        side = "right" if after else "left"
+        raw = int(np.searchsorted(self.ts, wall_us - self.skew_us, side=side))
+        return raw if self._sel is None else self._sel.rank(raw)
+
+    def searches(self, wall_us: np.ndarray) -> np.ndarray:
+        """
+        `search` at many **ascending** times, in one pass over the mask.
+
+        The vectorised form matters only for a filtered source, and it is what
+        makes deriving a filtered checkpoint table cheap (SPEC 11.2): tens of
+        thousands of times at once instead of a block sum each.
+        """
+        raw = np.searchsorted(self.ts, np.asarray(wall_us, dtype=np.int64)
+                              - self.skew_us, side="left")
+        if self._sel is None:
+            return raw.astype(np.int64)
+        return self._sel.ranks_sorted(raw)
+
+    def view_rank(self, raw_pos: int) -> int:
+        """Raw position -> view position."""
+        return int(raw_pos) if self._sel is None else self._sel.rank(raw_pos)
+
+    def window(self, lo: int, count: int) -> tuple[np.ndarray, np.ndarray]:
+        """
+        `count` rows from view position `lo`, as `(raw positions, skewed ts)`.
+
+        Short when the source runs out. The unfiltered path slices rather than
+        fancy-indexing, because this is the merge's inner loop and a slice plus
+        an add is one pass where a gather is two.
+        """
+        lo = max(0, int(lo))
+        if self._sel is None:
+            hi = min(self.index.n, lo + max(0, int(count)))
+            if hi <= lo:
+                empty = np.zeros(0, dtype=np.int64)
+                return empty, empty.copy()
+            return (np.arange(lo, hi, dtype=np.int64),
+                    self.ts[lo:hi] + self.skew_us)
+        pos = self._sel.take(self._sel.position(lo), count)
+        return pos, self.ts[pos] + self.skew_us
+
+    def span(self) -> tuple[int, int]:
+        """First and last skewed timestamp in the view."""
+        if self.n == 0:
+            return (0, 0)
+        if self._sel is None:
+            return (int(self.ts[0]) + self.skew_us,
+                    int(self.ts[-1]) + self.skew_us)
+        lo = self._sel.position(0)
+        hi = self._sel.position(self._sel.count - 1)
+        return (int(self.ts[lo]) + self.skew_us,
+                int(self.ts[hi]) + self.skew_us)
+
+    def earliest_from(self, entry: int) -> int | None:
+        """
+        Smallest skewed timestamp among entries `[entry, n)` that are in the
+        view -- what an append is resumed from (SPEC 6.4).
+
+        Read from the index's **raw** `ts` and the entry-order mask for the
+        reason the follow path already documents: in sorted order the appended
+        entries are not a slice at all.
+        """
+        ts = self.index.ts[entry:]
+        if self.keep is not None:
+            ts = ts[self.keep[entry:]]
+        return int(ts.min()) + self.skew_us if ts.size else None
+
+    def view_ranks(self, raw: np.ndarray) -> np.ndarray:
+        """`view_rank` at many **ascending** raw positions."""
+        raw = np.asarray(raw, dtype=np.int64)
+        return raw if self._sel is None else self._sel.ranks_sorted(raw)
+
+    def sorted_positions(self, entries: np.ndarray) -> np.ndarray:
+        """`sorted_position` for many entries, in one gather."""
+        entries = np.asarray(entries, dtype=np.int64)
+        if self.index.order is None:
+            return entries
+        self.sorted_position(0)                 # builds the inverse permutation
+        return self._rank_of_entry[entries]
+
+    def sorted_position(self, entry: int) -> int:
+        """
+        Entry index -> raw sorted position: the inverse of `to_entries`.
+
+        Identity for a monotonic file, and for one that needed reordering the
+        inverse permutation is built once and kept. Eight bytes an entry, which
+        is why it is built on demand rather than at construction -- only
+        `row_of` needs it, and only on a file that was out of order.
+        """
+        order = self.index.order
+        if order is None:
+            return int(entry)
+        if self._rank_of_entry is None or self._rank_of_entry.size != order.size:
+            inverse = np.empty(order.size, dtype=np.int64)
+            inverse[order] = np.arange(order.size, dtype=np.int64)
+            self._rank_of_entry = inverse
+        return int(self._rank_of_entry[int(entry)])
 
     def to_entries(self, positions: np.ndarray) -> np.ndarray:
         """
@@ -174,6 +340,7 @@ class MergeIndex:
         *,
         checkpoint: int = CHECKPOINT,
         cache_blocks: int = BLOCK_CACHE_BLOCKS,
+        derive_from: MergeIndex | None = None,
     ):
         self.sources = sources
         self.checkpoint = checkpoint
@@ -187,7 +354,10 @@ class MergeIndex:
         self._anchor_ts = np.zeros(0, dtype=np.int64)
         self._seen = np.zeros(len(sources), dtype=np.int64)
         self._built = False
-        self.build_checkpoints()
+        if derive_from is None:
+            self.build_checkpoints()
+        else:
+            self.derive_checkpoints(derive_from)
 
     # ------------------------------------------------------------------
     # the active set (FR-9)
@@ -235,19 +405,114 @@ class MergeIndex:
         are ascending, the count of entries strictly before `t` *is* the row
         number of the first entry at or after it.
         """
-        total = 0
-        for i in self.active:
-            s = self.sources[i]
-            total += int(np.searchsorted(s.ts, wall_us - s.skew_us, side="left"))
-        return total
+        return sum(self.sources[i].search(wall_us) for i in self.active)
 
     def cursors_at_time(self, wall_us: int) -> np.ndarray:
         k = len(self.sources)
         cur = np.zeros(k, dtype=np.int64)
         for i in self.active:
-            s = self.sources[i]
-            cur[i] = np.searchsorted(s.ts, wall_us - s.skew_us, side="left")
+            cur[i] = self.sources[i].search(wall_us)
         return cur
+
+    def cursors_at_row(self, row: int) -> np.ndarray:
+        """
+        How many rows each source has contributed by merged row `row`.
+
+        Exact where `cursors_at_time` is not: a run of identical timestamps has
+        one time but many rows, and "the first row at that time" is not where
+        row 1,000,004 of the run sits. Jumping to the next entry of a given
+        severity (FR-42) starts from a row, so it needs the exact frontier --
+        with the approximate one it would find a hit it had just come from.
+
+        Costs one block replay at most, like any other row lookup.
+        """
+        row = max(0, min(int(row), self.total))
+        k = len(self.sources)
+        if self._cp_row.size == 0:
+            base = np.zeros(k, dtype=np.int64)
+            skip = row
+        else:
+            c = max(int(np.searchsorted(self._cp_row, row, side="right")) - 1, 0)
+            base = self._cp_cursors[c].copy()
+            skip = row - int(self._cp_row[c])
+        if skip <= 0:
+            return base
+        _, s_s, _, _ = self._window(base, skip)
+        return base + np.bincount(s_s[:skip], minlength=k).astype(np.int64)
+
+    def row_of(self, source: int, entry: int) -> int:
+        """
+        The merged row an entry occupies -- the inverse of `row_at`.
+
+        What a search hit needs (FR-44): a scan finds `(source, entry)` pairs,
+        and "hit 7 of 1,284" and "jump to it" are both questions about row
+        numbers. Doing it by seeking to the hit's *time* would be wrong wherever
+        a timestamp repeats, which in a busy log is everywhere.
+
+        Exact, because the merged order is fully determined by the sort key
+        (ts, source order, position within the source): entries from a
+        lower-numbered source that share this one's timestamp come first, those
+        from a higher-numbered source come after, and within this source the
+        count is the position itself. One `searchsorted` per source.
+
+        For an entry the filter excluded this answers where it *would* sit --
+        the row of the next entry that did pass -- rather than refusing, so a
+        hit that a filter has hidden still scrolls somewhere sensible.
+        """
+        s = self.sources[source]
+        pos = s.sorted_position(entry)
+        t = int(s.index.ts_sorted[pos]) + s.skew_us
+        row = 0
+        for j in self.active:
+            if j == source:
+                row += s.view_rank(pos)
+            else:
+                row += self.sources[j].search(t, after=j < source)
+        return row
+
+    def rows_of(self, sources: np.ndarray, entries: np.ndarray) -> np.ndarray:
+        """
+        `row_of` for many entries at once -- what a search's hit list needs.
+
+        A find over a 10 GB set can return the 200,000 hits `MAX_HITS` allows,
+        and every one of them needs a row number: for "hit 7 of 1,284", for
+        next and previous, and for the scroll. One `row_of` per hit is
+        `O(hits x sources)` trips into Python and measures in seconds, so the
+        same arithmetic is done per *source pair* over whole arrays instead --
+        `sources^2` vectorised `searchsorted`s, which is tens of milliseconds
+        at that scale and not visible at any realistic one.
+
+        The hits of one source are sorted by position before the pass and put
+        back afterwards, because the filtered rank lookup needs ascending input
+        (`Selection.ranks_sorted`) and because a monotone time array lets every
+        source's `searchsorted` be one call rather than one per hit.
+        """
+        sources = np.asarray(sources, dtype=np.int64)
+        entries = np.asarray(entries, dtype=np.int64)
+        out = np.zeros(sources.size, dtype=np.int64)
+        for si in np.unique(sources):
+            si = int(si)
+            s = self.sources[si]
+            mine = sources == si
+            pos = s.sorted_positions(entries[mine])
+            order = np.argsort(pos, kind="stable")
+            pos = pos[order]
+            t = s.index.ts_sorted[pos].astype(np.int64) + s.skew_us
+            acc = s.view_ranks(pos)
+            for j in self.active:
+                if j == si:
+                    continue
+                sj = self.sources[j]
+                # A tie goes to the lower-numbered source (FR-17), so an entry
+                # from a source before this one with the *same* timestamp is
+                # already past -- which is the whole content of `side`.
+                raw = np.searchsorted(sj.ts, t - sj.skew_us,
+                                      side="right" if j < si else "left")
+                acc = acc + sj.view_ranks(raw.astype(np.int64))
+            back = np.empty_like(acc)
+            back[order] = acc
+            out[mine] = back
+        return out
 
     def row_to_time(self, row: int) -> int:
         block = self.rows(row, 1)
@@ -294,8 +559,7 @@ class MergeIndex:
     def time_span(self) -> tuple[int, int]:
         lo, hi = None, None
         for i in self.active:
-            s = self.sources[i]
-            a, b = int(s.ts[0]) + s.skew_us, int(s.ts[-1]) + s.skew_us
+            a, b = self.sources[i].span()
             lo = a if lo is None else min(lo, a)
             hi = b if hi is None else max(hi, b)
         return (lo or 0, hi or 0)
@@ -319,14 +583,14 @@ class MergeIndex:
         for i in self.active:
             s = self.sources[i]
             lo = int(cursors[i])
-            hi = min(s.n, lo + take)
-            if hi <= lo:
+            pos, ts = s.window(lo, take)
+            if pos.size == 0:
                 continue
-            segs_ts.append(s.ts[lo:hi] + s.skew_us)
-            segs_s.append(np.full(hi - lo, i, dtype=np.int64))
-            segs_p.append(np.arange(lo, hi, dtype=np.int64))
-            if hi < s.n:
-                last = int(segs_ts[-1][-1])
+            segs_ts.append(ts)
+            segs_s.append(np.full(pos.size, i, dtype=np.int64))
+            segs_p.append(pos)
+            if lo + pos.size < s.n:
+                last = int(ts[-1])
                 bound = last if bound is None else min(bound, last)
 
         if not segs_ts:
@@ -368,6 +632,113 @@ class MergeIndex:
         self._cache.clear()
         self._seen = self._counts()
         self._record_stats()
+
+    # ------------------------------------------------------------------
+    # SPEC 11.2: the same merge over a subset of the entries (FR-45, NFR-9)
+    # ------------------------------------------------------------------
+
+    def filtered(self, keeps: list[np.ndarray | None]) -> MergeIndex:
+        """
+        A merge over only the entries each mask passes, built from this one.
+
+        One mask per source, in entry order, or None for "all of it". The
+        result is an ordinary `MergeIndex`: the session hands it to the view in
+        place of this one and keeps this one for the moment the filter is
+        cleared, which is what makes clearing instant (FR-45).
+        """
+        if len(keeps) != len(self.sources):
+            raise ValueError("one mask per source")
+        srcs = [
+            MergeSource(index=s.index, skew_us=s.skew_us, enabled=s.enabled,
+                        name=s.name, keep=keeps[i])
+            for i, s in enumerate(self.sources)
+        ]
+        return MergeIndex(srcs, checkpoint=self.checkpoint,
+                          cache_blocks=self._cache_blocks, derive_from=self)
+
+    def derive_checkpoints(self, parent: MergeIndex) -> None:
+        """
+        Build this merge's checkpoints out of an unfiltered merge's, with no
+        re-merge at all. **This is what meets NFR-9.**
+
+        ## Why a filtered merge cannot simply be built
+
+        `build_checkpoints` is one pass over every timestamp -- measured at
+        2.7 Mrow/s (SPEC 14.1), so NFR-9's 100M-row set is **37 seconds**
+        against a 500 ms budget. SPEC 11.2 said the vectorised mask pass is
+        what meets NFR-9, and that was only ever half the story: the masks are
+        indeed a few milliseconds, and the merge built over them was not.
+
+        ## Why the parent's checkpoints transfer
+
+        The filtered merged order is the **subsequence** of the unfiltered
+        merged order containing the rows that passed -- both are the same
+        entries under the same sort key, and dropping some of them cannot
+        reorder the rest. So every unfiltered checkpoint is a cut through the
+        filtered order too, and the only thing that changes is the arithmetic
+        describing it:
+
+        * its **cursors** become the kept entries before that cut, which is
+          `Selection.rank` per source -- and at a checkpoint time that is the
+          same thing as `cursors_at_time`, so this is one `searchsorted` and one
+          masked pass per source for the *whole* table rather than per
+          checkpoint.
+        * its **row** is the sum of those cursors, because a merged row number
+          is exactly how many rows precede it.
+
+        A cut is a valid resume point whenever `row == sum(cursors)` and the
+        cursors describe a prefix of the merge order, which the entries before a
+        given time always do. `tests/unit/test_filter.py` holds the derived
+        table against a from-scratch build, because a merge whose order depended
+        on how it was built would be the worst defect this design can have.
+
+        ## What is given up
+
+        `_cp_ts` is a **lower bound** on the time at its row rather than the
+        exact value: if the filter removed every entry at that instant, the row
+        that inherits the checkpoint is a later one. Only `extend_checkpoints`
+        reads it, and only to pick a checkpoint strictly before an appended
+        timestamp, where a lower bound resumes early -- slower, never wrong.
+        """
+        self._cache.clear()
+        if self.total == 0 or parent._cp_row.size == 0:
+            # Nothing to place, or a parent too small to have a table. Either
+            # way a build is immediate -- and it keeps exactly one definition
+            # of what an unfiltered-sized merge's checkpoints are.
+            self.build_checkpoints()
+            return
+
+        self._cp_ts, self._cp_row, self._cp_cursors = self._transfer(
+            parent._cp_ts, want_cursors=True)
+        anchor_ts, anchor_row, _ = self._transfer(parent._anchor_ts)
+        self._anchor_ts, self._anchor_row = anchor_ts, anchor_row
+        self._built = True
+        self._seen = self._counts()
+        self._record_stats()
+        self.stats.notes.append("checkpoints derived from the unfiltered merge")
+
+    def _transfer(self, times: np.ndarray, *, want_cursors: bool = False):
+        """
+        Parent cut times -> `(times, rows, cursors)` in this merge's numbering.
+
+        Cuts landing on the same filtered row are collapsed to the first of
+        them, which is both a memory saving on a selective filter -- where
+        thousands of parent checkpoints can map to one row -- and what keeps
+        `_cp_row` strictly increasing, as `np.searchsorted` and `np.interp`
+        both require of it.
+        """
+        k = len(self.sources)
+        times = np.asarray(times, dtype=np.int64)
+        cursors = np.zeros((times.size, k), dtype=np.int64)
+        for i in self.active:
+            cursors[:, i] = self.sources[i].searches(times)
+        rows = cursors.sum(axis=1)
+
+        first = np.ones(rows.size, dtype=bool)
+        first[1:] = rows[1:] != rows[:-1]
+        times, rows = times[first], rows[first]
+        return times, rows, (cursors[first] if want_cursors
+                             else np.zeros((0, k), dtype=np.int64))
 
     def _stride(self) -> int:
         """
@@ -541,25 +912,38 @@ class MergeIndex:
         return from_row
 
     def _counts(self) -> np.ndarray:
-        return np.array([s.n for s in self.sources], dtype=np.int64)
+        """
+        Entries indexed per source -- **raw** counts, not view counts.
+
+        Growth is a property of the file, not of the filter in front of it: a
+        filtered merge whose predicate rejects every appended line has still
+        seen those entries, and recording the view count instead would make it
+        re-detect the same append on every tick.
+        """
+        return np.array([s.raw_n for s in self.sources], dtype=np.int64)
 
     def _earliest_appended(self, now: np.ndarray) -> int | None:
-        """Smallest skewed timestamp among entries not seen at the last build."""
+        """
+        Smallest skewed timestamp among entries not seen at the last build.
+
+        Read from the index's RAW `ts`, not the merge's `ts_sorted`. Entry
+        indices `[seen, n)` are the appended ones by definition, so that slice
+        is O(appended). In `ts_sorted` they are not a slice at all: a file that
+        was not time-ordered (SPEC 4.6) puts an appended line with an old
+        timestamp early in the sorted view, and `ts_sorted[seen:]` would then be
+        the *old* entries that got shifted along -- reporting the tail's
+        timestamp and resuming far too late. `MergeSource.earliest_from` holds
+        that rule, and applies the filter mask over the same slice.
+        """
         best: int | None = None
         for i in self.active:
             s = self.sources[i]
             at = int(self._seen[i])
             if at >= int(now[i]):
                 continue
-            # Read from the index's RAW `ts`, not the merge's `ts_sorted`.
-            # Entry indices `[seen, n)` are the appended ones by definition, so
-            # this slice is O(appended). In `ts_sorted` they are not a slice at
-            # all: a file that was not time-ordered (SPEC 4.6) puts an appended
-            # line with an old timestamp early in the sorted view, and
-            # `ts_sorted[seen:]` would then be the *old* entries that got
-            # shifted along -- reporting the tail's timestamp and resuming far
-            # too late.
-            lowest = int(s.index.ts[at:].min()) + s.skew_us
+            lowest = s.earliest_from(at)
+            if lowest is None:
+                continue                      # appended, but all of it filtered out
             best = lowest if best is None else min(best, lowest)
         return best
 

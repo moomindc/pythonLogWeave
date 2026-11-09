@@ -21,9 +21,10 @@ import pytest
 pytest.importorskip("PySide6", reason="GUI layer; the engine job installs no Qt")
 
 from PySide6.QtCore import QPointF, Qt  # noqa: E402
-from PySide6.QtGui import QImage, QMouseEvent  # noqa: E402
+from PySide6.QtGui import QColor, QImage, QMouseEvent  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
+from logweave.index.severity import Severity  # noqa: E402
 from logweave.session import Session  # noqa: E402
 from logweave.session.overview import StripTheme  # noqa: E402
 from logweave.ui import settings, theme  # noqa: E402
@@ -103,7 +104,10 @@ def test_a_strip_paints_the_buffer_it_was_given(app, session):
     img = render(strip)
     assert img.height() == HEIGHT
 
-    info = StripTheme().severity[3]          # INFO
+    # The busiest row's top class here is INFO, which below the colour floor
+    # is the ordinary-traffic grey -- taken from the theme either way, so this
+    # test is about the blit and not about which colour that class gets.
+    info = StripTheme().severity[int(Severity.INFO)]
     want = (info[0] << 16) | (info[1] << 8) | info[2]
     totals = session.overview.minimap(HEIGHT).totals
     busiest = int(np.argmax(totals[: HEIGHT // 2]))
@@ -391,3 +395,79 @@ def test_closing_everything_leaves_the_strips_on_the_new_session(window):
     assert window.minimap.session is window.session
     assert window.timeline.session is window.session
     assert not window.session.overview.available
+
+
+# ---------------------------------------------------------------------------
+# M7: find marks and the time window (FR-44, FR-48)
+# ---------------------------------------------------------------------------
+
+def test_a_find_layer_gets_the_rightmost_gutter_column(app, session):
+    """
+    A find is transient and the rules are not, so its column must not sit in
+    the rule gutter where a toggled rule would move it.
+    """
+    from logweave.session.marks import MarkLayer
+
+    strip = shown(MinimapStrip(session))
+    lo, hi = session.time_span()
+    rule = MarkLayer(rule="r", colour="#ff0000",
+                     times=np.array([lo], dtype=np.int64))
+    find = MarkLayer(rule="find", colour=theme.FIND_MARK,
+                     times=np.array([hi], dtype=np.int64))
+
+    strip.set_marks([rule])
+    assert strip._gutter_layers() == (rule,)
+    strip.set_find_marks(find)
+    assert strip._gutter_layers() == (rule, find)
+    assert strip._gutter_layers()[-1] is find
+
+    before = render(strip)
+    strip.set_find_marks(None)
+    QApplication.processEvents()
+    assert render(strip) != before, "the find column was not redrawn"
+
+
+def test_the_find_colour_reaches_the_pixels(app, session):
+    from logweave.session.marks import MarkLayer
+
+    strip = shown(TimelineStrip(session))
+    lo, _hi = session.time_span()
+    strip.set_find_marks(MarkLayer(rule="find", colour=theme.FIND_MARK,
+                                   times=np.array([lo], dtype=np.int64)))
+    QApplication.processEvents()
+    img = render(strip)
+    wanted = QColor(theme.FIND_MARK).rgb() & 0xFFFFFF
+    found = any((img.pixel(x, y) & 0xFFFFFF) == wanted
+                for y in range(img.height()) for x in range(img.width()))
+    assert found, "no pixel in the find colour"
+
+
+def test_the_time_window_paints_without_the_bands_moving(app, session):
+    """
+    FR-48's shade is drawn over the strip, so the one thing to check is that a
+    window neither raises nor blanks the map it sits on.
+    """
+    strip = shown(TimelineStrip(session))
+    plain = render(strip)
+    lo, hi = session.time_span()
+    strip.set_window((lo, lo + (hi - lo) // 2))
+    QApplication.processEvents()
+    shaded = render(strip)
+    assert shaded != plain
+    blank = QImage(shaded.size(), shaded.format())
+    blank.fill(QColor(theme.BACKGROUND))
+    assert shaded != blank, "the window painted over everything"
+
+    strip.set_window(None)
+    QApplication.processEvents()
+    assert render(strip) == plain
+
+
+def test_a_window_outside_the_span_is_clamped_rather_than_raising(app, session):
+    strip = shown(TimelineStrip(session))
+    lo, hi = session.time_span()
+    for window in ((lo - 10**12, lo - 10**11), (hi + 10**11, hi + 10**12),
+                   (hi, lo)):
+        strip.set_window(window)
+        QApplication.processEvents()
+        render(strip)

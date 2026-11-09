@@ -45,7 +45,7 @@ headlessly on Linux CI (NFR-18) and keeps Qt out of worker processes.
 
 ### 1.1 Repository layout
 
-The plan, with **what exists after M4 marked**. Unmarked entries are still
+The plan, with **what exists after M7 marked**. Unmarked entries are still
 designed and unbuilt; nothing has been built that is not in this list.
 
 ```
@@ -76,6 +76,7 @@ logweave/
   merge/                 layer 3
     mergeindex.py        checkpoints, row_at, time_to_row, row_to_time         M2a
     blockcache.py        -- built inside mergeindex.py, not split out          M2a
+    selection.py         a filter's passing set: mask + sampled rank (§11.2)   M7
   session/               layer 4
     session.py                                                                 M3
     prepare.py           cache warming in worker processes (§5.3)              M2b
@@ -85,7 +86,12 @@ logweave/
     overview.py          both strips: aggregation and pixel rendering (§8)     M5
     follow.py            the follow engine (§7); Qt-free, owns no timer        M6
     marks.py             where a marked rule's hits are, per source (§10.4)   M6a
-    profile.py  filters.py  search.py  bookmarks.py  export.py
+    scan.py              the byte-scan primitives all three searches share     M7
+    find.py              FR-44's search; hits as (source, entry) pairs         M7
+    filters.py           FR-45's two tiers, and the filtered histograms        M7
+    nav.py               next/previous by severity or file; time parsing       M7
+    export.py            FR-47, as a generator the UI thread drives            M7
+    profile.py  bookmarks.py
   highlight/             layer 5 by number, Qt-free by rule (§1)
     rules.py             HighlightRule, Ruleset, one-pass compilation          M4
     builtins.py          the three shipped rulesets, plus the user set (§10.1) M4
@@ -102,8 +108,12 @@ logweave/
     theme.py             fonts, chrome colours, stylesheet                     M3
     strips.py            the minimap and timeline widgets (FR-32, FR-33)       M5
     followui.py          the thread hop and the "N new lines" button (FR-26)   M6
-    sourcepanel.py  findbar.py  filterbar.py
-    dialogs.py  styles.py
+    findbar.py           the find strip: a box, two toggles, the count (FR-44) M7
+    filterbar.py         the filter strip, and what it is keeping out (FR-45)  M7
+    findscan.py          find and tier-2 filter scans, off the UI thread       M7
+    gotodialog.py        "go to timestamp" over `nav.parse_time` (FR-41)       M7
+    exportdialog.py      the export form, and the timer that drives it (§11.3) M7
+    sourcepanel.py  dialogs.py  styles.py
 tests/
   conftest.py            corpus fixture and an in-memory LogSource stub        M0
   test_architecture.py   §1: the engine layers stay Qt-free                    M0
@@ -1097,6 +1107,20 @@ now emitted **highest class first**, so every saturated band starts at `x=0`,
 least informative band is the one that runs under the viewport box. Nothing
 about the proportions changed; only the order they are laid down in.
 
+**Corrected again at M7: the bands stop colouring below WARNING.** Dimming
+`NONE` was half the fix. The other half is that of the rows which *are*
+classified, a healthy service writes almost nothing but INFO, so a saturated
+blue band floods the strip for exactly the reason the mid-grey `NONE` band did.
+`palette.COLOUR_FROM` is now the single floor for all three surfaces that
+colour by severity -- the message text (§10.1), the severity mark in the gutter
+and these bands -- and everything below it is drawn as `overview.ORDINARY`, one
+dim grey just above the background. One grey for all five classes, not five
+shades: at two pixels a row four greys are not distinguishable, and the
+question a strip answers is "where is the trouble", not "how much of this was
+DEBUG". Nothing about the *proportions* changes -- every class is still counted
+and still gets its own band width -- so `Strip.top_severity`, the tooltips and
+the severity filter are unaffected; only the colour the band is filled with.
+
 **That makes "draw marks over the bands" wrong.** The original rule -- marks at
 the left edge, over whatever is beneath, because a hit hidden by a dense band is
 a hit nobody finds -- was written when the left edge was `NONE` and free to be
@@ -1386,7 +1410,7 @@ Four further as-built details:
 
 **Built-in rulesets, user-extensible (D11, Q2).** Three ship as defaults. **As
 built at M4 the three are: severity words, exception and stack-trace *shapes*,
-and syslog priorities (`<0>`–`<7>`)** — which is a different cut from the one
+and syslog priorities (`<0>`–`<4>`)** — which is a different cut from the one
 planned above, for two reasons. The shapes were split out of the severity set
 because they are the only `scope="match"` rules among the built-ins: they colour
 the exception class name or a `at com.acme.Gateway(...)` frame *inside* the line,
@@ -1398,6 +1422,44 @@ the one convention that does.
 Severity is on, shapes are on, **syslog is off by default** — `<3>` at the start
 of a line is rare outside a raw capture, and a rule that never fires still costs
 a branch in the one regex every row is scanned with.
+
+**Corrected at M7: the shipped rules colour WARNING and above, and nothing
+below.** As built at M4 they coloured all eight classes, which was wrong on the
+only evidence that matters — a real log. A healthy service writes almost
+nothing but INFO, so an eight-class ramp colours *every* row, and a view in
+which everything is coloured is one in which nothing stands out. §10.2 had
+already reached that conclusion for row *tints* (`SEVERITY_BACKGROUNDS` starts
+at WARNING, "tinting INFO too would mean every row is tinted, which is the same
+as none being tinted"); M7 applies it to the foreground, with
+`builtins.COLOUR_FROM` as the single floor.
+
+Two things deliberately did **not** change with it:
+
+- The sub-WARNING rules still exist and still carry their `severity`, so the
+  index-time classifier (§10.3), the cached-index fingerprint, the severity mark
+  in the gutter, the minimap bands and every severity filter behave exactly as
+  before. Only `fg`/`bg` went. The severity *mark* keeps the full eight-colour
+  ramp for that reason: it is a one-character column a reader scans deliberately,
+  and it has to agree with the minimap it is a map of.
+- `palette.SEVERITY_COLOURS` still holds all eight colours. The floor is
+  applied where the paint is chosen, not by removing colours from the palette,
+  because a user who points a rule at INFO (FR-31) still needs a colour for it
+  and the settings dialog still has to show the ramp.
+
+The floor itself lives in `session.palette` rather than in `highlight.builtins`,
+and that placement is load-bearing: `highlight` imports `session.palette`, so a
+constant in `highlight` cannot be read by `session.overview` without inverting
+the dependency. Three surfaces read it -- the message text, the severity mark
+and the minimap bands -- and a floor that disagreed between them would be worse
+than no floor at all. That is not hypothetical: the first cut of this change
+dimmed the text and left the minimap drawing INFO in saturated blue, which is
+how it was found.
+
+The syslog set drops `<5>`–`<7>` outright rather than shipping them
+uncoloured, because those rules are regexes and so cannot carry a `severity`
+(§10.3): an uncoloured one would do nothing at all while still costing a branch
+in the scan. A reader who wants INFO back in blue adds a rule for it (FR-31);
+the floor is a default, not a limit.
 
 Users may add, edit, reorder, disable and delete rules freely, and may point any
 rule at any severity class; a rule the engine cannot compile is reported in
@@ -1615,90 +1677,253 @@ mid-scan would paint marks from a file that is no longer open.
 
 ## 11. Search, filter, copy and export
 
+Written at M0 from first principles and **rewritten at M7 on the measurements**.
+Three of its claims did not survive contact with a profiler, and they are
+marked *corrected* where they appear: the search kernel for case-insensitive
+text, the unit a hit is recorded in, and what it is that actually meets NFR-9.
+
 ### 11.1 Search (FR-44)
 
-A cancellable background job over the merged stream in time order, scanning raw
-bytes and reporting hits incrementally so the first results and the strip marks
-appear immediately (NFR-10).
+A cancellable background job over every open source, scanning raw bytes and
+publishing partial results as it goes, so the count and the strip marks appear
+while a large set is still being read (NFR-10). The job runs on a worker thread
+(`ui.findscan`); it reads the sources' bytes and the index arrays and writes
+nothing back, which is what makes that safe. It must never call
+`session.rows()` — that mutates the decoded-text LRU and the merge's block
+cache, and is a data race with the paint path on every row.
 
-- Literal, case-sensitive: `bytes.find` over each chunk — memchr-class speed.
-- Literal, case-insensitive: a compiled regex, or a cased-variant Aho-Corasick for
-  long patterns.
-- Regex: compiled `re` over chunk text.
-- Hits are recorded as merged row indices in a growable array, and drive the hit
-  count, next/previous, and strip overlays.
+**Three kernels, measured on a 64 MB subject with a needle that is not there
+(§14.1g):**
+
+| How | Throughput | Projected 10 GB |
+|---|---|---|
+| `mmap.find`, in place | **2257 MB/s** | 4.5s |
+| `bytes.find` over 4 MB chunks | 1318 MB/s | 7.8s |
+| `bytes.lower()` then `bytes.find` | 600 MB/s | 17s |
+| `re.finditer`, `IGNORECASE` literal | **88 MB/s** | 1.9 **minutes** |
+| `re.finditer`, a real regex | 1406 MB/s | 7.3s |
+
+Two rows decide the design.
+
+- **Case-insensitivity is a different algorithm, not a flag.** *(Corrected: M0
+  specified "a compiled regex, or a cased-variant Aho-Corasick for long
+  patterns".)* `re.IGNORECASE` costs **15x** a case-sensitive literal read the
+  same way, because it abandons the fast substring path and compares character
+  by character. Folding the chunk with `bytes.lower()` and searching for a
+  pre-folded needle costs one extra pass over the bytes and is **6.8x faster**
+  than the flag. The
+  price is that it folds ASCII only, which is stated at `scan.fold_ascii`; a
+  reader hunting a non-ASCII term case-insensitively can use regex mode. An
+  Aho-Corasick automaton was not needed: there is one needle, not a set, and
+  the fold already recovers the memchr-class path.
+- **A literal never needs the bytes copied out.** `LogSource.find` answers out
+  of the mapping (`mmap.find`), which is worth 1.7x — the difference between
+  meeting NFR-10's five seconds on a 10 GB set and missing it at 7.8s. The
+  chunked path remains for sources that are not mapped (a gzip member, a
+  locked file read through a copy).
+
+Threads were measured and rejected: `mmap.find` holds the GIL, so four threads
+scan a 64 MB subject at 1937 MB/s against one thread's 2257. Only processes
+could help, and NFR-10 is already met without them.
+
+**Chunks are entry-aligned**, cut at the entry boundary at or before each byte
+target (`scan.entry_chunks`). So no match can straddle a chunk, there is no
+overlap window to get an off-by-one in, and a chunk whose entries are all
+excluded by a tier-1 predicate can be skipped without being read at all. An
+entry larger than a chunk becomes a chunk of its own.
+
+**A hit is a `(source, entry)` pair, not a merged row.** *(Corrected: M0 said
+"recorded as merged row indices in a growable array".)* A row number is not a
+property of a hit — it changes when a source is enabled or disabled (FR-9),
+when a filter is applied (FR-45), and when a followed file appends in the
+middle (§6.4). The pair does not change, so the rows are **derived** from it on
+demand (`MergeIndex.rows_of`, k vectorised `searchsorted`s) and re-derived
+whenever the merge changes (`Hits.locate`). A hit the current view cannot reach
+— in a hidden source, or on a row a filter removed — gets no row at all and is
+counted as `hidden`: "3 of 18" has to mean eighteen rows this view can step
+through.
+
+Hits are capped at `find.MAX_HITS` (200,000) per search, reported as a
+truncation rather than silently dropped. Past that figure the answer to "where
+is this string" is "everywhere", and the right next action is a filter.
 
 ### 11.2 Filter (FR-45) — two tiers
 
-A filter changes row numbering, so the set of passing rows must be materialised for
-the scrollbar and row count to be correct. Two very different costs:
+A filter changes row numbering, so the passing set has to be describable
+exactly for the row count, the scrollbar and every seek to stay correct.
 
-**Tier 1 — metadata filters** (severity set, source set, time window). Evaluated
-directly on the `ts` and `flags` arrays as boolean masks, with no text access at
-all. A filtered `MergeIndex` is simply one built over masked cursor arrays. For a
-100M-row set this is a handful of vectorised passes — **this is what meets NFR-9
-(< 500ms)**.
+**Tier 1 — metadata filters** (severity set, source set, time window).
+Evaluated directly on each source's `ts` and `severity` arrays as boolean
+masks, with no text access at all, on the UI thread, in the same turn as the
+click that asked for it.
 
-**Tier 2 — text filters** (include/exclude literal or regex). Requires reading
-bytes, so it runs as a background job like search, producing a passing-row array
-incrementally. The view becomes usable at once and its row count grows as the pass
-proceeds. Governed by NFR-10, not NFR-9.
+**Tier 2 — text filters** (include/exclude, literal or regex). Reads bytes, so
+it runs as a background job like search and publishes partial results every
+120 ms. The view is usable throughout, and the two directions are incomplete in
+opposite ways — an unfinished *include* shows too few rows and gains them; an
+unfinished *exclude* shows too many and loses them — so the UI says which.
+Governed by NFR-10, not NFR-9.
 
-Filters compose: tier 1 narrows the candidate set first, so a tier-2 pass over
-"ERROR lines in the last hour" reads only those bytes. Clearing a filter is
-instant — the unfiltered `MergeIndex` is retained, never rebuilt (FR-45).
+Filters compose, and tier 1 narrows the candidate set first, so a tier-2 pass
+over "ERROR lines in the last hour" reads only those entries' bytes. Clearing a
+filter is instant: the unfiltered `MergeIndex` is retained, never rebuilt.
+
+#### What meets NFR-9 — corrected
+
+M0 said: *"A filtered `MergeIndex` is simply one built over masked cursor
+arrays… a handful of vectorised passes — this is what meets NFR-9."* The first
+half is right and the second half left out the expensive part. The masks are
+indeed a handful of passes (**650–855 Mrow/s**, so ~150 ms for 100M rows), but
+a `MergeIndex` built over them has to **build its checkpoint table**, and that
+is a full k-way merge of the kept rows at 6–10 Mrow/s.
+
+The fix is `MergeIndex.derive_checkpoints`. The filtered merged order is a
+*subsequence* of the unfiltered one — the same entries under the same sort key,
+with some removed — so every unfiltered checkpoint is also a cut through the
+filtered order, and all that changes is the arithmetic describing it: each
+cursor becomes the kept entries before that cut (`Selection.rank`, one
+`searchsorted` plus one masked pass per source) and the row becomes the sum of
+the cursors. `tests/unit/test_filter.py` holds the derived table against a
+from-scratch build over random masks, ties and skews, because a merge whose
+order depended on how it was built would be the worst defect this design can
+have.
+
+Measured, 8 sources, rates over the **parent's** rows (§14.1g):
+
+| Rows | Derive, 10% kept | Derive, 90% kept | Rebuild, 10% kept | Rebuild, 90% kept |
+|---|---|---|---|---|
+| 2M | 28 ms | 28 ms | 34 ms | 248 ms |
+| 8M | 89 ms | 89 ms | 135 ms | 992 ms |
+| 32M | 324 ms | 330 ms | 547 ms | 3973 ms |
+| 100M (projected) | **1.0s** | **1.0s** | 1.7s | 12.4s |
+
+Two things to read off it. **Deriving is independent of selectivity** and
+rebuilding is not: the common real filter — "hide DEBUG" — keeps nearly
+everything, which is exactly where a rebuild is worst, and there a derived
+table is **12x** faster. And **NFR-9's 500 ms holds to roughly 45M rows, not to
+100M**: at 100M rows a filter toggle is about a second on the reference
+machine, spent almost entirely in two passes over the per-source keep masks.
+That is stated here rather than rounded down. Closing the gap needs the masks
+themselves to go — a sampled rank over the *predicate* instead of over a
+materialised mask — which is M8 work at the earliest and is not worth doing
+before anyone has a 100M-row set open.
+
+#### Memory, and the strips
+
+The passing set is a **1-byte-per-entry mask plus a block-sampled prefix sum**
+(`merge.Selection`, BLOCK = 4096), not an array of passing row numbers. At
+NFR-15's ceiling an array of row numbers would be 8 bytes a row; the mask is
+one, and the sampled sum that makes `rank`, `position` and `take` O(1) adds
+200 KB per 100M rows. This is the same trade as §6.1, in a smaller place.
+
+The overview strips must show the filtered stream or they advertise rows the
+view will not show (§8.1), and for three of the four predicates that costs
+nothing: a **severity** filter zeroes the histogram's excluded columns (copied,
+never written through the sidecar's mapping), a **source** filter drops that
+source's histogram, and a **time window** clips the span. Only a text filter
+has to rebuild a histogram, which it does from the kept entries' timestamps.
 
 ### 11.3 Copy and export (D9, FR-46a, FR-46b, FR-47)
 
-The point of attribution is that a row pasted into a ticket stays traceable. Every
-emitted row therefore carries its **source file** and its **original line number
-within that file** — `line_no` from §2.3, not the merged row index.
+The point of attribution is that a row pasted into a ticket stays traceable.
+Every emitted row therefore carries its **source file** and its **original line
+number within that file** — `line_no` from §2.3, not the merged row index.
 
-**Formatters.** One interface, `RowFormatter`, serves clipboard and file export, so
-there is exactly one implementation of attribution:
+**Formatters.** One interface, `RowFormatter`, serves clipboard and file export,
+so there is exactly one implementation of attribution:
 
 | Preset | Output |
 |---|---|
 | `annotated` *(default)* | `app.log:1      2026-10-04 14:22:08.113  Connection pool exhausted` |
 | `aligned` | Exactly as displayed on screen, columns padded to the view's widths |
-| `plain` | Message text only, no timestamp, no attribution |
+| `plain` | The verbatim line, as it appears in its own file *(corrected)* |
 | `markdown` | A table with Source, Line, Time, Severity, Message columns |
 | `csv` | RFC4180-quoted, one row per entry, same columns |
 | `template` | A user string over `{source} {alias} {path} {line} {timestamp} {severity} {message} {row}` |
 
-**Built at M3 and M4: `annotated` and `plain`.** The other four extend this
-module at M7; the interface is shaped for them now so that attribution has
-exactly one implementation, as this section requires. M4 bound the two to
-separate commands rather than to a preference — **Ctrl+C** annotated, **Ctrl+Shift+C**
-plain — because they are wanted for different things within one session: the
-first is evidence to paste into a ticket, the second is input for a parser, a
-diff, or a search box that would choke on the prefix. A preference would mean
-visiting a dialog between those two acts.
+**`plain` is the verbatim line, not message-only.** *(Corrected: M0 said
+"message text only, no timestamp, no attribution".)* M4 shipped it as the
+verbatim line and that is the right behaviour: the preset exists to feed a
+parser, a diff or a grep, and all three want the line that is in the file.
+Trimming the leading timestamp would produce text that matches nothing in the
+original, and `aligned` already covers "what I can see on screen".
+
+M4 bound two of the presets to their own commands rather than to a preference —
+**Ctrl+C** annotated, **Ctrl+Shift+C** plain — because they are wanted for
+different things within one session: the first is evidence for a ticket, the
+second is input for a tool. M7 added the other four under **Edit → Copy As**,
+and the export dialog, which is where a `template` can be typed.
 
 The row cap is on the *selection*, not on the preset, so dropping the
 attribution is not a way around it; it is a refusal rather than a silent
 truncation, because FR-47's export is the right tool for a whole view and it
 streams.
 
+**Export streams on the UI thread, and that is deliberate.** `session.export`
+is a generator that yields a `Progress` after every batch of 2000 rows, driven
+by a zero-delay `QTimer`; the event loop runs between batches, so the window
+stays live without a second thread and without a lock. A worker thread is
+*unsafe* here for the reason §13 gives: reading rows means `session.rows()`,
+which mutates the decoded-text LRU and the merge's block cache. A find or a
+mark scan is safe off-thread precisely because it touches neither. Column
+widths for the aligned presets are measured on the first 2000 rows, because
+measuring 41M before writing the first would defeat the streaming.
+
 **Rules that fall out of the data model:**
 
-- **Source naming** renders as basename (default, matching `app.log` / `SOA.log`),
-  alias, or full path. Basename is the default because it is what someone reading
-  a ticket needs in order to find the file.
+- **Source naming** renders as basename (default, matching `app.log` /
+  `SOA.log`), alias, or full path. Basename is the default because it is what
+  someone reading a ticket needs in order to find the file.
 - **Column widths** in `annotated` are computed from the widest value in the
-  *selection*, not the whole log, so a 40-row copy is not padded to the width of a
-  41M-row file.
+  *selection*, not the whole log, so a 40-row copy is not padded to the width
+  of a 41M-row file.
 - **Multi-line entries** emit the annotation once, on the entry's first line;
   continuation lines are indented beneath it and inherit that line number. A
-  setting annotates every physical line instead, with incrementing line numbers,
-  for people pasting into tools that parse line references.
-- **Line numbers are 1-based**, matching every editor a reader will open the file
-  in.
-- **Stale generations**: if a source was truncated or replaced since the rows were
-  indexed (§7.2), those rows are marked in the output rather than being given line
-  numbers that no longer resolve (risk R10).
-- Export (FR-47) differs from copy only in destination and in offering the whole
-  view rather than the selection; filters apply to both.
+  setting annotates every physical line instead, with incrementing line
+  numbers, for people pasting into tools that parse line references.
+- **Line numbers are 1-based**, matching every editor a reader will open the
+  file in.
+- **Stale generations**: if a source was truncated or replaced since the rows
+  were indexed (§7.2), those rows are marked in the output — a `?` after the
+  line number, and a note on the export — rather than being given line numbers
+  that no longer resolve (risk R10).
+- Export (FR-47) differs from copy only in destination and in offering the
+  whole view rather than the selection; filters apply to both.
+
+### 11.4 Navigating (FR-41, FR-42, FR-43, FR-48)
+
+**Go to timestamp** is free: `time_to_row` is one `searchsorted` per source
+with no block replay, measured at 27 µs (NFR-6), so there is nothing to show
+progress for at any file size. The dialog accepts four shapes, because a reader
+with a log open has four different things in mind — a whole timestamp pasted
+from a ticket, a date alone, **a time of day alone** (which takes its date from
+the row the view is on; the log being read is usually one day's), and **a
+signed step** like `+5m` from where they are.
+
+**Next/previous by severity or by file** (FR-42) is deliberately not a scan
+over merged rows: that would be a block replay every 4096 rows and a Python
+loop over all of them, so finding the next CRITICAL in a quiet 10M-row log
+would read the whole merge. Instead each source answers the question in its own
+`severity` array — "the first entry at or after this position in this set" is
+one vectorised test over a slice — and the nearest answer wins
+(`session.nav`). The cost is one pass over the entries actually skipped, with
+nothing decoded and nothing read from disk. Windows grow geometrically (16384
+entries, then 4x a pass) because the common case is a hit a few hundred rows
+away and the worst case is no hit at all.
+
+It does **not** wrap. Silently going back to the top when you ask for the next
+error is how you read the same error twice and conclude there are two; the end
+of the log is reported instead. A *find* does wrap, because a search is a set of
+places in the file and going round is how you check you have seen them all.
+
+**Dragging a time range on the timeline strip** (FR-48) sets the time window of
+the filter. The strip has one button, so the gesture is split by movement: a
+click seeks (as it did at M5), and a drag past four pixels selects a range and
+stops seeking. Scrubbing is what is given up on that strip, and §8.2 already
+says it is a seek control and not a scrollbar — the minimap is the strip to
+scrub on. The dragged window shades the *excluded* time rather than boxing the
+included time, because the excluded rows are gone from the view and the
+timeline is the only place left that can show how much was put aside.
 
 ---
 
@@ -1844,7 +2069,9 @@ that users are expected to put under version control.
 | UI, painting, all Qt objects | Main thread only |
 | Format detection | Worker thread (I/O-bound, small) |
 | Index build, severity scan, checkpoint build | `ProcessPoolExecutor`, warm at start, writing into memmapped sidecars (§5.3) |
-| Search, tier-2 filter | Worker thread per job, cancellable, chunked, progress reported |
+| Search, tier-2 filter, mark scan | Worker thread per job, cancellable, chunked, progress reported |
+| Tier-1 filter (severity, source, time) | Main thread: vectorised masks and derived checkpoints, applied in the same turn as the click (§11.2) |
+| Export | Main thread, as a generator driven by a zero-delay timer (§11.3) |
 | Watchers | One thread per watcher kind; events queued to the UI thread |
 | SSH I/O | Dedicated thread per connection |
 
@@ -1856,6 +2083,14 @@ Rules:
   published by an atomic generation-counter swap, so a paint always reads a
   consistent snapshot without locking.
 - Paints read memmapped arrays directly; readers never wait on writers.
+- **A worker must not call `session.rows()`.** It mutates the decoded-text LRU
+  and the merge's block cache, so touching it off the main thread is a data
+  race with the paint path on every row. This is the line that decides which
+  job gets a thread: a find, a tier-2 filter and a mark scan read the index
+  arrays and the sources' bytes and write nothing back, so they are safe; an
+  export reads *rows*, so it stays on the main thread and yields between
+  batches instead (§11.3). Added at M7, after it was the first question asked
+  of every new job.
 
 ## 14. Performance plan
 
@@ -2220,6 +2455,64 @@ layer is a sorted array and a pixel column is two `searchsorted`s, so a repaint
 is O(pixels × log hits) and the strips' 3.85 ms re-aggregation (§14.1d) is
 unchanged.
 
+### 14.1g Measured — M7 result (search and filtering)
+
+`python tools/bench.py`, same machine and method as §14.1a–f; the rows are in
+`tools/bench_baseline.json` under `find_*` and `filter_*`.
+
+**Searching** — 64 MB subject, needle absent, which is the shape of a search
+someone is hunting with:
+
+| How | Throughput | Projected 10 GB |
+|---|---|---|
+| `mmap.find`, in place (`LogSource.find`) | **2257 MB/s** | **4.5 s** |
+| `bytes.find` over 4 MB chunks | 1318 MB/s | 7.8 s |
+| fold with `bytes.lower()`, then `bytes.find` | 600 MB/s | 17 s |
+| `re.finditer` with `IGNORECASE` | **88 MB/s** | **1.9 minutes** |
+| `re.finditer`, a literal-prefixed regex | 1406 MB/s | 7.3 s |
+
+**NFR-10 (a literal across a 10 GB merged set in under 5 s) is met, but only
+in place.** Chunked reads give 7.8 s, so `LogSource.find` exists to answer out
+of the mapping and `FileSource` overrides it; the 1.7x is the whole margin. The
+case-insensitive row is the other finding: `re.IGNORECASE` is 15x the same
+literal read the same way, because the fast substring path goes with the flag,
+and ASCII folding recovers 6.8x of it for one extra pass over the bytes. Four
+threads were measured at 1937 MB/s against one thread's 2257 — `mmap.find`
+holds the GIL — so the scan stays single-threaded per source.
+
+**Filtering** — 8 sources, a scattered mask, rates over the *parent's* rows so
+that both arrangements are charged for the same job:
+
+| Rows | Masks | Derive, 10% kept | Derive, 90% kept | Rebuild, 10% | Rebuild, 90% |
+|---|---|---|---|---|---|
+| 2M | 1 ms | 28 ms | 29 ms | 32 ms | 248 ms |
+| 8M | 12 ms | 89 ms | 89 ms | 135 ms | 992 ms |
+| 32M | 49 ms | 324 ms | 330 ms | 547 ms | 3973 ms |
+| 100M (projected) | ~150 ms | **1.0 s** | **1.0 s** | 1.7 s | 12.4 s |
+
+The masks were never the problem, and §11.2 claimed they were the whole of it.
+The cost is the filtered merge's **checkpoint table**, which the original text
+did not mention: rebuilding it is a full k-way merge of the kept rows, so it is
+linear in selectivity and worst for the commonest real filter — "hide DEBUG"
+keeps nearly everything, and there a rebuild is 12.4 s against a derived
+table's 1.0 s. Deriving (§11.2) is selectivity-independent because it is a few
+passes over the keep masks and one `searchsorted` per source per checkpoint.
+
+**NFR-9 (toggle a filter on a 100M-row set in under 500 ms) holds to roughly
+45M rows and not to 100M**, where it is about a second. The remaining cost is
+two passes over 1-byte-per-entry masks, which is a floor for as long as the
+passing set is a materialised mask at all; removing it means ranking the
+*predicate* instead, and that is not worth building before anyone has a
+100M-row set open. Recorded here rather than rounded down, and listed in §14.2.
+
+**What is not measurable here.** Marking a find's hits on the strips is free on
+top of §14.1f: a `MarkLayer` is a sorted time array and a pixel column is two
+`searchsorted`s. Painting the hits in the view re-matches the term over the ~48
+rows on screen, which does not register against the 1.48 ms scroll step of
+§14.1c. Export is bounded by `session.rows()` and the formatter, not by the
+file: 2000-row batches on a zero-delay timer, each a few milliseconds, which is
+what keeps the window live without a thread (§11.3).
+
 ### 14.2 Remaining performance work
 
 In priority order. Native code stays off the table until these are exhausted (D8).
@@ -2252,6 +2545,17 @@ In priority order. Native code stays off the table until these are exhausted (D8
    on a 2 M-entry index (§14.1e). It is inside NFR-8 today and rises linearly
    with how much log is open, so it is the term that decides how large a set can
    be tailed. Below items 1–4 because it breaches nothing yet.
+
+7. **NFR-9 beyond 45M rows (M7).** A filter toggle on a 100M-row set is ~1.0 s
+   against a 500 ms budget (§14.1g). The cost is the per-source keep masks: one
+   byte an entry, written once and then read twice — once to build
+   `Selection`'s sampled prefix sum, and once to rank the parent's checkpoint
+   times. Both passes disappear only if the passing set stops being a
+   materialised mask, which means evaluating the predicate at rank time
+   instead. That is a larger change than it sounds — every `Selection` caller
+   would have to accept a predicate — it buys nothing at the sizes anyone is
+   reading today, and the arrangement it replaced (rebuilding the filtered
+   merge) is 12x worse. Deferred, measured, and written down.
 
 ## 15. Testing
 
@@ -2339,7 +2643,7 @@ dependency may be added without an ADR.
 | **M5** ✅ | Both strips (D4), the density histogram and its sidecar entry | **FR-32 to FR-34 met, and risk R3 is contained with margin**: a scroll repaints both strips in 0.63 ms and a resize re-aggregates them in 3.85 ms, against a 16 ms frame (§14.1d). Rewrote §8.1 twice — the millionth bucket cost 96 MB a source against a "few MB" claim in the same paragraph, and the pass cannot be folded into the chunk loop because the bucket width is not known until the file has been read — and §8.3, whose checkpoint lookup was too coarse and made the minimap invent an idle gap. Found that the frame cost was never in the aggregation but in the per-pixel work after it (5.65 ms a strip, now 0.84), and two Qt defects of the kind SPEC 9.1 already argues about: `Signal(int)` is a 32-bit int, so every timeline seek truncated a `wall_us` and landed on row 0; and a menu built before the window is shown reads `isVisible()` False for a strip that is on. **Done.** |
 | **M6** ✅ | Follow engine, rotation matrix green | **FR-21 to FR-26 met, NFR-8 met with an order of magnitude to spare, NFR-20 measured rather than assumed, and risk R5 is retired.** A tick is ~19 ms against a 200 ms budget, and every structure it touches became incremental: the histogram 1090× cheaper than a rebuild, the checkpoints 381× (§14.1e). Rewrote §7.4, whose four watching mechanisms were premised on polling being too expensive to meet NFR-8 — a probe is 12 µs, so one portable poller at 150 ms costs 0.09% of a core and `ReadDirectoryChangesW` is no longer planned. Rewrote §6.4, which described a fast and a slow path as separate algorithms; one rule produces both, and the pending tail buffer it specified would have traded a measured millisecond for a visible two-second delay on every line. Found four defects that each produced a plausible-looking result: §7.2's table was being tested in its written order, so a writer that appended and *then* rotated was read as an ordinary append and the rotation never noticed; §7.3's partial-line rule was honoured by the line splitter but not by the recorded extent, so a half-written line came back as two rows once finished; an append produced a new `FileIndex` while the merge kept the old object, which looks exactly like following that works except no row ever appears; and the earliest appended entry was being read from the merge's sorted view rather than raw entry order, which resumes far too late on an out-of-order file. Measured that a live mapping makes the writer's own truncating reopen fail (§7.5) and gave up the mapping for followed sources at 4% of a frame. FR-23's "without losing already-read history" is met for rotation and deletion and is stated plainly as unachievable for truncation in place. **Done.** |
 | **M6a** ✅ | Settings dialog, the highlight-rule editor, and rule marks on both strips | **FR-31 complete bar TOML import/export, FR-31a new, FR-52 in part.** Brought forward from M8 because the strips could not say *where* a user's colour should appear. Corrected §8.4, whose severity bands were drawn in ascending class order -- which put the dimmed `NONE` band along the left edge and pushed ERROR and CRITICAL out to the right, so the strip read as right-justified with its most important colours at a position that moved per pixel row. Bands now descend from the left, and a marked rule gets a reserved right-hand gutter rather than overdrawing them. Corrected §10.1's implication that rule count is free: `re` has no DFA, so an alternation costs linearly in its branches -- 439 MB/s for one literal against 0.39 MB/s for the shipped thirty (§14.1f), which is 166 seconds on a 64 MB set. So `session.marks` scans per rule rather than per alternation (2.2x) and marking is opt-in per rule. Found four defects that each looked fine: the rule store dropped `enabled=False`, so a rule switched off came back on at the next start; the lane-width menu actions carried no width, so nothing could ever put their ticks back in step; `MarkLayer.counts` used a half-open final edge and dropped a hit landing on the last entry's timestamp, the same off-by-one §8.2 already records; and the rule form revalidated on only two of the fields its advice depends on, so the warnings about severity and about scan cost appeared only after an unrelated keystroke. **Done.** |
-| **M7** | Search, filters, selection, copy, export | FR-41 to FR-48, NFR-9, NFR-10 |
+| **M7** ✅ | Search, filters, selection, copy, export, and the navigation keys | **FR-41 to FR-48 and FR-46b met; NFR-10 met in place; NFR-9 met to ~45M rows and measured rather than claimed at 100M.** Rewrote §11 on the evidence: three of its claims did not survive a profiler. `re.IGNORECASE` is 15x a case-sensitive literal, so case-insensitive search folds the chunk instead and the Aho-Corasick variant §11.1 specified was never needed; a literal has to be searched *in place* out of the mapping, which is the whole of NFR-10's margin (4.5 s against 7.8 s chunked); and a hit cannot be recorded as a merged row, because a row moves when a source is hidden, a filter changes or a followed file appends in the middle — so hits are `(source, entry)` pairs with rows derived on demand. Corrected §11.2's NFR-9 claim, which accounted for the masks and not for the filtered merge's checkpoints: deriving them from the parent's (`derive_checkpoints`) is selectivity-independent where a rebuild is 12x worse on the commonest real filter (§14.1g). Corrected §11.3's `plain` preset, which M4 had already shipped as the verbatim line for good reason. Found four defects of the kind that look like working code: `ranks_sorted`'s `reduceat` boundary ran its last segment to the end of the mask, so every rank past the first was wrong by whatever the tail contained; `nav.next_row` clamped the starting row to 0 and thereby made a match *on* row 0 unreachable, which is where the first error in a log that failed at startup is; `Hits.locate` was handing rows to hits in hidden and filtered-out sources, so "3 of 18" counted rows the view could not step through; and the find bar reported an invalid regex only once a scan returned, which for an invalid regex is never. Gave Ctrl+F to the find bar and moved following to Ctrl+Shift+F. Fixed two test-harness defects that were hiding behaviour rather than breaking it: a window asked to `deleteLater` was being destroyed in the middle of a *later* test, emptying the Windows clipboard it had taken ownership of, and a second clipboard write in one test needs an event-loop turn before it can be read back. **Done.** |
 | **M8** | Profiles, file association, recent lists; the rest of the settings screen, and the TOML ruleset import/export left over from M4 (§10.1) — the editing dialog itself landed early at M6a | FR-49 to FR-54 |
 | **M9** | Packaging, signing, cold-start tuning, docs | NFR-12, NFR-19. **v1.0** |
 

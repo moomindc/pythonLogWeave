@@ -24,16 +24,24 @@ row-to-pixel mapping O(1) at any file size.
 
 from __future__ import annotations
 
+import re
+
 from PySide6.QtCore import QRect, Qt, Signal
 from PySide6.QtGui import QColor, QFont, QFontMetrics, QGuiApplication, QPainter, QWheelEvent
 from PySide6.QtWidgets import QAbstractScrollArea, QWidget
 
-from ..highlight import Ruleset, default_ruleset
+from ..highlight import RowStyle, Ruleset, Span, Style, default_ruleset
 from ..index.civil import format_wall_us
-from ..index.severity import Severity
 from ..session import Session
 from ..session import palette as pal
-from ..session.rowformat import Preset, RowFormatter
+from ..session.find import Query
+from ..session.overview import ORDINARY
+from ..session.rowformat import (
+    Columns,
+    Preset,
+    RowFormatter,
+    SourceNaming,
+)
 from . import theme
 
 SCROLL_UNITS_MAX = 1_000_000_000
@@ -135,6 +143,22 @@ class MergedLogView(QAbstractScrollArea):
         self._aliases: list[str] = []
         self._alias_w = 0
         self._line_no_w = 0
+
+        self._find: re.Pattern[str] | None = None
+        """
+        The find term, compiled against *displayed* text (FR-44).
+
+        Deliberately a second match rather than a reuse of `find.Hits`. The
+        hits are durable `(source, entry)` pairs -- which entry matched -- and
+        painting needs something they do not carry: where in the decoded,
+        timestamp-trimmed, possibly elided line the characters are. Re-matching
+        is one regex over the ~48 rows on screen, which is nothing next to the
+        bytes a scan reads, and it stays correct when the display changes
+        (timestamp column toggled, multi-line row collapsed) without the scan
+        being told.
+        """
+        self._find_row = -1
+        """The row holding the hit the user is standing on, or -1."""
 
         self.highlights: Ruleset = default_ruleset()
         """
@@ -253,12 +277,30 @@ class MergedLogView(QAbstractScrollArea):
         self._sel = QColor(theme.SELECTION)
         self._stamp = QColor(theme.TIMESTAMP)
         self._stamp_inferred = QColor(theme.TIMESTAMP_INFERRED)
-        self._sev = {k: QColor(v) for k, v in pal.SEVERITY_COLOURS.items()}
-        # A row with no severity word is ordinary text, so it is painted in the
-        # ordinary foreground. The palette's NONE grey is for the severity mark
-        # and the minimap, where it means "nothing here"; applied to the message
-        # it makes every unclassified line -- most of a syslog -- look disabled.
-        self._sev[int(Severity.NONE)] = QColor(theme.FOREGROUND)
+        # Two maps, because the mark and the message are different surfaces,
+        # and both stop colouring at `pal.COLOUR_FROM`.
+        #
+        # `_sev` paints the severity bar in the left gutter. Below the floor it
+        # is the strips' `ORDINARY` grey, and that is not a coincidence: the
+        # gutter mark is the per-row form of a minimap band, so the two have to
+        # agree -- an INFO row whose mark was saturated blue beside a minimap
+        # that draws INFO as ordinary traffic would make the map disagree with
+        # the rows it is a map of. The mark is still *drawn* for those rows, so
+        # "this line says something about its level" is still visible; it just
+        # stops shouting.
+        #
+        # `_sev_text` is what the *message* is painted in, and below the floor
+        # it is the ordinary foreground rather than a grey: a message is read,
+        # not scanned, and dimming most of a file would make it look disabled.
+        quiet = QColor(*ORDINARY)
+        self._sev = {
+            k: (QColor(v) if pal.is_loud(k) else quiet)
+            for k, v in pal.SEVERITY_COLOURS.items()
+        }
+        self._sev_text = {
+            k: (QColor(v) if pal.is_loud(k) else QColor(theme.FOREGROUND))
+            for k, v in pal.SEVERITY_COLOURS.items()
+        }
         self._sev_bg = {k: QColor(v) for k, v in pal.SEVERITY_BACKGROUNDS.items()}
         # Rules carry colours as hex strings, so each distinct one is turned
         # into a `QColor` once and kept. A `QColor` per span per row per frame
@@ -612,6 +654,113 @@ class MergedLogView(QAbstractScrollArea):
         self._anchor_row = 0
         self.set_current_row(max(0, self.session.total_rows - 1), extend=True)
 
+    # ------------------------------------------------------------------
+    # the find term (FR-44)
+    # ------------------------------------------------------------------
+
+    def set_find(self, query: Query | None, current_row: int = -1) -> None:
+        """
+        Mark a query's matches in the message text, and emphasise one of them.
+
+        Pushed in by the window alongside `find.Hits`: the hits say which rows
+        to visit, this says what to paint. A query that cannot compile marks
+        nothing rather than raising -- the find bar is already reporting why.
+        """
+        pattern = None
+        if query is not None and not query.empty and not query.validate():
+            body = query.text if query.regex else re.escape(query.text)
+            try:
+                pattern = re.compile(
+                    body, 0 if query.case_sensitive else re.IGNORECASE)
+            except re.error:
+                pattern = None
+        changed = (pattern.pattern if pattern else None) != (
+            self._find.pattern if self._find else None)
+        self._find = pattern
+        self._find_row = int(current_row)
+        if changed or current_row >= 0:
+            self.viewport().update()
+
+    def set_current_hit(self, row: int) -> None:
+        """Which hit is the current one, for the brighter mark. -1 for none."""
+        if int(row) != self._find_row:
+            self._find_row = int(row)
+            self.viewport().update()
+
+    def _with_find(self, st, text: str, row: int):
+        """
+        `st` with the find's matches laid over its spans.
+
+        Over, not beside: a hit inside a word a rule has already coloured has
+        to win, or searching for a string that a built-in rule paints would
+        appear to find nothing. So the rule spans are **clipped** around the
+        hits rather than merged with them -- `_paint_segments` requires
+        disjoint spans in order, and drawing one over another is the
+        overdraw this view measured at +10.6 ms a frame.
+        """
+        found = [(m.start(), m.end()) for m in self._find.finditer(text)
+                 if m.end() > m.start()]
+        if not found:
+            return st
+        del found[SPAN_LIMIT:]
+        style = Style(bg=theme.FIND_CURRENT if row == self._find_row
+                      else theme.FIND_MARK,
+                      fg=theme.BACKGROUND, bold=row == self._find_row)
+        marks = [Span(a, b, style, rule="find") for a, b in found]
+
+        kept: list[Span] = []
+        for sp in st.spans:
+            at = sp.start
+            for a, b in found:
+                if b <= at or a >= sp.end:
+                    continue
+                if a > at:
+                    kept.append(Span(at, a, sp.style, sp.rule))
+                at = max(at, b)
+            if at < sp.end:
+                kept.append(Span(at, sp.end, sp.style, sp.rule))
+        spans = tuple(sorted(kept + marks, key=lambda sp: sp.start))
+        return RowStyle(line=st.line, spans=spans, rule=st.rule)
+
+    def displayed_columns(self) -> Columns:
+        """
+        Which columns are on screen, for the `As displayed` preset (FR-46b).
+
+        Asked of the view rather than assembled by the caller, so a copy and an
+        export cannot disagree about what "as displayed" means -- and so adding
+        a column later is one change here instead of three at the call sites.
+        """
+        return Columns(timestamp=self._show_timestamp,
+                       alias=self._show_alias,
+                       line_no=self._show_line_no)
+
+    def copy_as(self, preset: Preset, *, naming: SourceNaming | None = None,
+                template: str = "") -> None:
+        """
+        Copy the selection in one of the M7 presets (FR-46b).
+
+        The columns handed to the formatter are the ones the view is actually
+        showing, so `As displayed` pastes what is on screen rather than what
+        the default happened to be -- which is the whole point of that preset,
+        and the reason `Columns` lives in `rowformat` instead of here.
+        """
+        lo, hi = self.selection()
+        count = hi - lo + 1
+        if count > COPY_ROW_LIMIT:
+            self.copyRefused.emit(count)
+            return
+        rows = self.session.rows(lo, count)
+        formatter = RowFormatter(
+            self.session, preset=preset,
+            naming=naming or SourceNaming.BASENAME,
+            micros=True, trim_timestamp=self.trims_timestamp(),
+            columns=self.displayed_columns(),
+            template=template or None)
+        text = formatter.format(rows)
+        if text:
+            QGuiApplication.clipboard().setText(text)
+            self.copied.emit(len(rows))
+
     def copy_selection(self, *, annotated: bool = True) -> None:
         """
         Copy the selected rows, with or without attribution (D9, FR-46a).
@@ -628,17 +777,7 @@ class MergedLogView(QAbstractScrollArea):
         deliberate refusal rather than a silent truncation -- M7's export
         (FR-47) is the right tool for a whole view, and it streams.
         """
-        lo, hi = self.selection()
-        count = hi - lo + 1
-        if count > COPY_ROW_LIMIT:
-            self.copyRefused.emit(count)
-            return
-        rows = self.session.rows(lo, count)
-        preset = Preset.ANNOTATED if annotated else Preset.PLAIN
-        text = RowFormatter(self.session, preset=preset).format(rows)
-        if text:
-            QGuiApplication.clipboard().setText(text)
-            self.copied.emit(len(rows))
+        self.copy_as(Preset.ANNOTATED if annotated else Preset.PLAIN)
 
     def copy_selection_plain(self) -> None:
         """The verbatim lines, no timestamp column and no attribution."""
@@ -795,6 +934,11 @@ class MergedLogView(QAbstractScrollArea):
         trim = self.trims_timestamp()
         texts = [self._row_text(r, trim=trim) for r in rows]
         styles = [self.highlights.style_of(t) for t in texts]
+        if self._find is not None:
+            # After the rules, never instead of them: a hit has to be visible
+            # on a row a rule has already coloured (see `_with_find`).
+            styles = [self._with_find(st, t, r.row)
+                      for st, t, r in zip(styles, texts, rows, strict=True)]
 
         # Pass 1 -- row backgrounds and the severity mark, which is a solid bar
         # in the left gutter so severity is findable by eye without reading the
@@ -857,7 +1001,7 @@ class MergedLogView(QAbstractScrollArea):
             # reason its background does. With no rule, severity still decides,
             # so a file with highlighting switched off looks as it did at M3.
             pen = (self._colour(st.line.fg) if st.line.fg
-                   else self._sev.get(r.severity, self._fg))
+                   else self._sev_text.get(r.severity, self._fg))
             face = self._face(st.line.bold, st.line.italic)
 
             if not st.spans:

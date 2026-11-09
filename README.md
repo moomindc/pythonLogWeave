@@ -13,8 +13,9 @@ Notepad++ DocMonitor — combining what each does well: correct timestamp
 interleaving, a real follow-tail engine, and a GUI that does not fall over on large
 files.
 
-> **Status: M0 complete.** Ground truth and the performance gate exist; the
-> application does not yet. See [Roadmap](#roadmap).
+> **Status: M7 complete.** Merging, following, highlighting, both overview
+> strips, search, filters, copy and export all work; profiles, file association
+> and packaging do not yet. See [Roadmap](#roadmap).
 
 - [`docs/PRD.md`](docs/PRD.md) — product requirements: goals, 55 functional
   requirements, performance budgets, decisions, risks
@@ -167,10 +168,19 @@ like logs, one level deep.
 | Left edge | A severity bar, so errors are findable without reading the level word |
 | Ctrl+C | Copy the selected rows with `app.log:1` attribution |
 | Ctrl+Shift+C | Copy the same rows verbatim — no attribution, no timestamp column |
+| Edit ▸ Copy As | The same rows as a Markdown table, CSV, or exactly as displayed |
 | Ctrl+A | Select all (a copy past 200 000 rows is refused rather than truncated) |
+| Ctrl+E | Export the view, or just the selection, to a file — see below |
+| Ctrl+F | Find as you type: literal or regex, hits marked in the view and on both strips — see below |
+| F3 / Shift+F3 | Next / previous match |
+| Ctrl+Shift+L | Filter: severity, source, time window, contains, does not contain — see below |
+| Ctrl+Shift+K | Clear the filter |
+| Ctrl+G | Go to a timestamp — a whole time, a time of day, or `+5m` from here |
+| F8 / Shift+F8 | Next / previous ERROR or worse (Ctrl+F8 for WARNING or worse) |
+| Alt+Down / Alt+Up | Next / previous row from the file the cursor is on |
 | Ctrl+T | Hide the timestamp column — see below |
 | Ctrl+M / Ctrl+L | Collapse the minimap / the timeline — see below |
-| Ctrl+F | Follow new lines: watch every open file and keep the view at the end — see below |
+| Ctrl+Shift+F | Follow new lines: watch every open file and keep the view at the end — see below |
 | Ctrl++ / Ctrl+- / Ctrl+0 | Text size, also Ctrl+wheel; remembered between runs |
 | Arrows, PgUp/PgDn, Home/End | Move; hold Shift to extend the selection |
 | Scrollbar at the bottom | Scrolls the message only; the line number, timestamp, alias and lanes stay put |
@@ -211,6 +221,38 @@ their own files, which is what you want when pasting into a parser, a diff, or a
 search box that would choke on the prefix. The attribution names the *file*, not
 the alias, so a renamed source is still cited by something a colleague can find.
 
+**Finding (Ctrl+F).** A bar under the view, not a dialog, because a find over a
+log is something you steer: type three characters, look at the count, add two
+more, step through what is left. Matches are marked in amber in the view and in
+their own column on both overview strips, so a term's distribution across the
+whole stream is visible before you have stepped through any of it; the hit you
+are standing on is brighter. **Aa** matches case, **.\*** switches to regex, and
+an unfinished scan says so — the count grows as it reads, and a 10 GB set is
+usable from the first partial result. A hit in a file you have unticked, or on a
+row the filter removed, is counted separately: `12 (6 hidden)`, because "of 18"
+has to mean eighteen places the view can take you.
+
+**Filtering (Ctrl+Shift+L).** Pick severities, pick sources, drag a time range on
+the timeline, type what a line must or must not contain. Everything composes, and
+nothing is re-indexed: clearing a filter is instant because the unfiltered merge
+was kept, not rebuilt. Severity, source and time-window filters apply in the same
+turn as the click; a text filter reads bytes in the background and fills in as it
+goes. Both overview strips redraw for the filter too, so they never advertise
+rows the view will not show.
+
+The count is on screen the whole time it is in force — in the bar and again in
+the status bar — because a filtered view is the one state this application could
+mislead you badly in: every row on screen is true, and the absence of the row you
+are looking for is not. Closing the bar drops the filter with it, for the same
+reason.
+
+**Exporting (Ctrl+E).** The whole view or just the selection, as annotated text,
+exactly-as-displayed text, verbatim lines, a Markdown table, CSV, or your own
+template. The format follows the extension you type until you override it.
+Filters apply, the file is written in batches so a 41-million-row view is fine,
+and the window stays usable with a progress bar and a Stop while it goes. A
+stopped export leaves what it had already written where it is.
+
 **Text size.** Ctrl+wheel, Ctrl+plus and Ctrl+minus between 6 and 32 point, and
 the size is remembered — set it once when you move the window to a different
 monitor, not once a session. Ctrl+0 returns to the shipped 10pt. Zooming keeps
@@ -224,13 +266,20 @@ of line length — so a bold face a fraction wider would displace every span aft
 the first by a growing fraction of a character. Most monospace families keep the
 advance; the ones that do not get the colour and no weight.
 
-**Highlighting.** Three rule sets ship. *Severity* colours the level words.
-*Shapes* picks out the things a stack trace is made of — the exception class
-name, Java and Python frames, `Caused by:` — as spans inside the line rather
-than colouring the whole row. *Syslog* reads `<0>`–`<7>` priorities and is off
-by default, because that prefix is rare outside a raw capture and a rule that
-never fires still costs a branch in the one regex every row is scanned with.
-Which sets are on is remembered.
+**Highlighting.** Three rule sets ship. *Severity* colours the level words —
+**from WARNING up**, and no further down: a healthy service writes almost
+nothing but INFO, so colouring that class too would colour every row, which is
+the same as colouring none. The same floor applies to the severity mark in the
+gutter and to the minimap's bands, so all three agree. The quiet classes are
+still *classified*, so the severity filter, the jump-to-next-error keys and the
+band proportions on the strips are unchanged; what stops is the paint. *Shapes* picks out the
+things a stack trace is made of — the exception class name, Java and Python
+frames, `Caused by:` — as spans inside the line rather than colouring the
+whole row. *Syslog* reads `<0>`–`<4>` priorities, emergency through warning,
+for the same reason the severity set stops there, and is off by default because
+that prefix is rare outside a raw capture and a rule that never fires still
+costs a branch in the one regex every row is scanned with. Which sets are on is
+remembered.
 
 All the enabled rules compile into **one** alternation regex, so a row is
 scanned once however many rules there are, and the result is memoised by the
@@ -262,7 +311,17 @@ of having two.
 The minimap is a **full-width colour map of severity**: every pixel is a bar
 across the whole strip, divided by what is in it, **drawn worst first from the
 left**. CRITICAL starts at the left edge, then ERROR, then WARNING, down to the
-unclassified traffic that fills out the right.
+ordinary traffic that fills out the right.
+
+Only those three are coloured. Everything below WARNING — unclassified rows,
+TRACE, DEBUG, INFO, NOTICE — is drawn in one dim grey just above the
+background, because between them they are nearly every row of nearly every log:
+a saturated blue INFO band floods the strip and leaves the colours that matter
+as a fringe, which is the same mistake as colouring every row of the text. The
+proportions are untouched — every class is still counted separately, so the
+bands are the widths they always were and a severity filter still sees all
+eight — and one grey rather than five dim shades because four greys are not
+distinguishable at two pixels a row.
 
 That order matters, and getting it wrong is what the first version did. Drawn
 the other way — ascending by class — the dim "no level word" band took the left
@@ -336,7 +395,7 @@ Your rules are remembered between runs, globally rather than per profile: a rule
 for finding timeouts is about you, so opening a colleague's profile should not
 take their colours with it — or lose yours.
 
-**Follow mode (Ctrl+F).** Every open file is watched, appended lines appear in
+**Follow mode (Ctrl+Shift+F).** Every open file is watched, appended lines appear in
 the merged view in their correct place, and the view stays at the end. Scroll
 up and auto-scroll pauses — ingestion does not — and the status bar counts what
 has arrived since: press that counter, or `End`, to go back to the tail.
@@ -415,8 +474,8 @@ living record — updated as each lands.
 | **M5** | Minimap and timeline strips | ✅ **done** |
 | **M6** | Follow engine; rotation matrix green | ✅ **done** |
 | **M6a** | Settings screen, the highlight-rule editor, rule marks on both strips | ✅ **done** |
-| **M7** | Search, filters, selection, copy, export | ⬜ next |
-| **M8** | Profiles, file association, recent lists — plus the TOML ruleset import/export still outstanding on FR-31 | ⬜ |
+| **M7** | Search, filters, selection, copy, export, navigation keys | ✅ **done** |
+| **M8** | Profiles, file association, recent lists — plus the TOML ruleset import/export still outstanding on FR-31 | ⬜ next |
 | **M9** | Packaging, signing, cold-start tuning — **v1.0** | ⬜ |
 
 Then: phase 2 Windows Event Log, phase 3 syslog listener.
@@ -1016,14 +1075,14 @@ view, in the right place, while they are rotated, truncated and deleted
 underneath it (FR-21 to FR-26, NFR-8, NFR-20). Risk R5 — rotation handling
 being harder than it looks — is retired.
 
-**Turn it on with Ctrl+F**, or View ▸ Follow New Lines. Scroll up and it pauses
+**Turn it on with Ctrl+Shift+F**, or View ▸ Follow New Lines. Scroll up and it pauses
 and counts what you missed; `End` or the counter puts you back on the tail.
 
 To watch it work, leave the generator running in a second terminal:
 
 ```bash
 python tools/make_test_logs.py                     # make the files
-python -m logweave C:/temp/logweave-logs           # open them, Ctrl+F
+python -m logweave C:/temp/logweave-logs           # open them, Ctrl+Shift+F
 python tools/make_test_logs.py --tail              # in another terminal
 ```
 
@@ -1361,6 +1420,162 @@ and `replace_rule` beside the `add`/`edit_selected` that the buttons call, and
 `ColourButton.set_colour` is the API rather than its click handler. Every
 assertion is about what the dialog settled, never about a dialog being dismissed.
 
+## M7 — what it delivers and what it found
+
+Finding things. A find bar that searches every open file as you type, a filter
+bar that takes rows away and says how many, the navigation keys that get you to
+the next error or the next line of *this* file, a time range you can drag on the
+timeline, six copy formats, and an export that streams a 41-million-row view to
+disk without ever holding more than two thousand rows.
+
+| Key | What it does |
+|---|---|
+| **Ctrl+F** | Find — incremental, literal or regex, case-sensitive on request |
+| **F3** / **Shift+F3** | Next / previous match (wraps) |
+| **Ctrl+Shift+L** | Filter: severity, source, time window, contains, does not contain |
+| **Ctrl+Shift+K** | Clear the filter |
+| **Ctrl+G** | Go to timestamp — a whole time, a time of day, or `+5m` |
+| **F8** / **Shift+F8** | Next / previous ERROR or worse (**Ctrl+F8** for WARNING or worse) |
+| **Alt+Down** / **Alt+Up** | Next / previous row from the file the cursor is on |
+| **Ctrl+E** | Export the view, or just the selection |
+| **Edit ▸ Copy As** | Annotated, as displayed, plain, Markdown table, CSV |
+| drag on the timeline | Set the time filter to what you dragged over (a click still seeks) |
+
+**Following moved to Ctrl+Shift+F.** Ctrl+F is the find key in every other
+application a log reader has open, and someone who presses it expecting a search
+box and instead gets the view dragged to the tail has lost their place in
+exchange for something they did not ask for.
+
+### Three of the spec's claims did not survive a profiler
+
+**Case-insensitive search is a different algorithm, not a flag.** §11.1 said "a
+compiled regex, or a cased-variant Aho-Corasick for long patterns". A compiled
+regex with `IGNORECASE` scans at **88 MB/s** against **1318 MB/s** for the same
+literal read the same way: the flag gives up `re`'s fast substring path and
+compares character by character. On NFR-10's 10 GB set that is 1.9 minutes
+rather than 7.8 seconds. Folding the chunk with `bytes.lower()` and searching
+for a pre-folded needle costs one extra pass over the bytes and gets 6.8x of it
+back. The Aho-Corasick automaton was never needed: there is one needle, not a
+set. The price is that the fold is ASCII-only, which is written down where
+someone will meet it rather than in a release note.
+
+**A literal has to be searched in place.** Reading 4 MB chunks and calling
+`bytes.find` is 1318 MB/s — 7.8 seconds on 10 GB, against NFR-10's five. Asking
+the memory mapping directly (`mmap.find`, no copy at all) is 2257 MB/s and 4.5
+seconds. So `LogSource.find` exists as an interface method with a
+read-and-search default, `FileSource` overrides it to answer out of its mapping,
+and the 1.7x *is* the margin. Four threads were measured at 1937 MB/s against
+one thread's 2257 — `mmap.find` holds the GIL — so the scan stays
+single-threaded per source and the second core would need processes to help.
+
+**A hit cannot be a row number.** §11.1 said hits are "recorded as merged row
+indices in a growable array". A row index is not a property of a hit: it moves
+when a source is switched off (FR-9), when a filter is applied (FR-45), and when
+a followed file appends in the middle (SPEC §6.4). So a hit is stored as the
+`(source, entry)` pair it really is, and its row is **derived** on demand — k
+vectorised `searchsorted`s — and re-derived whenever the merge changes. That is
+also what makes a hit in a hidden source cheap to bring back: showing the file
+again re-derives a row for it without reading a byte.
+
+### NFR-9 was half-costed, and still is not met at 100M rows
+
+§11.2 said a filtered `MergeIndex` is "simply one built over masked cursor
+arrays… a handful of vectorised passes — this is what meets NFR-9 (< 500 ms)".
+The masks are indeed a handful of passes. What the sentence left out is that the
+filtered merge then has to **build its checkpoint table**, and that is a full
+k-way merge of every row it kept.
+
+The filtered merged order is a *subsequence* of the unfiltered one — the same
+entries under the same sort key, with some removed — so every checkpoint of the
+parent is also a cut through the filtered order. All that changes is the
+arithmetic: each cursor becomes the kept entries before that cut, and the row
+becomes the sum of the cursors. `MergeIndex.derive_checkpoints` does that, and a
+property test holds the derived table against a from-scratch build over twelve
+seeds of random masks, ties and skews — because a merge whose order depended on
+how it was built would be the worst defect this design can have.
+
+Measured over eight sources, charged against the *parent's* rows so both
+arrangements answer for the same job:
+
+| Rows | Derive, 10% kept | Derive, 90% kept | Rebuild, 10% | Rebuild, 90% |
+|---|---|---|---|---|
+| 2M | 28 ms | 29 ms | 32 ms | 248 ms |
+| 8M | 89 ms | 89 ms | 135 ms | 992 ms |
+| 32M | 324 ms | 330 ms | 547 ms | 3973 ms |
+| 100M (projected) | **1.0 s** | **1.0 s** | 1.7 s | 12.4 s |
+
+Deriving does not care how much the filter keeps; rebuilding cares enormously,
+and the commonest real filter — "hide DEBUG" — keeps nearly everything. That is
+where the rebuild is 12x worse, which is the case the original text implicitly
+priced at nothing.
+
+And **NFR-9's 500 ms holds to about 45M rows, not to 100M**, where a toggle is
+about a second. The remaining cost is two passes over one-byte-per-entry keep
+masks. Removing them means ranking the predicate instead of a materialised mask,
+which is a bigger change than it sounds and buys nothing at the sizes anyone is
+reading today. It is in SPEC §14.2 as item 7, with the measurement, rather than
+rounded down to a pass.
+
+### Four defects that looked like working code
+
+**`ranks_sorted` was wrong by whatever the tail contained.** `Selection` answers
+"how many kept entries are before this position" for a whole array of positions
+at once, with `np.add.reduceat` over the keep mask. `reduceat` treats its last
+index as "from here to the end of the array", so the final segment ran to the end
+of the mask instead of stopping at the last position asked about — every rank
+past the first was inflated by the kept entries in the tail. It only shows up
+when the positions do not happen to end at the array's end, which is to say in
+production and not in the first test.
+
+**A match on row 0 was unreachable.** `nav.next_row` clamped its starting row
+into `[0, total]` and then searched strictly forward. With a floor of 0, "find
+the next error from the top of the file" skipped an error *on* row 0 — which is
+exactly where the first error lives in a log from a service that failed at
+startup. The floor is -1, and the reason is a comment in the code and a test with
+the needle on row 0.
+
+**"3 of 18" counted rows the view could not reach.** `Hits.locate` derives a row
+for every hit. For a hit in a source that is switched off, or on a row a filter
+removed, there is no row to derive — and the first version gave it one anyway, so
+stepping through the hits visited rows that merely happened to take their place.
+Now an unreachable hit gets no row, stays in the `(source, entry)` arrays so it
+comes back for free, and is counted as `hidden`: the bar says `12 (6 hidden)`
+because "of 18" has to mean eighteen places this view can actually take you.
+
+**An invalid regex was reported only when a scan finished.** The find bar's label
+was refreshed from the scan result. An invalid regex never produces one, so the
+complaint never arrived: the box sat there looking like a search that had found
+nothing. It now refreshes on every keystroke, which is also what stops a stale
+count describing a term you have already changed.
+
+### Export is on the UI thread on purpose
+
+Reading rows means `session.rows()`, which mutates the decoded-text LRU and the
+merge's block cache. A find or a mark scan is safe on a worker thread precisely
+because it touches neither — it reads the index arrays and the raw bytes and
+writes nothing back. An export cannot be, so it is a generator that yields after
+every 2000 rows, driven by a zero-delay `QTimer`: the event loop runs between
+batches, the window stays scrollable and cancellable, and there is not a single
+lock anywhere in it. A cancelled export leaves the part-written file on disk,
+because deleting what you asked for is not the exporter's decision.
+
+### Two of the fixes were in the test harness
+
+**A destroyed window was emptying the clipboard — in the middle of a later
+test.** Two copy tests passed alone and failed in the suite, with the *second*
+clipboard write in the process reading back as empty. `deleteLater` only posts
+the destruction, and these tests rarely run an event loop, so a window dropped by
+one test was being destroyed somewhere inside the next one — and on Windows,
+destroying the window that owns the clipboard empties it. An autouse fixture now
+drains deferred deletions at the end of each test. It had been failing at HEAD
+before M7 began; nothing in the application was wrong.
+
+**A second clipboard write in one test needs an event-loop turn.** Taking
+clipboard ownership again sends the previous owner — this same process — a
+`WM_DESTROYCLIPBOARD`, which arrives as a posted message and drops the data Qt is
+holding. The application always has an event loop, so only a test can see it;
+`copied_text` is the helper that pumps one, with the explanation attached.
+
 ## Layout
 
 ```
@@ -1391,6 +1606,7 @@ logweave/
     appending.py     indexing an appended region, without splitting its last line
   merge/       layer 3: k-way merge over the indexes, Qt-free
     mergeindex.py    checkpointed cursors, block cache, random access by row
+    selection.py     a filter's passing set: one byte a row, O(1) rank
   session/     layer 4: what the UI asks for, still Qt-free
     session.py       open files, rebuild the merge, hand out decoded rows
     prepare.py       warm the cache in worker processes, before opening
@@ -1400,6 +1616,11 @@ logweave/
     aliasing.py      shortest distinguishing source names, for the column and copy
     follow.py        the follow engine: append, rotate, truncate, go stale
     marks.py         where a marked rule's hits are, as merged timestamps
+    scan.py          the byte-scan kernels a mark, a find and a filter share
+    find.py          FR-44's search; hits as (source, entry), rows derived
+    filters.py       FR-45's two tiers, and the strips' filtered histograms
+    nav.py           next error, next line of this file, and "+5m"
+    export.py        FR-47, as a generator so the UI thread can drive it
   highlight/   layer 5 by number, Qt-free by rule: the rules, not the colours
     rules.py         HighlightRule, Ruleset, the one-pass compiled scanner
     builtins.py      the shipped rulesets: severity, shapes, syslog, and yours
@@ -1414,6 +1635,11 @@ logweave/
     settingsdialog.py  the settings window: appearance, and the rule list
     ruledialog.py    one rule's form, validated while you type
     markscan.py      the mark scan on a worker thread, superseded not queued
+    findbar.py       the find strip: a box, two toggles, and the count
+    filterbar.py     the filter strip, and what it is keeping out of the view
+    findscan.py      the find and tier-2 filter scans, off the UI thread
+    gotodialog.py    "go to timestamp", over nav.parse_time
+    exportdialog.py  the export form, and the timer that writes the file
     theme.py         fonts, chrome colours, stylesheet
     app.py           QApplication entry point
 tools/

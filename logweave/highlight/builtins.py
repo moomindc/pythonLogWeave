@@ -10,7 +10,7 @@ switch:
 * **shapes** -- what an exception and a stack frame *look* like, which is how a
   Java trace or a Python traceback gets found in a file whose own lines carry no
   level word at all.
-* **syslog** -- `<0>`-`<7>` priorities, for a file written by syslog rather than
+* **syslog** -- `<0>`-`<4>` priorities, for a file written by syslog rather than
   by an application framework.
 
 The colours come from `session.palette`, not from here, so severity has one
@@ -22,6 +22,25 @@ Why the severity rules are `line` scope and the shapes mostly `match`: a line
 with ERROR in it *is* an error, and the eye should find the whole row. A stack
 frame is a line of ordinary text in which one part -- the file and line -- is
 worth picking out.
+
+## Only WARNING and above are coloured
+
+`palette.COLOUR_FROM` is the floor, and it is shared with the severity mark and
+the minimap so that all three agree. Colouring INFO, NOTICE, DEBUG and TRACE as
+well means colouring *every* row of an ordinary log -- a healthy service writes
+almost nothing else -- and a view in which everything is coloured is a view in
+which nothing stands out. It also spends the reader's attention on the lines
+they are not looking for.
+
+So the quiet classes keep their rule, with its `severity`, and give up only
+their paint: the word is still classified, so the left-hand severity mark, the
+minimap, the timeline and every filter that names a severity go on working
+exactly as before. What changes is the message text, which stays in the
+ordinary foreground until there is something worth saying about it.
+
+`SEVERITY_BACKGROUNDS` reached the same conclusion about row tints a milestone
+earlier -- "tinting INFO too would mean every row is tinted, which is the same
+as none being tinted" -- and this is that argument applied to the foreground.
 """
 
 from __future__ import annotations
@@ -62,10 +81,16 @@ def _severity_rules() -> list[HighlightRule]:
     ERROR" comes out as the error it is talking about rather than the warning
     it is logged as. That is a judgement call and it is the useful one: the
     reason to colour a row is to find the worst thing on it.
+
+    Below `pal.COLOUR_FROM` a rule carries no colour at all -- see the module
+    docstring. It is still a rule, and it still carries its `severity`, which
+    is what the minimap and the severity filter are built on; it simply leaves
+    the text alone.
     """
     out: list[HighlightRule] = []
     for level, words in DEFAULT_WORDS.items():
         sev = Severity(level)
+        loud = pal.is_loud(sev)
         for word in words:
             out.append(HighlightRule(
                 name=f"severity:{word.lower()}",
@@ -74,8 +99,8 @@ def _severity_rules() -> list[HighlightRule]:
                 word_boundary=True,
                 case_sensitive=False,
                 scope="line",
-                fg=pal.severity_colour(sev),
-                bg=pal.severity_background(sev),
+                fg=pal.severity_colour(sev) if loud else None,
+                bg=pal.severity_background(sev) if loud else None,
                 bold=sev >= Severity.ERROR,
                 priority=int(sev) * 10,
                 severity=sev,
@@ -136,19 +161,42 @@ def _shape_rules() -> list[HighlightRule]:
     ]
 
 
+PRIORITY_SEVERITY = {
+    0: Severity.CRITICAL,   # emergency: system is unusable
+    1: Severity.CRITICAL,   # alert: action must be taken immediately
+    2: Severity.CRITICAL,   # critical
+    3: Severity.ERROR,
+    4: Severity.WARNING,
+    5: Severity.NOTICE,
+    6: Severity.INFO,
+    7: Severity.DEBUG,
+}
+"""
+RFC 5424's eight priorities onto the eight classes (D11).
+
+Numbered the opposite way round -- 0 is emergency, 7 is debug -- and `NOTICE`
+exists in the class list precisely so this maps without loss. Emergency, alert
+and critical all land on `CRITICAL`, which is the one place the mapping loses
+anything: three numbers for "the machine is in trouble" against one class, and
+nothing in the view would do differently for them.
+"""
+
+
 def _syslog_rules() -> list[HighlightRule]:
     """
-    Syslog priorities, `<0>` to `<7>`.
+    Syslog priorities, `<0>` to `<4>`.
 
-    RFC 5424 numbers them the opposite way round from the eight classes -- 0 is
-    emergency, 7 is debug -- and `NOTICE` exists in the class list precisely so
-    this maps without loss (D11).
+    Only the loud half, for the reason the module docstring gives: `<5>`,
+    `<6>` and `<7>` are notice, informational and debug, which is most of a
+    syslog, and a rule that colours most of a file is one that hides the rest.
+    They are not written as uncoloured rules either -- unlike the severity
+    words they carry no `severity` (a regex cannot reach the index-time
+    classifier, see `HighlightRule.severity`), so an uncoloured one would do
+    nothing at all while still costing a branch in the regex every row is
+    scanned with.
     """
-    mapping = {
-        0: Severity.CRITICAL, 1: Severity.CRITICAL, 2: Severity.CRITICAL,
-        3: Severity.ERROR, 4: Severity.WARNING, 5: Severity.NOTICE,
-        6: Severity.INFO, 7: Severity.DEBUG,
-    }
+    mapping = {pri: sev for pri, sev in PRIORITY_SEVERITY.items()
+               if pal.is_loud(sev)}
     return [
         HighlightRule(
             name=f"syslog:<{pri}>",

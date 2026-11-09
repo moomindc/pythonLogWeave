@@ -19,11 +19,11 @@ from logweave.session import Session
 from logweave.session.marks import (
     MAX_HITS,
     MarkLayer,
-    _chunks,
     marking_rules,
     scan,
     scan_key,
 )
+from logweave.session.scan import chunks as _chunks
 
 US = 1_000_000
 
@@ -168,16 +168,16 @@ def test_a_hit_on_a_chunk_seam_is_found_once(tmp_path, monkeypatch):
     enough here that the file is dozens of chunks, which is the only way to
     exercise a seam without writing a four-megabyte fixture.
     """
-    import logweave.session.marks as marks
+    import logweave.session.scan as scanmod
 
     rows = [(s, f"row {s} needle" if s % 7 == 0 else f"row {s}")
             for s in range(400)]
     path = write_log(tmp_path / "seams.log", rows)
     s = session_over(path)
-    monkeypatch.setattr(marks, "CHUNK_BYTES", 256)
-    chunks = list(marks._chunks(np.asarray(s.sources[0].index.off, dtype=np.int64)))
+    monkeypatch.setattr(scanmod, "CHUNK_BYTES", 256)
+    chunks = list(_chunks(np.asarray(s.sources[0].index.off, dtype=np.int64)))
     assert len(chunks) > 10, "the point of the test is many seams"
-    layer = marks.scan(s, [rule(pattern="needle")]).layers[0]
+    layer = scan(s, [rule(pattern="needle")]).layers[0]
     assert layer.hits == len([x for x in range(400) if x % 7 == 0])
     s.close()
 
@@ -200,7 +200,7 @@ def test_a_single_entry_larger_than_a_chunk_is_its_own_chunk(tmp_path, monkeypat
     range rather than an empty one, which would read as a chunk of no bytes
     and skip the entry entirely.
     """
-    import logweave.session.marks as marks
+    import logweave.session.scan as scanmod
 
     path = tmp_path / "huge.log"
     path.write_text(
@@ -208,9 +208,9 @@ def test_a_single_entry_larger_than_a_chunk_is_its_own_chunk(tmp_path, monkeypat
         "2026-10-04 10:00:01.000000 INFO " + ("x" * 4000) + " needle\n"
         "2026-10-04 10:00:02.000000 INFO small again\n", encoding="utf-8")
     s = session_over(path)
-    monkeypatch.setattr(marks, "CHUNK_BYTES", 64)
+    monkeypatch.setattr(scanmod, "CHUNK_BYTES", 64)
     off = np.asarray(s.sources[0].index.off, dtype=np.int64)
-    chunks = list(marks._chunks(off))
+    chunks = list(_chunks(off))
     assert all(hi > lo for lo, hi in chunks)
     assert chunks[-1][1] == int(off[-1])
     s.close()

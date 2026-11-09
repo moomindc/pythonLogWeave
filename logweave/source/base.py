@@ -239,6 +239,29 @@ class LogSource(ABC):
     @abstractmethod
     def identity(self) -> SourceIdentity: ...
 
+    def find(self, needle: bytes, start: int, end: int) -> int:
+        """
+        Lowest offset of ``needle`` within ``[start, end)``, or -1 -- NFR-10.
+
+        Overridable because a source that holds a mapping can answer it
+        **without copying the bytes out**, and that is the difference between
+        meeting NFR-10 and missing it. Measured on a 64 MB subject (SPEC 14.1g):
+        a case-sensitive literal scans at 2.07 GB/s in place against 1.27 GB/s
+        through 4 MB ``read_range`` chunks, where a third of the cost is the
+        copy. Ten gigabytes is 4.9s one way and 8.1s the other, against a 5s
+        budget.
+
+        The default is the chunk-free honest answer for any source: read the
+        range and search it. It is only ever asked for a literal, because for a
+        regex or a case-folded pass the bytes have to come out anyway.
+        """
+        start, end = max(0, int(start)), int(end)
+        if end <= start or not needle:
+            return -1
+        buf = self.read_range(start, end)
+        at = buf.find(needle)
+        return -1 if at < 0 else start + at
+
     def data_start(self) -> int:
         """
         First byte of actual content, for a source with a prologue to skip.

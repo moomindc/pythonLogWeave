@@ -327,6 +327,27 @@ def selected(view, lo: int, hi: int) -> None:
     view.set_current_row(hi, extend=True)
 
 
+def copied_text(view, *, annotated: bool) -> str:
+    """
+    Copy, let Qt settle, and read the clipboard back.
+
+    The event-loop turn is the point. Qt takes ownership of the Windows
+    clipboard when it writes to it, and writing a *second* time re-takes that
+    ownership -- which sends the previous owner (this same process) a
+    `WM_DESTROYCLIPBOARD`, and Qt's handler for it drops the data it is
+    holding. The message is posted, not delivered inline, so with no event loop
+    running it arrives after the test has already read the clipboard and the
+    read comes back empty.
+
+    The application always has an event loop, so only a test can see this. Use
+    this helper rather than reading the clipboard directly whenever a test
+    copies more than once.
+    """
+    view.copy_selection(annotated=annotated)
+    QGuiApplication.processEvents()
+    return QGuiApplication.clipboard().text()
+
+
 def test_copy_with_attribution_names_the_file_and_line(window, view):
     """
     D9, in the user's own wording: "line 1 app.log line 7 SOA.log". The whole
@@ -363,10 +384,8 @@ def test_plain_text_carries_no_attribution(window, view):
 
 def test_the_two_modes_differ_by_what_is_put_in_front(window, view):
     selected(view, 2, 2)
-    view.copy_selection(annotated=False)
-    plain = QGuiApplication.clipboard().text()
-    view.copy_selection(annotated=True)
-    annotated = QGuiApplication.clipboard().text()
+    plain = copied_text(view, annotated=False)
+    annotated = copied_text(view, annotated=True)
 
     assert plain != annotated
     assert len(annotated) > len(plain)

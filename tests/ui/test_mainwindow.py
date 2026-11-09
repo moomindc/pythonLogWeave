@@ -246,3 +246,53 @@ def test_close_all_empties_the_window_without_destroying_it(window, corpus):
     # and it still works afterwards
     window.open_paths([corpus / "basic" / "app.log"])
     assert window.session.total_rows > 0
+
+
+def test_no_shortcut_is_claimed_twice(window):
+    """
+    Qt answers an ambiguous shortcut by doing nothing.
+
+    When two bindings in the same window resolve to one sequence, pressing it
+    logs `QAction::event: Ambiguous shortcut overload: F3` to stderr and fires
+    neither action -- so the feature is simply dead, with the only evidence on
+    a console nobody is reading. M7 shipped exactly that: `StandardKey.FindNext`
+    expands to **F3 and Ctrl+G** on Windows, so listing it beside an explicit
+    F3 bound F3 twice on one action, and its Ctrl+G collided with Go to
+    Timestamp.
+
+    So the whole window is swept here rather than each shortcut being asserted
+    where it is set: the defect is a *collision*, which no single action can
+    see, and a standard key can quietly start resolving to something new on a
+    platform or a Qt version nobody tested on.
+    """
+    from collections import defaultdict
+
+    from PySide6.QtGui import QAction
+
+    owners: dict[str, list[str]] = defaultdict(list)
+    for act in window.findChildren(QAction):
+        name = act.text() or act.objectName() or "<unnamed>"
+        for seq in act.shortcuts():
+            key = seq.toString()
+            if key:
+                owners[key].append(name)
+
+    clashes = {key: who for key, who in owners.items() if len(who) > 1}
+    assert not clashes, f"ambiguous shortcuts: {clashes}"
+
+
+def test_the_m7_keys_are_bound_where_the_readme_says(window):
+    """The ones a reader is told to press, spelled as Qt reports them."""
+    expected = {
+        "Ctrl+F": window.find_act,
+        "F3": window.find_next_act,
+        "Shift+F3": window.find_prev_act,
+        "Ctrl+Shift+L": window.filter_act,
+        "Ctrl+Shift+K": window.clear_filter_act,
+        "Ctrl+G": window.goto_act,
+        "Ctrl+E": window.export_act,
+        "Ctrl+Shift+F": window.follow_act,
+    }
+    for key, act in expected.items():
+        assert key in [s.toString() for s in act.shortcuts()], \
+            f"{act.text()} does not answer {key}"

@@ -68,16 +68,15 @@ from dataclasses import dataclass
 import numpy as np
 
 from ..highlight.rules import SCAN_LIMIT, HighlightRule
+from .scan import (
+    Needle,
+    ScanProgress,
+    byte_oriented,
+    scan_source,
+    source_codec,
+)
 
-CHUNK_BYTES = 4 * 1024 * 1024
-"""
-How much of a source is read at once.
-
-Entry-aligned, always: chunk boundaries are placed at entry boundaries from
-`FileIndex.off`, so no match can straddle one and there is no overlap window to
-get wrong. An entry larger than this becomes a chunk of its own -- the corpus
-has a 1 MB single line and a pathological file could have a bigger one.
-"""
+__all__ = ["MAX_HITS", "MarkLayer", "MarkScan", "marking_rules", "scan", "scan_key"]
 
 MAX_HITS = 200_000
 """
@@ -287,23 +286,26 @@ def _bytes_pattern(rule: HighlightRule, ss) -> tuple[re.Pattern | None, str]:
     first would mean a character offset with no way back to an entry, and
     decoding per entry instead would mean a Python loop over millions of them.
 
-    Two sources refuse:
+    A rule is compiled as a regex even when its pattern is a plain word, which
+    is the one place this differs from `session.find`: a rule's `regex_source`
+    is already a regex -- it carries the word-boundary and case flags the rule
+    editor set -- so there is no literal to hand to the faster path. Two
+    sources refuse:
 
-    * **A UTF-16 or UTF-32 source.** Its bytes are not a byte-oriented
-      encoding of the pattern, and `terminator_width` is exactly the test --
-      `source.encoding` derives it from the codec, so a width above 1 means the
-      text is wider than a byte. Rather than scan it wrongly, the source is
-      reported. This is also the only place in the engine that would have cared,
-      because everything else treats a file as bytes and decodes on demand.
+    * **A UTF-16 or UTF-32 source.** Its bytes are not a byte-oriented encoding
+      of the pattern (`scan.byte_oriented`). Rather than scan it wrongly, the
+      source is reported. This is also the only place in the engine that would
+      have cared, because everything else treats a file as bytes and decodes on
+      demand.
     * **A pattern the source's codec cannot hold**, e.g. a rule containing a
       character that is not in cp1252 against a cp1252 log. There is nothing in
       those bytes that could match it, so the honest answer is to say so.
     """
-    info = getattr(ss.source, "encoding_info", None)
-    if info is not None and info.terminator_width != 1:
+    if not byte_oriented(ss):
+        info = ss.source.encoding_info
         return None, f"{info.name} is not byte-oriented, so it is not scanned"
 
-    codec = info.name if info is not None else "utf-8"
+    codec = source_codec(ss)
     try:
         body = rule.regex_source().encode(codec)
     except (LookupError, UnicodeEncodeError):
@@ -321,70 +323,28 @@ def _scan_source(pattern: re.Pattern, ss, *, progress, done: int, total: int,
     """
     One rule over one source. Returns (timestamps, hit the cap, bytes read).
 
-    The mapping from a match to a row is three vectorised steps and no loop
-    over entries:
-
-    1. `searchsorted(off, starts, "right") - 1` -- which entry each match is in.
-    2. `starts - off[entry] < SCAN_LIMIT` -- drop a match too deep into an entry
-       for the view to have coloured it.
-    3. `unique` -- an entry matching twice is still one row.
+    The scan itself and the match-to-entry arithmetic are `session.scan`'s,
+    shared with find and with text filters; what is left here is turning the
+    entries into the merged *timestamps* a `MarkLayer` holds, and applying the
+    source's skew.
     """
-    index = ss.index
-    off = np.asarray(index.off, dtype=np.int64)
-    skew = int(ss.meta.skew_us)
-    read = 0
-    entries: list[np.ndarray] = []
-    hits = 0
-    capped = False
-
-    for lo, hi in _chunks(off):
-        if cancelled is not None and cancelled():
-            break
-        raw = ss.source.read_range(lo, hi)
-        read += hi - lo
-        starts = np.fromiter((m.start() for m in pattern.finditer(raw)),
-                             dtype=np.int64)
-        if starts.size:
-            hits += int(starts.size)
-            starts += lo
-            where = np.searchsorted(off, starts, side="right") - 1
-            np.clip(where, 0, index.n - 1, out=where)
-            keep = (starts - off[where]) < SCAN_LIMIT
-            if keep.any():
-                entries.append(np.unique(where[keep]))
-        if progress is not None:
-            progress(done + read, total, rule)
-        if hits >= MAX_HITS:
-            capped = True
-            break
-
-    if not entries:
-        return np.empty(0, dtype=np.int64), capped, read
-    rows = np.unique(np.concatenate(entries))
-    return (np.asarray(index.ts, dtype=np.int64)[rows] + skew), capped, read
+    state = ScanProgress(done=done, total=total)
+    rows, state = scan_source(
+        _Compiled(pattern), ss, limit=SCAN_LIMIT, max_hits=MAX_HITS,
+        progress=progress, cancelled=cancelled, state=state, label=rule)
+    read = state.done - done
+    if rows.size == 0:
+        return np.empty(0, dtype=np.int64), state.capped, read
+    ts = np.asarray(ss.index.ts, dtype=np.int64)[rows] + int(ss.meta.skew_us)
+    return ts, state.capped, read
 
 
-def _chunks(off: np.ndarray):
-    """
-    Entry-aligned byte ranges covering the whole indexed extent.
+class _Compiled(Needle):
+    """A rule's compiled bytes pattern as a `scan.Needle`."""
 
-    The cuts are chosen by byte target and then snapped to the entry boundary
-    at or before it, so a match can never straddle a chunk -- which is what
-    removes the overlap window that a fixed-size read would need, and with it
-    the off-by-one that duplicates or loses a hit on the seam.
-    """
-    end = int(off[-1]) if off.size else 0
-    if end <= 0 or off.size < 2:
-        return
-    targets = np.arange(CHUNK_BYTES, end, CHUNK_BYTES, dtype=np.int64)
-    cuts = np.searchsorted(off, targets, side="left")
-    # An entry bigger than a chunk collapses its neighbouring cuts onto the
-    # same boundary, so `unique` leaves it as a chunk of its own rather than
-    # producing an empty range.
-    bounds = np.unique(np.concatenate(
-        [np.array([0], dtype=np.int64), cuts,
-         np.array([off.size - 1], dtype=np.int64)]))
-    for a, b in zip(bounds[:-1], bounds[1:], strict=True):
-        lo, hi = int(off[a]), int(off[b])
-        if hi > lo:
-            yield lo, hi
+    def __init__(self, pattern: re.Pattern):
+        self._pattern = pattern
+
+    def offsets(self, buf: bytes) -> np.ndarray:
+        return np.fromiter((m.start() for m in self._pattern.finditer(buf)),
+                           dtype=np.int64)
