@@ -9,6 +9,7 @@ the layer-4 boundary (SPEC 1).
 
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 
 from PySide6.QtCore import Qt
@@ -31,6 +32,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from .. import profile as pf
 from ..highlight import default_group
 from ..highlight import store as rulestore
 from ..highlight.builtins import USER_SET
@@ -38,12 +40,14 @@ from ..highlight.rules import Ruleset
 from ..index import sidecar
 from ..index.civil import format_wall_us
 from ..index.severity import Severity
-from ..session import Session, nav
+from ..session import Session, nav, timefmt
 from ..session import filters as filtering
+from ..session.bookmarks import Bookmarks
 from ..session.follow import FollowEngine
 from ..session.nav import AT_LEAST
 from ..session.rowformat import PRESET_LABELS, Preset
-from . import settings, theme
+from ..session.timefmt import TimeMode
+from . import association, profileio, settings, theme
 from .exportdialog import ExportDialog, ExportRun
 from .filterbar import FilterBar
 from .findbar import FindBar
@@ -53,6 +57,7 @@ from .gotodialog import GoToTimeDialog
 from .indexing import IndexWorker, start
 from .markscan import MarkScanner
 from .mergedview import MergedLogView
+from .reportpanel import ReportPanel
 from .settingsdialog import SettingsDialog, Settled
 from .strips import MinimapStrip, TimelineStrip
 
@@ -90,6 +95,22 @@ def expand(paths: list[Path]) -> list[Path]:
         else:
             out.append(p)
     return out
+
+
+def _origin_key(origin) -> str:
+    """
+    One comparable name for a file, for "is this already open?" (FR-52).
+
+    Resolved and case-folded, because a retry compares what a profile just
+    resolved against what the session opened a minute ago, and on Windows
+    `C:/Logs/a.log` and `c:/logs/a.log` are the same file. Opening it twice
+    would duplicate every one of its rows in the merge, which reads as the log
+    repeating itself rather than as a mistake in a profile.
+    """
+    try:
+        return str(Path(origin).resolve()).casefold()
+    except OSError:
+        return str(origin).casefold()
 
 
 class AliasDelegate(QStyledItemDelegate):
@@ -194,6 +215,31 @@ class MainWindow(QMainWindow):
         of how this window is being read, and the session knows nothing about
         it. Idle unless a rule asks for marks.
         """
+        self.bookmarks = Bookmarks()
+        """
+        The rows this reader has marked (FR-37).
+
+        On the window rather than the session, like the follow engine and for
+        the same reason: FR-33 allows several windows over the same files, and
+        what one of them has marked is not a fact about the files.
+        """
+        self.profile_path: Path | None = None
+        """The profile this window was opened from, for Save (FR-49)."""
+        self.saved_filters: list = []
+        """
+        The filters the open profile carries, offered on `Search > Saved
+        Filters` (FR-45, FR-49). Empty until a profile that has some is open:
+        this window has no filter library of its own.
+        """
+        self._pending_profile = None
+        """
+        A profile whose files are still indexing.
+
+        Opening is asynchronous (SPEC 5.3), so the aliases, the filter and the
+        bookmarks cannot be installed in the same call that asked for the
+        files -- there is nothing yet to install them on. `_finish_open` picks
+        this up.
+        """
         self.marks.updated.connect(self._marks_ready)
         self.marks.progress.connect(self._marks_progress)
         self.marks.started.connect(self._marks_started)
@@ -225,6 +271,10 @@ class MainWindow(QMainWindow):
         self._build_sources_dock()
         self._build_menus()
         self._build_status()
+        # Both read the store and the window, so they need the menus and the
+        # status bar to exist first.
+        self._refresh_recent_menus()
+        self._refresh_saved_filter_menu()
         self._restore_follow()
         if self._rule_notes:
             # Read before the status bar existed (`_restore_preferences` runs
@@ -276,11 +326,15 @@ class MainWindow(QMainWindow):
         self.filterbar.closed.connect(self.close_filter)
         self.filterbar.cancelRequested.connect(self.filterer.cancel)
 
+        self.report = ReportPanel(self)
+        self.report.retried.connect(self.retry_profile_sources)
+
         centre = QWidget(self)
         stack = QVBoxLayout(centre)
         stack.setContentsMargins(0, 0, 0, 0)
         stack.setSpacing(0)
         stack.addWidget(rows, 1)
+        stack.addWidget(self.report)
         stack.addWidget(self.filterbar)
         stack.addWidget(self.findbar)
 
@@ -477,6 +531,16 @@ class MainWindow(QMainWindow):
         """
         self.view.set_font_point(settings.font_point())
         self.view.set_lane_width(settings.lane_width())
+        self.time_display = settings.time_display()
+        """
+        FR-35: the reader's choice of timestamp format, as plain data.
+
+        Kept here and not in the view because the view holds a *built*
+        formatter: the relative modes need the session's span, which changes
+        when a file is opened or a followed one appends, so the window rebuilds
+        it from this and the session (`_apply_time_display`).
+        """
+        self._apply_time_display()
         self.view.set_show_timestamp(settings.read_bool(settings.SHOW_TIMESTAMP, True))
         self.view.set_show_alias(settings.read_bool(settings.SHOW_ALIAS, False))
         self.view.set_show_line_no(settings.read_bool(settings.SHOW_LINE_NO, False))
@@ -502,6 +566,81 @@ class MainWindow(QMainWindow):
             # must not come back as a name nothing answers to.
             self.highlight_group.active = wanted & set(self.highlight_group.sets)
         self._apply_highlights()
+
+    # ------------------------------------------------------------------
+    # the timestamp column (FR-35)
+    # ------------------------------------------------------------------
+
+    def _apply_time_display(self) -> None:
+        """
+        Build a formatter for the chosen display over the open session.
+
+        Two things come from the session rather than from the reader: elapsed
+        mode's default origin, which is the first row, and the width of a
+        relative column, which is sized from the span so a log covering one
+        afternoon does not reserve a day group it cannot use.
+
+        Called whenever either could have moved -- a file opened or closed, a
+        followed file appended -- and cheap enough to be: the work is compiling
+        one pattern. The guard is not about that cost but about the formatter's
+        per-day cache, which a needless rebuild would throw away on every
+        follow tick.
+        """
+        lo, hi = self.session.time_span()
+        key = (self.time_display, lo, hi)
+        if key == getattr(self, "_time_key", None):
+            return
+        self._time_key = key
+        self.view.set_time_format(timefmt.for_span(
+            self.time_display, span_us=max(0, hi - lo), first_row_us=lo))
+
+    def _set_time_mode(self, mode: TimeMode) -> None:
+        """
+        FR-35, from the View menu. The pattern is left exactly as it was.
+
+        Switching to elapsed keeps whatever zero point this session has
+        already been given, and means "from the first row" if it has none --
+        which is what the sentinel resolves to.
+        """
+        self.time_display = replace(self.time_display, mode=mode)
+        settings.write_time_display(self.time_display)
+        self._apply_time_display()
+        self._update_position(self.view.current_row())
+        self._status_msg.setText(self._time_summary())
+
+    def _set_zero_here(self) -> None:
+        """
+        Measure elapsed time from the row the cursor is on (FR-35).
+
+        Switches to elapsed as well as setting the origin, because setting a
+        zero point in any other mode would change nothing on screen and read
+        as a command that did not work.
+        """
+        if self.session.is_empty:
+            self._status_msg.setText("No rows to measure from")
+            return
+        at = self.session.row_to_time(self.view.current_row())
+        self.time_display = replace(self.time_display, mode=TimeMode.ELAPSED,
+                                    zero_us=at)
+        # Only the mode and the pattern are stored: a zero point is a position
+        # in the log that is open, not a preference (see `settings.TIME_MODE`).
+        settings.write_time_display(self.time_display)
+        self._apply_time_display()
+        self._sync_setting_menus()
+        self._update_position(self.view.current_row())
+        self._status_msg.setText(
+            f"Elapsed time measured from {format_wall_us(at, micros=False)}")
+
+    def _time_summary(self) -> str:
+        """One line saying what the column now shows."""
+        mode = self.time_display.mode
+        if mode is TimeMode.DELTA:
+            return "Timestamps: difference from the row above"
+        if mode is TimeMode.ELAPSED:
+            zero = self.view.time_format.zero_us
+            return ("Timestamps: elapsed from "
+                    f"{format_wall_us(zero, micros=False)}")
+        return f"Timestamps: {self.time_display.pattern}"
 
     def _apply_highlights(self) -> None:
         """
@@ -538,6 +677,12 @@ class MainWindow(QMainWindow):
             show_line_no=self.view.show_line_no,
             show_minimap=self.minimap.isVisibleTo(self),
             show_timeline=self.timeline.isVisibleTo(self),
+            time_display=self.time_display,
+            reopen_last=settings.reopen_last(),
+            # None where there is no such thing to set, which is what disables
+            # the box rather than showing it unticked and lying (FR-53).
+            associate=(association.state() == association.OURS
+                       if association.available() else None),
         )
         dialog = SettingsDialog(self.highlight_group, current=current, parent=self)
         dialog.changed.connect(self._settings_changed)
@@ -561,6 +706,25 @@ class MainWindow(QMainWindow):
         self._line_no_toggled(settled.show_line_no)
         self._set_strips_visible(minimap=settled.show_minimap,
                                  timeline=settled.show_timeline)
+        # The zero point is the dialog's one blind spot (FR-35): it is a row in
+        # the open log, set from the View menu, and a dialog that returned a
+        # display without one would clear it on every Apply.
+        self.time_display = replace(settled.time_display,
+                                    zero_us=self.time_display.zero_us)
+        settings.write_time_display(self.time_display)
+        self._apply_time_display()
+
+        settings.write(settings.REOPEN_LAST, bool(settled.reopen_last))
+        if settled.associate is not None:
+            # Only when the reader moved the box: `Settled.associate` is None
+            # for "leave it alone", so an Apply does not rewrite the registry
+            # every time it is pressed.
+            why = (association.register() if settled.associate
+                   else association.unregister())
+            self._status_msg.setText(
+                why or (f"{pf.SUFFIX} files now open in LogWeave"
+                        if settled.associate
+                        else f"{pf.SUFFIX} association removed"))
 
         self.highlight_group.sets[USER_SET] = Ruleset(settled.user_rules)
         self.highlight_group.active = (
@@ -592,6 +756,8 @@ class MainWindow(QMainWindow):
         ]
         for name, act in self.highlight_acts.items():
             pairs.append((act, name in self.highlight_group.active))
+        for act in getattr(self, "time_acts", []):
+            pairs.append((act, act.data() == self.time_display.mode.value))
         width = self.view.lane_width
         for act in self.lane_acts:
             pairs.append((act, act.data() == width))
@@ -1037,6 +1203,39 @@ class MainWindow(QMainWindow):
         close_act.triggered.connect(self.close_all)
         file_menu.addAction(close_act)
 
+        # FR-54. Two lists rather than one: a reader reopens a *profile* to get
+        # back to an investigation and a *log* to glance at one file, and
+        # mixing them puts the thing they want behind nine of the other kind.
+        self.recent_logs_menu = file_menu.addMenu("Recent &Logs")
+        self.recent_profiles_menu = file_menu.addMenu("Recent Pro&files")
+
+        file_menu.addSeparator()
+        # FR-49 to FR-51. Under File and not under a Profile menu of its own:
+        # a profile is a thing you open and save, and putting it anywhere else
+        # is asking the reader to learn that this application's documents are
+        # not where documents are.
+        self.open_profile_act = QAction("Open &Profile...", self)
+        self.open_profile_act.setShortcut("Ctrl+Shift+O")
+        self.open_profile_act.setStatusTip(
+            "Open a saved session: its files, aliases, colours, filter, "
+            "bookmarks and highlight rules (FR-50)")
+        self.open_profile_act.triggered.connect(self.open_profile_dialog)
+        file_menu.addAction(self.open_profile_act)
+
+        self.save_profile_act = QAction("&Save Profile", self)
+        self.save_profile_act.setShortcut(QKeySequence.StandardKey.Save)
+        self.save_profile_act.setStatusTip(
+            "Save this session -- which files, how they are shown, what is "
+            "filtered and what is bookmarked (FR-49)")
+        self.save_profile_act.triggered.connect(self.save_profile)
+        file_menu.addAction(self.save_profile_act)
+
+        self.save_profile_as_act = QAction("Save Profile &As...", self)
+        self.save_profile_as_act.setShortcut(
+            QKeySequence.StandardKey.SaveAs)
+        self.save_profile_as_act.triggered.connect(self.save_profile_as)
+        file_menu.addAction(self.save_profile_as_act)
+
         file_menu.addSeparator()
         self.export_act = QAction("&Export View...", self)
         self.export_act.setShortcut("Ctrl+E")
@@ -1198,8 +1397,55 @@ class MainWindow(QMainWindow):
         view_menu.addSeparator()
         self._build_zoom_menu(view_menu)
         view_menu.addSeparator()
+        self._build_time_menu(view_menu)
         self._build_lane_menu(view_menu)
         self._build_highlight_menu(view_menu)
+
+    def _build_time_menu(self, view_menu) -> None:
+        """
+        FR-35: what the timestamp column shows, and elapsed mode's origin.
+
+        On the View menu and not only in the settings dialog, for the reason
+        the dialog's own docstring gives: the mode is something a reader flips
+        while reading -- "how long was that gap?" -- and the pattern is
+        something they sit down and set up. So the three modes are here and the
+        pattern is there.
+
+        The zero point is here and *only* here, because it is not a preference
+        at all: it is a row in the log that is open. It needs the cursor to be
+        on that row, which is a thing a dialog cannot see.
+        """
+        menu = view_menu.addMenu("Time&stamps")
+        self.time_acts = []
+        group = QActionGroup(self)
+        group.setExclusive(True)
+        for mode, label, tip in (
+            (TimeMode.ABSOLUTE, "&Clock Time",
+             "The time each line was written"),
+            (TimeMode.ELAPSED, "&Elapsed from Zero Point",
+             "Signed offset from the row set below (FR-35)"),
+            (TimeMode.DELTA, "&Difference from Row Above",
+             "How long passed since the previous row -- what makes a stall "
+             "visible"),
+        ):
+            act = QAction(label, self)
+            act.setCheckable(True)
+            act.setData(mode.value)
+            act.setChecked(self.time_display.mode is mode)
+            act.setStatusTip(tip)
+            act.triggered.connect(lambda _=False, m=mode: self._set_time_mode(m))
+            group.addAction(act)
+            menu.addAction(act)
+            self.time_acts.append(act)
+
+        menu.addSeparator()
+        self.zero_act = QAction("Set &Zero Point Here", self)
+        self.zero_act.setShortcut("Ctrl+Shift+Z")
+        self.zero_act.setStatusTip(
+            "Measure elapsed time from the row the cursor is on, and switch "
+            "the column to elapsed if it is not already")
+        self.zero_act.triggered.connect(self._set_zero_here)
+        menu.addAction(self.zero_act)
 
     def _build_search_menu(self) -> None:
         """
@@ -1292,6 +1538,48 @@ class MainWindow(QMainWindow):
         self.prev_source_act.triggered.connect(
             lambda: self._jump_source(back=True))
         menu.addAction(self.prev_source_act)
+
+        menu.addSeparator()
+        # FR-37, on this menu and not on View: a bookmark is not a way of
+        # showing the log, it is a way of getting back to a line -- the same
+        # thing find and go-to do, with the same keys-not-dialogs shape.
+        #
+        # Ctrl+F2 to set and F2 to step is the Notepad++ and Visual Studio
+        # binding, which is what a reader who uses bookmarks already has in
+        # their fingers. F2 alone would collide with the rename this window
+        # puts on the sources dock if it were the toggle.
+        self.bookmark_act = QAction("&Toggle Bookmark", self)
+        self.bookmark_act.setShortcut("Ctrl+F2")
+        self.bookmark_act.setStatusTip(
+            "Mark this row so it can be found again, and saved with the "
+            "profile (FR-37)")
+        self.bookmark_act.triggered.connect(self.toggle_bookmark)
+        menu.addAction(self.bookmark_act)
+
+        self.next_bookmark_act = QAction("Next &Bookmark", self)
+        self.next_bookmark_act.setShortcut("F2")
+        self.next_bookmark_act.triggered.connect(lambda: self.next_bookmark())
+        menu.addAction(self.next_bookmark_act)
+
+        self.prev_bookmark_act = QAction("Previous Boo&kmark", self)
+        self.prev_bookmark_act.setShortcut("Shift+F2")
+        self.prev_bookmark_act.triggered.connect(
+            lambda: self.next_bookmark(back=True))
+        menu.addAction(self.prev_bookmark_act)
+
+        self.clear_bookmarks_act = QAction("Clear Bookmarks", self)
+        self.clear_bookmarks_act.setShortcut("Ctrl+Shift+F2")
+        self.clear_bookmarks_act.triggered.connect(self.clear_bookmarks)
+        menu.addAction(self.clear_bookmarks_act)
+
+        menu.addSeparator()
+        # FR-45 with FR-49: the filters a profile carries, as commands. Empty
+        # and disabled until a profile that has some is open, which is honest
+        # about where they come from -- this window does not have a filter
+        # library of its own, and should not look as though it does.
+        self.saved_filter_menu = menu.addMenu("&Saved Filters")
+        self.saved_filter_menu.setEnabled(False)
+
         self.search_menu = menu
 
     def _build_zoom_menu(self, view_menu) -> None:
@@ -1415,6 +1703,11 @@ class MainWindow(QMainWindow):
         self._status_follow.setStyleSheet(f"color: {theme.FOLLOW_ACTIVE};")
         self._status_filter = QLabel("")
         self._status_filter.setStyleSheet(f"color: {theme.FILTER_ACTIVE};")
+        self._status_bookmarks = QLabel("")
+        self._status_bookmarks.setStyleSheet(f"color: {theme.BOOKMARK};")
+        self._status_bookmarks.setToolTip(
+            "Bookmarked rows (FR-37). Ctrl+F2 marks this row, F2 steps to the "
+            "next; they are saved with the profile")
         """
         What the filter is keeping out, permanently on show while one is in
         force (FR-45). See `_update_filter_status` for why it is said twice.
@@ -1457,6 +1750,7 @@ class MainWindow(QMainWindow):
         bar.addWidget(self._cancel_btn)
         bar.addWidget(self._export_bar)
         bar.addWidget(self._export_cancel)
+        bar.addPermanentWidget(self._status_bookmarks)
         bar.addPermanentWidget(self._status_filter)
         bar.addPermanentWidget(self._status_follow)
         bar.addPermanentWidget(self._status_span)
@@ -1505,7 +1799,9 @@ class MainWindow(QMainWindow):
             self.open_paths([Path(p) for p in paths])
 
     def open_paths(self, paths: list[Path], *,
-                   background: bool | None = None) -> None:
+                   background: bool | None = None,
+                   options: list | None = None,
+                   formats: dict[str, str] | None = None) -> None:
         """
         Open files and report honestly what happened (FR-19).
 
@@ -1525,12 +1821,15 @@ class MainWindow(QMainWindow):
         """
         if background is None:
             background = self.background_indexing
-        files = expand(paths)
+        # A profile's paths are already resolved, one option per file, so they
+        # are taken as given: expanding them could turn one into several and
+        # leave the options describing the wrong file (FR-50).
+        files = list(paths) if options is not None else expand(paths)
         if not files:
             self._status_msg.setText("nothing to open")
             return
         if not background or not self.session.use_cache:
-            self._finish_open(files)
+            self._finish_open(files, options=options)
             return
 
         if self._worker is not None:
@@ -1542,10 +1841,12 @@ class MainWindow(QMainWindow):
                 f"indexing... {len(self._queued)} more file(s) queued")
             return
 
-        self._begin_indexing(files)
+        self._begin_indexing(files, options=options, formats=formats)
 
-    def _begin_indexing(self, files: list[Path]) -> None:
+    def _begin_indexing(self, files: list[Path], *, options: list | None = None,
+                        formats: dict[str, str] | None = None) -> None:
         self._pending = files
+        self._pending_options = options
         self._progress.setRange(0, len(files))
         self._progress.setValue(0)
         self._progress.setFormat("%v / %m")
@@ -1554,7 +1855,8 @@ class MainWindow(QMainWindow):
         self._status_msg.setText(f"indexing {len(files)} file(s)...")
 
         self._worker = IndexWorker(files, root=self.session.cache_root,
-                                   use_cache=self.session.use_cache)
+                                   use_cache=self.session.use_cache,
+                                   formats=formats)
         self._worker.progress.connect(self._indexing_progress)
         self._worker.finished.connect(self._indexing_finished)
         self._thread = start(self._worker, self)
@@ -1571,17 +1873,27 @@ class MainWindow(QMainWindow):
         self._cancel_btn.hide()
 
         files, self._pending = self._pending, []
+        options, self._pending_options = getattr(
+            self, "_pending_options", None), None
         if result.cancelled:
             # Whatever finished before the cancel is in the cache and costs
             # nothing to open, so the files that did get indexed are still
             # opened. Nothing is discarded for having been interrupted.
             done = {f.path for f in result.files}
-            files = [p for p in files if str(p) in done]
+            # The options are per file and positional, so they are filtered
+            # with the files rather than alongside them: a cancel that dropped
+            # the third file would otherwise give the fourth file the third's
+            # alias, colour and skew.
+            kept = [(p, o) for p, o in zip(
+                files, options or [None] * len(files), strict=True)
+                if str(p) in done]
+            files = [p for p, _ in kept]
+            options = [o for _, o in kept] if options else None
             self._status_msg.setText("indexing cancelled")
             if not files:
                 return
 
-        self._finish_open(files, prepared=result)
+        self._finish_open(files, prepared=result, options=options)
 
         queued, self._queued = self._queued, []
         if queued:
@@ -1618,8 +1930,9 @@ class MainWindow(QMainWindow):
             self._worker.cancel()
             self._cancel_btn.setEnabled(False)
 
-    def _finish_open(self, files: list[Path], prepared=None) -> None:
-        result = self.session.add_files(files)
+    def _finish_open(self, files: list[Path], prepared=None,
+                     options: list | None = None) -> None:
+        result = self.session.add_files(files, options)
         # A file opened while following is on is followed from the start.
         # `sync` is idempotent, so calling it unconditionally is cheaper to
         # reason about than deciding here whether it is needed.
@@ -1668,6 +1981,16 @@ class MainWindow(QMainWindow):
             "\n".join(f"{p}: {why}" for p, why in result.failed)
             if result.failed else ""
         )
+        # FR-54: only what actually opened, and only when this was not a
+        # profile opening its own files -- a profile is remembered as a
+        # profile, and listing its eight logs individually would push
+        # everything else out of a ten-item menu.
+        if self._pending_profile is None and result.opened:
+            settings.remember_logs(result.opened)
+            self._refresh_recent_menus()
+        # Last, because it installs the filter and the bookmarks over the
+        # session this call has just finished building (FR-50).
+        self._apply_pending_profile()
 
     def clear_cache(self) -> None:
         """
@@ -1725,9 +2048,354 @@ class MainWindow(QMainWindow):
         self.view.set_tailing(False)
         self._new_lines.clear()
         self.follow.set_global_follow(self.follow_act.isChecked())
+        # The bookmarks are `(source, entry)` pairs into files that are no
+        # longer open, so they index a stream that no longer exists -- the same
+        # reason the mark layers go. They are written to the profile on save,
+        # so closing is the one place they can be dropped safely.
+        self.bookmarks.clear()
+        self._sync_bookmarks()
+        # This window is no longer the profile's: Save must ask again rather
+        # than write an empty session over the file it came from.
+        self.profile_path = None
+        self._pending_profile = None
+        self.saved_filters = []
+        self._refresh_saved_filter_menu()
+        self.report.report("", [])
+        self.setWindowTitle("LogWeave")
         self.refresh()
         self._update_follow_status()
         self._status_msg.setText("No logs open")
+
+    # ------------------------------------------------------------------
+    # profiles (FR-49 to FR-53)
+    # ------------------------------------------------------------------
+
+    def open_profile_dialog(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Open Profile", "",
+            f"LogWeave profiles (*{pf.SUFFIX});;All files (*)")
+        if path:
+            self.open_profile(Path(path))
+
+    def open_profile(self, path: Path | str) -> None:
+        """
+        Close what is open and open what the profile names (FR-49, FR-52).
+
+        Closing first, because a profile *is* a session: opening one into the
+        files already on screen would silently merge two investigations, and
+        the reader would be looking at a stream neither of them describes.
+
+        Nothing here raises on a profile that is partly wrong. The file is read
+        and validated, the sources are resolved against the disk as it is this
+        morning, and whatever resolved is opened; everything else goes to the
+        report panel with a Retry (FR-52).
+        """
+        path = Path(path)
+        try:
+            profile = pf.load(path)
+        except pf.ProfileError as exc:
+            self.report.report(f"Could not open {path.name}", [str(exc)],
+                               can_retry=False)
+            self._status_msg.setText(f"{path.name}: {exc}")
+            return
+
+        resolution = pf.resolve(profile)
+        self.close_all()
+        self.profile_path = path
+        self.bookmarks.clear()
+        self.saved_filters = list(profile.filters)
+        self._refresh_saved_filter_menu()
+        settings.remember_profile(path)
+        self._refresh_recent_menus()
+        self.setWindowTitle(f"LogWeave - {profile.name or path.stem}")
+
+        lines = profileio.describe(resolution, profile)
+        self.report.report(
+            f"{path.name}: {resolution.summary()}", lines,
+            can_retry=bool(resolution.missing or resolution.unmatched))
+
+        if not resolution.ok:
+            self._status_msg.setText(
+                f"{path.name}: nothing to open -- {resolution.summary()}")
+            # `profile_path` is kept so Retry still knows which profile it is
+            # retrying, but nothing is pending: there will be no open to finish.
+            return
+
+        # The view preferences go on *before* the files, so the first frame is
+        # already the profile's: a session that appeared in the reader's own
+        # columns and then rearranged itself would look like a fault.
+        profileio.apply_view(self, profile.view)
+        self._pending_profile = profile
+        self.open_paths(resolution.paths,
+                        options=profileio.open_options(resolution),
+                        formats=profileio.forced_formats(resolution))
+
+    def _apply_pending_profile(self) -> None:
+        """
+        The half of opening a profile that needs the files to be there.
+
+        Filters, bookmarks and rules all name sources by alias, so none of them
+        can be installed until the session has the sources to name. Indexing is
+        asynchronous (SPEC 5.3), so this runs at the end of the open rather
+        than at the end of `open_profile`; `background=False` takes the same
+        two steps, which is what keeps the synchronous path from being a
+        special case nobody runs.
+        """
+        profile, self._pending_profile = self._pending_profile, None
+        if profile is None:
+            return
+        notes: list[str] = list(profileio.apply_highlight(self, profile.highlight))
+
+        if profile.filters:
+            filt, why = profileio.to_filter(self, profile.filters[0])
+            notes += why
+            # The bar is opened first so it has the source list to tick, and
+            # `set_filter` then emits once -- which is what runs the scan.
+            self.open_filter()
+            self.filterbar.set_filter(filt)
+
+        notes += self.bookmarks.restore(
+            self.session,
+            [(b.source, b.wall_us, b.line_no, b.note) for b in profile.bookmarks])
+        self._sync_bookmarks()
+        self._reload_source_list()
+        self._update_follow_status()
+
+        if notes:
+            # Appended to whatever the resolve already reported, so one panel
+            # carries everything that did not go to plan rather than a second
+            # list replacing the first.
+            existing = ([ln for ln in self.report.detail.toolTip().splitlines() if ln]
+                        if self.report.isVisibleTo(self) else [])
+            name = self.profile_path.name if self.profile_path else "Profile"
+            self.report.report(f"{name}: opened with notes", existing + notes,
+                               can_retry=bool(self.profile_path))
+
+    def retry_profile_sources(self) -> None:
+        """
+        Resolve the profile's sources again and open whatever has appeared.
+
+        Additive rather than a reopen: a glob that matched nothing at 09:00
+        usually matches at 09:05 because the writer has rotated, and what the
+        reader wants then is the missing file added to the session they are
+        already reading -- not that session torn down and rebuilt around it,
+        losing the scroll position and the filter they had got to.
+        """
+        if self.profile_path is None:
+            self.report.report("", [])
+            return
+        try:
+            profile = pf.load(self.profile_path)
+        except pf.ProfileError as exc:
+            self.report.report("Could not re-read the profile", [str(exc)],
+                               can_retry=False)
+            return
+
+        resolution = pf.resolve(profile)
+        already = {_origin_key(ss.meta.origin) for ss in self.session.sources}
+        fresh = [(path, spec) for path, spec in resolution.opened
+                 if _origin_key(path) not in already]
+        lines = profileio.describe(resolution, profile)
+
+        if not fresh:
+            self.report.report(f"{self.profile_path.name}: nothing new yet", lines)
+            self._status_msg.setText("no new sources have appeared")
+            return
+
+        self.report.report(f"{self.profile_path.name}: {resolution.summary()}",
+                           lines, can_retry=bool(lines))
+        subset = pf.Resolution(opened=fresh)
+        self.open_paths([path for path, _ in fresh],
+                        options=profileio.open_options(subset),
+                        formats=profileio.forced_formats(subset))
+        self._status_msg.setText(
+            f"opened {len(fresh)} source(s) that have appeared since")
+
+    def save_profile(self) -> None:
+        """Save over the profile this window came from, or ask where."""
+        if self.profile_path is None:
+            self.save_profile_as()
+            return
+        self._write_profile(self.profile_path)
+
+    def save_profile_as(self) -> None:
+        start = str(self.profile_path or Path.home() / f"session{pf.SUFFIX}")
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save Profile", start,
+            f"LogWeave profiles (*{pf.SUFFIX});;All files (*)")
+        if path:
+            self._write_profile(Path(path))
+
+    def _write_profile(self, path: Path) -> None:
+        """
+        Capture this window and write it (FR-49).
+
+        The filters written are the profile's own *plus* the one in force,
+        which is what makes "open a profile, adjust the filter, save" do the
+        obvious thing without quietly discarding the other saved views the file
+        came with.
+
+        A profile is a hand-editable file (SPEC 12.1), so a reader may have put
+        comments in it. They cannot survive a rewrite -- see `toml_io` for why
+        this build emits rather than patches -- so what was lost is counted and
+        reported rather than discovered later.
+        """
+        if self.session.is_empty:
+            self._status_msg.setText("nothing to save: no logs are open")
+            return
+        profile = profileio.capture(self, name=profileio.default_name(path))
+        merged = list(getattr(self, "saved_filters", []))
+        for filt in profile.filters:
+            if all(f.name != filt.name for f in merged):
+                merged.append(filt)
+        profile.filters = merged
+        self.saved_filters = merged
+        self._refresh_saved_filter_menu()
+
+        lost = pf.comments_at_risk(path)
+        try:
+            written = pf.save(profile, path)
+        except OSError as exc:
+            self._status_msg.setText(f"could not save {path.name}: {exc}")
+            return
+        self.profile_path = written
+        settings.remember_profile(written)
+        self._refresh_recent_menus()
+        self.setWindowTitle(f"LogWeave - {profile.name}")
+        plural = "" if lost == 1 else "s"
+        note = (f"  ({lost} comment line{plural} in the previous file were "
+                "not kept)" if lost else "")
+        self._status_msg.setText(
+            f"saved {written.name}: {len(profile.sources)} sources, "
+            f"{len(profile.bookmarks)} bookmarks{note}")
+
+    def _refresh_saved_filter_menu(self) -> None:
+        """
+        The profile's filters, as commands (FR-45, FR-49).
+
+        A hand-written profile may carry several -- "the four views we always
+        look at" -- and this is how a team shares them without a filter manager
+        nobody asked for.
+        """
+        menu = self.saved_filter_menu
+        menu.clear()
+        saved = getattr(self, "saved_filters", [])
+        menu.setEnabled(bool(saved))
+        for filt in saved:
+            act = QAction(filt.name or "unnamed filter", self)
+            act.triggered.connect(
+                lambda _c=False, f=filt: self._apply_saved_filter(f))
+            menu.addAction(act)
+
+    def _apply_saved_filter(self, saved) -> None:
+        filt, notes = profileio.to_filter(self, saved)
+        self.open_filter()
+        self.filterbar.set_filter(filt)
+        if notes:
+            self.report.report("Filter", notes, can_retry=False)
+
+    def _refresh_recent_menus(self) -> None:
+        """
+        FR-54: the last ten logs and the last ten profiles, as two lists.
+
+        Rebuilt from the store on every change rather than kept in step by
+        hand, and the store drops paths that are no longer files -- so the menu
+        never offers something that cannot be opened.
+        """
+        for menu, paths, go in (
+                (self.recent_logs_menu, settings.recent_logs(),
+                 lambda p: self.open_paths([Path(p)])),
+                (self.recent_profiles_menu, settings.recent_profiles(),
+                 self.open_profile)):
+            menu.clear()
+            menu.setEnabled(bool(paths))
+            for path in paths:
+                act = QAction(Path(path).name, self)
+                # The full path in the tip, the name in the menu: two logs
+                # called `service.log` from different machines are the normal
+                # case, and a menu of identical names is no menu at all.
+                act.setStatusTip(path)
+                act.setToolTip(path)
+                act.triggered.connect(
+                    lambda _c=False, p=path, open_one=go: open_one(p))
+                menu.addAction(act)
+            if paths:
+                menu.addSeparator()
+                clear = QAction("Clear List", self)
+                clear.triggered.connect(self._forget_recent)
+                menu.addAction(clear)
+
+    def _forget_recent(self) -> None:
+        settings.forget_recent()
+        self._refresh_recent_menus()
+        self._status_msg.setText("recent lists cleared")
+
+    # ------------------------------------------------------------------
+    # bookmarks (FR-37)
+    # ------------------------------------------------------------------
+
+    def toggle_bookmark(self) -> None:
+        """
+        Mark or unmark the row the cursor is on.
+
+        The mark is on the `(source, entry)` the row came from, never on the
+        row number: row numbers are derived from what is open and what is
+        filtered, so a bookmark stored as one would move to a different line
+        the moment another file was added (the M7 lesson, SPEC 12.2).
+        """
+        if self.session.is_empty:
+            return
+        rows = self.session.rows(self.view.current_row(), 1)
+        if not rows:
+            return
+        row = rows[0]
+        marked = self.bookmarks.toggle(row.source, row.entry)
+        self._sync_bookmarks()
+        where = f"{self.session.sources[row.source].alias}:{row.line_no}"
+        self._status_msg.setText(
+            f"bookmarked {where}" if marked else f"bookmark cleared at {where}")
+
+    def clear_bookmarks(self) -> None:
+        had = len(self.bookmarks)
+        self.bookmarks.clear()
+        self._sync_bookmarks()
+        self._status_msg.setText(
+            f"cleared {had} bookmark" + ("" if had == 1 else "s"))
+
+    def next_bookmark(self, *, back: bool = False) -> None:
+        """
+        Step to the next bookmark below the cursor, or above it (FR-37).
+
+        No wrap-around, like every other step in this window: a reader walking
+        down a set of marks needs to be told when they have reached the last
+        one, not silently returned to the first.
+        """
+        row = self.bookmarks.next_row(self.session, self.view.current_row(),
+                                      back=back)
+        if row < 0:
+            where = "above" if back else "below"
+            self._status_msg.setText(
+                f"no bookmark {where} this row" if len(self.bookmarks)
+                else "no bookmarks")
+            return
+        self._seek_row(int(row))
+        self._sync_strips()
+
+    def _sync_bookmarks(self) -> None:
+        """
+        Put the bookmarks on both strips, and the count in the status bar.
+
+        A `MarkLayer` like every other mark, so the strips draw bookmarks
+        through exactly the code that draws a rule's marks and the find's hits
+        (FR-31a, FR-44) rather than learning a third way to put a tick in a
+        gutter.
+        """
+        layer = self.bookmarks.layer(self.session, theme.BOOKMARK)
+        for strip in (self.minimap, self.timeline):
+            strip.set_bookmark_marks(layer)
+        count = len(self.bookmarks)
+        self._status_bookmarks.setText(
+            (f"{count} bookmark" + ("" if count == 1 else "s")) if count else "")
 
     # ------------------------------------------------------------------
     # drag and drop (FR-1)
@@ -1762,6 +2430,8 @@ class MainWindow(QMainWindow):
         self._sync_strips()
         self.filterbar.set_sources([s.alias for s in self.session.sources])
         self._reload_source_list()
+        # Before the position line, which reads the formatter this may rebuild.
+        self._apply_time_display()
         self._update_span()
         self._update_position(self.view.current_row())
 
@@ -1906,6 +2576,12 @@ class MainWindow(QMainWindow):
         if rows:
             r = rows[0]
             where = f"   {self.session.sources[r.source].alias}:{r.line_no}"
+            if self.time_display.relative:
+                # FR-35: a relative column has to stay explainable. The row the
+                # cursor is on says its clock time here, so a reader working in
+                # offsets never has to switch modes to find out when something
+                # actually happened.
+                where += f"   {self.view.time_format.absolute(r.ts)}"
         self._status_pos.setText(f"row {row + 1:,} of {total:,}{where}   ")
 
     def _report_copied(self, count: int) -> None:

@@ -1056,6 +1056,18 @@ of the prepared prefix sum (§8.1) — `cum[e[1:]] - cum[e[:-1]]`, O(H·k), meas
 as blank pixels, bursts as dense bands, exactly as the chosen option showed. Click
 maps a pixel to a time and calls `time_to_row` (§6.2).
 
+**Decided at M5: no severity colour on this strip at all.** FR-33 asks for bands
+"coloured by severity density per time bucket", and built that way the two strips
+read as two copies of one thing -- which they nearly were, because the minimap's
+bar length cannot vary, so both ended up as stacked severity ramps differing only
+in their vertical axis. The timeline is therefore a **left-justified monochrome
+bar chart**: one neutral grey (`StripTheme.density`), bar length proportional to
+the entries in that slice of time against the busiest slice. One saturated colour
+map beside one monochrome bar chart tells a reader at a glance that they are being
+shown two different quantities -- the minimap answers "how bad", the timeline "how
+much". The per-class counts are still read for the tooltip, so nothing is lost but
+the paint.
+
 ### 8.3 Minimap strip (row-proportional)
 
 Vertical axis is merged row index. Pixel `p` covers rows
@@ -1353,6 +1365,84 @@ The same reasoning applies to copy and export: the `annotated` preset prints a
 timestamp column of its own, so it trims by the same rule (§11.3). `plain` prints
 no timestamp, so it trims nothing and emits the line verbatim.
 
+### 9.6 Timestamp display formats (FR-35, M8)
+
+The column of §9.5 renders through `session.timefmt`, not through
+`civil.format_wall_us`. That function stays exactly as it was and keeps its
+job: it is the **canonical** rendering, the one an annotated copy cites, an
+export writes and a sidecar header records, and it must not move because a
+reader changed a column.
+
+Three modes, because readers ask three different questions of a timestamp:
+
+| Mode | Answers | Reads |
+|---|---|---|
+| `absolute` | when did this happen? | `2026-10-04 14:22:08.113456`, or any pattern |
+| `elapsed` | how long after the thing I care about? | `+1:04.882` from a chosen row |
+| `delta` | where did the time go? | `+41.000000` from the row above |
+
+**Delta is the one that pays for the other two.** A forty-second stall between
+two lines is invisible in clock time — the two rows look like every other pair
+on the screen — and unmissable as a number in its own column. Elapsed is the
+same subtraction against a fixed origin rather than a moving one, so the two
+share a renderer; setting the zero point on the row where a deploy started
+turns the rest of the log into a timeline of what followed.
+
+**The pattern is a documented subset of `strftime`**, compiled rather than
+passed through: `%Y %y %m %d %H %I %M %S %f %b %a %p %j %%`, plus `%L` for
+milliseconds. `%L` is the one extension, because log timestamps are
+overwhelmingly millisecond resolution and C `strftime` has no directive for
+them — `%f` is itself a Python extension, so this is the same kind of thing.
+An unknown directive is **reported** by `validate_pattern` where a human can
+be told, and rendered verbatim where it cannot: `render` is on the paint path,
+so a bad pattern degrades to a visibly odd column rather than raising sixty
+times a second.
+
+#### Fixed width, and why the column is sized from the data
+
+Every mode renders to exactly the width of `TimeFormatter.sample`. The view
+measures the column once per font change and freezes it against horizontal
+scroll (§9.1, FR-36a), so a format whose width varied by row would make the
+message column move while scrolling.
+
+For the relative modes that width is a fact about the log rather than about
+the pattern: a log spanning four minutes needs `+1:23.456789`, one spanning a
+week needs a day group as well, and reserving the day group for an afternoon
+costs four characters of message on every row. So a formatter is built against
+the session's span (`timefmt.for_span`), and `MainWindow` rebuilds it whenever
+the span can have moved — a file opened or closed, a followed file appended.
+Leading groups inside that width are **blanked rather than zero-filled**
+(`      +1:23.456789`), so the magnitude of a gap is legible at a glance down
+the column, which is the whole reason the mode exists.
+
+An offset larger than the shape was sized for widens the column rather than
+dropping its top group. It should not arise — no interval within a log exceeds
+the log's own span — but a quietly truncated interval would be a wrong number
+in evidence, and a momentarily ragged column is merely odd.
+
+#### What the choice does and does not reach
+
+* **The view**, which is the point.
+* **`aligned` copy and export** (FR-46b), because that preset means "what is on
+  screen", and in delta mode what is on screen is an offset.
+* **Nothing else.** `annotated`, `markdown`, `csv` and the template keep clock
+  time whatever the view is set to: `+41.000000` in a ticket cites nothing a
+  colleague can find, and a CSV column of deltas cannot be sorted back into
+  time order. Attribution exists to be followed (D9).
+* **The status bar** shows the cursor row's clock time whenever a relative mode
+  is in force, so a reader working in offsets is never more than a glance from
+  the real time of a row.
+
+#### Where the choice lives
+
+The mode and the pattern are application preferences (`QSettings`, §12.3). The
+**zero point is not stored at all**: it is a position in the log that is open —
+"measure from the deploy" — and carrying last week's origin into this
+morning's incident would be meaningless and, worse, invisible, because every
+row would simply read a few days out. It resets to the first row
+(`timefmt.ZERO_FIRST_ROW`) on each start, and a profile (§12.1) is where a
+named reading of a named set of files belongs.
+
 ---
 
 ## 10. Highlighting
@@ -1525,6 +1615,13 @@ Three bits in `flags` (§2.3), fixed and ordered so `np.maximum` folds correctly
 ```
 0 NONE   1 TRACE   2 DEBUG   3 INFO   4 NOTICE   5 WARN   6 ERROR   7 FATAL
 ```
+
+All eight are **computed for every row**, whatever is painted. Only the top
+three are coloured by default (`palette.COLOUR_FROM`, §10.1), and that is a
+decision about paint alone: the filter, the next/previous-severity keys (§11.4),
+the band proportions on both strips and the tooltips all work from the full
+eight, and `palette.SEVERITY_COLOURS` keeps a colour for each so a user rule
+(FR-31) and the settings dialog have one to show.
 
 ### 10.3 Severity at index time
 
@@ -1935,6 +2032,29 @@ timeline is the only place left that can show how much was put aside.
 Chosen over JSON for comments and diff-friendliness; read with stdlib `tomllib`,
 written with `tomlkit` so user comments and ordering survive a round-trip.
 
+**Amended at M8: written by this project's own emitter, not by `tomlkit`.** The
+engine's one hard dependency is numpy (§1), and `tomlkit` is a 400 KB parser
+pulled in to preserve comments in a file this application writes whole. The
+emitter is 120 lines, has a fixed section order, and writes its own explanatory
+comments into every profile it produces — so a saved profile is a *better*
+document than a round-tripped one, and a hand-edited profile stays readable
+because `tomllib` reads it either way.
+
+What that costs is honest and visible: a reader's own comments do not survive a
+Save. `profile.comments_at_risk(path)` counts them before the write and the
+status bar says how many went, which is the one thing that must not be a
+surprise. The three ways out, if this turns out to matter, are to keep the
+reader's comments attached to the keys they precede (which is `tomlkit` again),
+to write beside rather than over (`.lwprofile` plus a `.lwprofile.local`), or to
+leave it as it is — and the decision wants a user who has lost a comment, not a
+guess now.
+
+Windows paths are written as TOML **literal** strings (`'C:\Acme\logs\a.log'`)
+rather than basic ones. Both are valid and `tomllib` reads either, but a basic
+string doubles every separator (`"C:\\Acme\\logs\\a.log"`), and FR-53 asks for a
+file a person can read and diff: a doubled path is the first thing a reader
+would try to "fix".
+
 ```toml
 format_version = 1
 name = "Acme Gateway"
@@ -2009,6 +2129,42 @@ timestamp = "2026-10-04T14:22:08.120"
 note = "pool exhausted"
 ```
 
+#### As built at M8
+
+The example above is the whole intended schema. What M8 reads and writes is a
+subset of it, and the differences are deliberate rather than pending:
+
+| In the example | As built | Why |
+|---|---|---|
+| `[view] timestamp_format`, `relative_time` | `[view.timestamp] mode`, `format` | FR-35 turned out to have *three* modes, not a format plus a boolean: absolute, elapsed from a zero point, and delta from the previous row. A boolean cannot say which (§9.6). |
+| `font = { family, size }` | `font_point` | Family selection is not built (FR-38); the view uses the configured monospace family, so writing a family into a profile would be writing a preference nothing honours. |
+| `minimap = { visible, width }` | `minimap = true` | The strips are a fixed 64 px (§8); there is no width to save. |
+| `source_lanes = { visible, lane_width }` | `lane_width` | The lanes cannot be hidden — they are the one column that says where a row came from. |
+| `theme = "dark"` | *(absent)* | One theme is built. FR-39 is a should, and a key that can only hold its default is a key that will be wrong later. |
+| `[copy] attribute`, `annotate_continuations` | *(absent)* | Attribution is not a setting: FR-46a makes annotated and verbatim two commands, so there is nothing to save. |
+| `[[source]] ssh = ...` | read, reported, not opened | FR-7 is M9. A profile naming an SSH source is **not** rejected and the host is not dropped: it is reported in the open-outcome panel, so a profile written for the whole set still opens the files this build can reach. |
+| `[[bookmark]] timestamp = "2026-10-04T14:22:08.120"` | `wall_us`, plus `line` | See §12.2. |
+
+Written in addition: `enabled` per source (FR-9), `skew_us` (FR-18), and
+`[highlight] inherit_global` with `[[highlight.rule]]` entries in the same shape
+the global store uses, so a rule can be moved between the two by copy and paste.
+
+**A profile's rules are never written back to `QSettings`.** Opening a
+colleague's profile must not edit your own list, and closing it must leave yours
+as it was. With `inherit_global = true` the two are merged by name for the life
+of the window, and the profile's version of a shared name wins — it is the one
+the profile is for.
+
+**Aliases are saved as custom.** A name in a profile is a name somebody typed,
+so it arrives as `alias_custom` and the session's own shortest-unique rule
+(§6, FR-29) leaves it alone. Without that, the first file to join the set would
+silently rewrite it.
+
+**Encoding and `ts_format` are written only when overridden**, never from
+detection. Writing a detected value back would freeze a guess into the file, so
+that a later build which detects better — or a file whose encoding changed at
+rotation — would be forced to keep reading it the old way.
+
 ### 12.2 Resolution at open (FR-50, FR-51, FR-52)
 
 1. Take each `path` or `glob` as an absolute path, verbatim (D10). A relative path
@@ -2020,8 +2176,50 @@ note = "pool exhausted"
    paths, unreachable hosts — each with a retry. The session opens with whatever
    succeeded.
 
-Bookmarks are stored as `(source alias, timestamp)`, not row numbers, so they
-survive the file having grown, rotated, or been re-indexed.
+**Amended at M8: a bookmark is `(source alias, timestamp, line number)`.** The
+alias and the timestamp are right and for the reason given -- a row number is
+derived from what is open and what is filtered, so a bookmark stored as one
+moves to a different line the moment another file is added. But a timestamp is
+not unique: a log that writes four lines in the same millisecond is ordinary,
+and restoring by alias and timestamp alone lands on the first of that run every
+time. A test caught it; the line number inside the source file disambiguates,
+and is itself stable because it is a coordinate in a file rather than in a
+merge. Restoring matches alias, then the run of equal timestamps, then the line
+number within that run, and reports any bookmark whose source is not open
+rather than dropping it.
+
+Resolution collects and never aborts, and keeps three outcomes apart because
+they mean different things and have different fixes:
+
+* **missing** -- a named path that is not there. Probably a mistake.
+* **unmatched** -- a glob that matched nothing. Probably Tuesday.
+* **invalid** -- a spec that cannot be resolved at all, such as a relative path
+  (D10). Always in the file rather than on the disk.
+
+A file named twice -- by a glob and by a path, or by two overlapping globs -- is
+opened once. Opening it twice would duplicate every one of its rows in the
+merge, which reads as the log repeating itself rather than as a profile
+mistake.
+
+Resolved files keep the order their specs appear in, and within one glob they
+are sorted: by name for `all`, by modification time for the policies that are
+about time. A profile that opened its files in a different order on different
+days would give every source a different lane colour each morning.
+
+**Retry re-resolves; it does not reopen.** A glob that matched nothing at 09:00
+usually matches at 09:05 because the writer has rotated, and what the reader
+wants then is the missing file added to the session they are already reading --
+not that session torn down and rebuilt around it, losing the scroll position
+and the filter they had got to. The panel's Retry therefore resolves again and
+opens only what is not already open, compared by resolved, case-folded path.
+
+**A profile is applied in two halves.** Indexing is asynchronous (§5.3), so the
+call that asks for the files cannot then install the aliases, the filter and the
+bookmarks -- there is nothing yet to install them on. The view preferences go on
+*before* the open, so the first frame is already the profile's; everything that
+names a source by alias goes on at the end of the open. The synchronous path
+(`background=False`, which the tests use) takes the same two steps, so it is not
+a special case nobody runs.
 
 ### 12.3 Global settings
 
@@ -2033,11 +2231,30 @@ theme and font, cache cap, poll intervals, default copy format, and recent lists
 Text size (FR-38), lane width (FR-28), the alias and line-number columns (FR-29,
 FR-29a), the timestamp column and which highlight sets are active persist through
 the platform store — the registry on Windows, a plist on macOS, an ini on Linux.
-`settings.toml` arrives with the profile work at M8 and will hold the things a
-*team* shares, which is a different problem from where one person left a window:
-a TOML file under version control is the wrong place for "this user's font is
-13pt", and the registry is the wrong place for a ruleset a team wants to review
-in a pull request.
+**Amended at M8: `settings.toml` is not built, and the recent lists went to
+`QSettings` instead.** The reasoning above still stands and is why the file is
+still wanted -- a TOML file under version control is the wrong place for "this
+user's font is 13pt", and the registry is the wrong place for a ruleset a team
+wants to review in a pull request. But every *user* of that file turned out to
+belong on the other side of the line:
+
+* The global highlight rules are already in `QSettings`, and a profile now
+  carries its own (§12.1), which is how a team shares a ruleset today: in the
+  profile, where the files it describes are.
+* The recent-files and recent-profiles lists (FR-54) are the clearest case of
+  "where this person left a window" in the application. They are per machine,
+  per user, and nobody would review them -- so they are two `QSettings` keys,
+  checked against the disk on the way out so a menu never offers a file that
+  has gone.
+* Cache cap, poll intervals and the default copy format have no UI yet. Writing
+  a settings file to hold three values nothing can set is a format to maintain
+  with no reader.
+
+So what `settings.toml` is for is **sharing a ruleset without sharing a
+profile**, and that is the shape it should be built in when it is built: an
+import and an export of a ruleset, not a second store with its own precedence
+rules against the first. It stays owed, and it is owed as a feature rather than
+as plumbing.
 
 Two rules that the store itself cannot enforce, so the reader does:
 
@@ -2513,6 +2730,99 @@ rows on screen, which does not register against the 1.48 ms scroll step of
 file: 2000-row batches on a zero-delay timer, each a few milliseconds, which is
 what keeps the window live without a thread (§11.3).
 
+### 14.1h Measured — M8 result (the timestamp column, FR-35)
+
+A configurable format is rendered per visible row per frame, so the question
+is what it costs against the fixed one it replaces. Measured over a 60-row
+frame, best of five runs, same machine as §14.1a–g:
+
+| Rendering | Per frame | Per row |
+|---|---|---|
+| `civil.format_wall_us` (the fixed column, M3) | 362 µs | 6.0 µs |
+| `timefmt` absolute, full pattern | **419 µs** | **7.0 µs** |
+| `timefmt` absolute, time only | 413 µs | 6.9 µs |
+| `timefmt` delta | 445 µs | 7.4 µs |
+| `timefmt` elapsed | 452 µs | 7.5 µs |
+| `timefmt` absolute, no per-day cache | 937 µs | 15.6 µs |
+| `datetime.strftime` for comparison | 714 µs | 11.9 µs |
+
+**A configurable format costs 0.06 ms of a 16 ms frame over the fixed one**,
+against a worst measured scroll step of 1.48 ms (§14.1c). Two findings sit
+behind that, and both were places where the obvious implementation was twice
+the cost:
+
+1. **The date half of a pattern is rendered once per day, not once per row.**
+   A pattern's date fields cannot change within a day and consecutive log rows
+   are nearly always on the same one, so `_day_template` pre-renders them into
+   a `str.format` template and a row is one `format` over the clock fields.
+   Without it the same column is 15.6 µs a row — worse than `strftime`, which
+   it exists to beat.
+2. **The relative modes' overflow guard has to be one integer comparison.**
+   The first version called `_shape_for` on every row to find out whether the
+   offset fitted the column, which measured 22.2 µs a row — three times the
+   absolute path — for a branch that should never be taken. The shape now
+   carries the largest offset it covers (`_Shape.covers`), and the reshaping
+   happens only on the path no row should reach.
+
+Nothing here is near a budget, which is the point of recording it: the column
+was the one part of the frame that had been allowed to assume a fixed format,
+and it now reads a compiled one for 6% more than it used to spend.
+
+### 14.1i Measured — M8 result (the profile path, FR-49 to FR-52)
+
+`python tools/bench.py`, which from M8 carries both the timestamp column and
+the profile benches so they are gated like everything else. Same machine and
+method as §14.1a–h.
+
+Opening a profile is not in a frame budget: it happens once, on a menu command,
+and the open it starts is dominated by indexing. It is measured because the two
+parts that can surprise someone are proportional to something the *user*
+controls rather than to the log — a glob over a log directory nobody prunes,
+and a profile carrying a bookmark per incident for a year.
+
+| Operation | Cost |
+|---|---|
+| write a profile (12 sources, 100 bookmarks) | 0.93 ms |
+| read one back, validated | 4.5 ms |
+| resolve one glob over 2000 files, `select = "all"` | **46 ms** |
+| the same glob, `select = "newest"`, count 3 | 68 ms |
+| resolve the same glob with `Path.resolve()` dedupe | **549 ms** |
+
+**One finding, and it changed the code.** Deduplicating the resolved files with
+`Path.resolve()` — the obvious call, and what was written first — cost 0.55 s
+for one glob over 2000 files, because `resolve()` asks the filesystem and that
+is roughly 0.25 ms a path on Windows. It is now
+`normcase(normpath(abspath(path)))`, which is string work: **12× faster, and
+the whole resolve is now cheaper than reading the profile that asked for it.**
+What that gives up is seeing through a junction or a symlink, so a profile that
+names one directory twice under two mount points opens those files twice. That
+is a rare way to write a profile and a visible one when it happens — the source
+list shows the file twice, under two names — against half a second of lag on
+every open, which is neither.
+
+`select = "newest"` is slower than `all` despite opening three files instead of
+2000: it has to `stat` every match to find out which three. That is inherent
+and it is the right trade — the alternative is trusting the name, and a profile
+written for `gateway-*.log` cannot know whether that is a sequence number or a
+date.
+
+**A correction to §14.1h.** Its "absolute, no per-day cache" row at 15.6 µs is
+not reproducible from this tree, and the row has been left in place because the
+decision it records is real: the *original* implementation did per-row calendar
+work and a per-row dict, and replacing that with a pre-rendered day template
+took the column from 15.6 µs a row to 7.0. But rebuilding that template is
+itself cheap, so defeating the cache — one row per day, a miss on every row —
+now measures the same as hitting it (2.92 µs against 2.97 µs on this run). The
+cache is worth keeping and is no longer worth 2× on its own.
+
+The absolute numbers in this run are also about 2.4× lower than §14.1h's across
+every row of that table, fixed column included, which is the run-to-run
+variation the harness warns about in its own header — a laptop under thermal
+load. The ratios, which are what the decisions rest on, are unchanged: a
+configurable format still costs about 1.2× the fixed one it replaced, and the
+relative modes are if anything cheaper than the absolute one because they
+render fewer groups.
+
 ### 14.2 Remaining performance work
 
 In priority order. Native code stays off the table until these are exhausted (D8).
@@ -2643,9 +2953,9 @@ dependency may be added without an ADR.
 | **M5** ✅ | Both strips (D4), the density histogram and its sidecar entry | **FR-32 to FR-34 met, and risk R3 is contained with margin**: a scroll repaints both strips in 0.63 ms and a resize re-aggregates them in 3.85 ms, against a 16 ms frame (§14.1d). Rewrote §8.1 twice — the millionth bucket cost 96 MB a source against a "few MB" claim in the same paragraph, and the pass cannot be folded into the chunk loop because the bucket width is not known until the file has been read — and §8.3, whose checkpoint lookup was too coarse and made the minimap invent an idle gap. Found that the frame cost was never in the aggregation but in the per-pixel work after it (5.65 ms a strip, now 0.84), and two Qt defects of the kind SPEC 9.1 already argues about: `Signal(int)` is a 32-bit int, so every timeline seek truncated a `wall_us` and landed on row 0; and a menu built before the window is shown reads `isVisible()` False for a strip that is on. **Done.** |
 | **M6** ✅ | Follow engine, rotation matrix green | **FR-21 to FR-26 met, NFR-8 met with an order of magnitude to spare, NFR-20 measured rather than assumed, and risk R5 is retired.** A tick is ~19 ms against a 200 ms budget, and every structure it touches became incremental: the histogram 1090× cheaper than a rebuild, the checkpoints 381× (§14.1e). Rewrote §7.4, whose four watching mechanisms were premised on polling being too expensive to meet NFR-8 — a probe is 12 µs, so one portable poller at 150 ms costs 0.09% of a core and `ReadDirectoryChangesW` is no longer planned. Rewrote §6.4, which described a fast and a slow path as separate algorithms; one rule produces both, and the pending tail buffer it specified would have traded a measured millisecond for a visible two-second delay on every line. Found four defects that each produced a plausible-looking result: §7.2's table was being tested in its written order, so a writer that appended and *then* rotated was read as an ordinary append and the rotation never noticed; §7.3's partial-line rule was honoured by the line splitter but not by the recorded extent, so a half-written line came back as two rows once finished; an append produced a new `FileIndex` while the merge kept the old object, which looks exactly like following that works except no row ever appears; and the earliest appended entry was being read from the merge's sorted view rather than raw entry order, which resumes far too late on an out-of-order file. Measured that a live mapping makes the writer's own truncating reopen fail (§7.5) and gave up the mapping for followed sources at 4% of a frame. FR-23's "without losing already-read history" is met for rotation and deletion and is stated plainly as unachievable for truncation in place. **Done.** |
 | **M6a** ✅ | Settings dialog, the highlight-rule editor, and rule marks on both strips | **FR-31 complete bar TOML import/export, FR-31a new, FR-52 in part.** Brought forward from M8 because the strips could not say *where* a user's colour should appear. Corrected §8.4, whose severity bands were drawn in ascending class order -- which put the dimmed `NONE` band along the left edge and pushed ERROR and CRITICAL out to the right, so the strip read as right-justified with its most important colours at a position that moved per pixel row. Bands now descend from the left, and a marked rule gets a reserved right-hand gutter rather than overdrawing them. Corrected §10.1's implication that rule count is free: `re` has no DFA, so an alternation costs linearly in its branches -- 439 MB/s for one literal against 0.39 MB/s for the shipped thirty (§14.1f), which is 166 seconds on a 64 MB set. So `session.marks` scans per rule rather than per alternation (2.2x) and marking is opt-in per rule. Found four defects that each looked fine: the rule store dropped `enabled=False`, so a rule switched off came back on at the next start; the lane-width menu actions carried no width, so nothing could ever put their ticks back in step; `MarkLayer.counts` used a half-open final edge and dropped a hit landing on the last entry's timestamp, the same off-by-one §8.2 already records; and the rule form revalidated on only two of the fields its advice depends on, so the warnings about severity and about scan cost appeared only after an unrelated keystroke. **Done.** |
-| **M7** ✅ | Search, filters, selection, copy, export, and the navigation keys | **FR-41 to FR-48 and FR-46b met; NFR-10 met in place; NFR-9 met to ~45M rows and measured rather than claimed at 100M.** Rewrote §11 on the evidence: three of its claims did not survive a profiler. `re.IGNORECASE` is 15x a case-sensitive literal, so case-insensitive search folds the chunk instead and the Aho-Corasick variant §11.1 specified was never needed; a literal has to be searched *in place* out of the mapping, which is the whole of NFR-10's margin (4.5 s against 7.8 s chunked); and a hit cannot be recorded as a merged row, because a row moves when a source is hidden, a filter changes or a followed file appends in the middle — so hits are `(source, entry)` pairs with rows derived on demand. Corrected §11.2's NFR-9 claim, which accounted for the masks and not for the filtered merge's checkpoints: deriving them from the parent's (`derive_checkpoints`) is selectivity-independent where a rebuild is 12x worse on the commonest real filter (§14.1g). Corrected §11.3's `plain` preset, which M4 had already shipped as the verbatim line for good reason. Found four defects of the kind that look like working code: `ranks_sorted`'s `reduceat` boundary ran its last segment to the end of the mask, so every rank past the first was wrong by whatever the tail contained; `nav.next_row` clamped the starting row to 0 and thereby made a match *on* row 0 unreachable, which is where the first error in a log that failed at startup is; `Hits.locate` was handing rows to hits in hidden and filtered-out sources, so "3 of 18" counted rows the view could not step through; and the find bar reported an invalid regex only once a scan returned, which for an invalid regex is never. Gave Ctrl+F to the find bar and moved following to Ctrl+Shift+F. Fixed two test-harness defects that were hiding behaviour rather than breaking it: a window asked to `deleteLater` was being destroyed in the middle of a *later* test, emptying the Windows clipboard it had taken ownership of, and a second clipboard write in one test needs an event-loop turn before it can be read back. **Done.** |
-| **M8** | Profiles, file association, recent lists; the rest of the settings screen, and the TOML ruleset import/export left over from M4 (§10.1) — the editing dialog itself landed early at M6a | FR-49 to FR-54 |
-| **M9** | Packaging, signing, cold-start tuning, docs | NFR-12, NFR-19. **v1.0** |
+| **M7** ✅ | Search, filters, selection, copy, export, and the navigation keys | **FR-41 to FR-48 and FR-46b met; NFR-10 met in place; NFR-9 met to ~45M rows and measured rather than claimed at 100M.** Rewrote §11 on the evidence: three of its claims did not survive a profiler. `re.IGNORECASE` is 15x a case-sensitive literal, so case-insensitive search folds the chunk instead and the Aho-Corasick variant §11.1 specified was never needed; a literal has to be searched *in place* out of the mapping, which is the whole of NFR-10's margin (4.5 s against 7.8 s chunked); and a hit cannot be recorded as a merged row, because a row moves when a source is hidden, a filter changes or a followed file appends in the middle — so hits are `(source, entry)` pairs with rows derived on demand. Corrected §11.2's NFR-9 claim, which accounted for the masks and not for the filtered merge's checkpoints: deriving them from the parent's (`derive_checkpoints`) is selectivity-independent where a rebuild is 12x worse on the commonest real filter (§14.1g). Corrected §11.3's `plain` preset, which M4 had already shipped as the verbatim line for good reason. Found four defects of the kind that look like working code: `ranks_sorted`'s `reduceat` boundary ran its last segment to the end of the mask, so every rank past the first was wrong by whatever the tail contained; `nav.next_row` clamped the starting row to 0 and thereby made a match *on* row 0 unreachable, which is where the first error in a log that failed at startup is; `Hits.locate` was handing rows to hits in hidden and filtered-out sources, so "3 of 18" counted rows the view could not step through; and the find bar reported an invalid regex only once a scan returned, which for an invalid regex is never. Gave Ctrl+F to the find bar and moved following to Ctrl+Shift+F. Fixed two test-harness defects that were hiding behaviour rather than breaking it: a window asked to `deleteLater` was being destroyed in the middle of a *later* test, emptying the Windows clipboard it had taken ownership of, and a second clipboard write in one test needs an event-loop turn before it can be read back. **Corrected after the milestone, on a user report: the shipped rules coloured all eight severity classes**, so a healthy log -- almost nothing but INFO -- came out entirely coloured, which is the same as none of it being. §10.1 and §8.4 now stop at WARNING, and the first attempt at that fix is the part worth keeping: dimming the message text left the minimap drawing INFO in saturated blue, because the strips read the palette directly and the floor had been put in `highlight.builtins`, which `session.overview` cannot import without inverting the dependency. The floor lives in `session.palette` for that reason, read by all three surfaces that colour by severity. **Done.** |
+| **M8** ✅ | Profiles, bookmarks, the configurable timestamp column, the file association and the recent lists | **FR-49 to FR-54 met, FR-37 new, and FR-35 brought in from unscheduled** — it had to be, because the profile schema (§12.1) and FR-49's payload both name a timestamp format, and there was none to name. Rewrote §12.1: a profile is written by this project's own 120-line emitter rather than by `tomlkit`, because the engine's one hard dependency is numpy and a 400 KB parser was being pulled in to preserve comments in a file the application writes whole — what that costs is a reader's own comments, so `comments_at_risk` counts them before the write and the status bar says how many went. Windows paths are written as TOML *literal* strings, since a basic string doubles every separator and FR-53 asks for a file a person can read and diff. Rewrote §12.3, which promised a `settings.toml` at M8: every user of that file turned out to belong on the other side of its own line — a profile carries its rules, and the recent lists are the clearest "where this person left a window" in the application — so what the file is actually for is sharing a ruleset *without* sharing a profile, and it stays owed as that feature rather than as plumbing. Corrected §12.2: a bookmark cannot be `(alias, timestamp)`, because a log writing four lines in one millisecond is ordinary and restoring by timestamp lands on the first of that run every time; it is `(alias, timestamp, line number)`, which a failing test found before a user could. Found three more defects of the kind that look like working code: deduplicating a resolve with `Path.resolve()` cost 0.55 s on one glob over 2000 files, because it asks the filesystem — 12× that in string work (§14.1i); the `profile` package re-exports `resolve` as a *function*, so `profile.resolve.resolve` does not exist and two callers bound the wrong object before either noticed; and the filter bar had no way to be shown a whole filter, so installing a saved one meant six separate signals and six background scans of every open file, five of them thrown away. The timestamp column measured at 1.2× the fixed one it replaces (§14.1h), and §14.1i corrects that section's cache row, which is no longer reproducible from the tree. **Done.** |
+| **M9** | Packaging, signing, cold-start tuning, docs; the TOML ruleset import/export owed since M4 (§10.1, §12.3) | NFR-12, NFR-19. **v1.0** |
 
 Phase 2 (Event Log) begins with a new `LogSource` implementation and a spill file;
 by construction it needs no change to layers 2–4.

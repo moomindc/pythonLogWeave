@@ -112,7 +112,8 @@ def worker_count(paths: list[Path], workers: int | None = None) -> int:
     return max(1, min(MAX_WORKERS, cpus - 1, len(paths)))
 
 
-def warm_one(path: str, mtime_wall_us: int, root: str | None) -> Prepared:
+def warm_one(path: str, mtime_wall_us: int, root: str | None,
+             force_format: str = "") -> Prepared:
     """
     Make sure a sidecar exists for one file. Runs in a worker process.
 
@@ -122,6 +123,12 @@ def warm_one(path: str, mtime_wall_us: int, root: str | None) -> Prepared:
 
     The index built here is deliberately thrown away. It lives in the wrong
     process, and the parent can map the sidecar for almost nothing.
+
+    `force_format` is carried through because a sidecar is only reusable by a
+    reader asking for the same format (FR-13, SPEC 5.4). Warming without it
+    would build an index of the detected reading, which the session then
+    refuses and rebuilds -- the file indexed twice, and the slower time is the
+    one the reader waits for.
     """
     from ..index.cached import open_index
     from ..index.civil import epoch_us_to_wall_us
@@ -135,7 +142,8 @@ def warm_one(path: str, mtime_wall_us: int, root: str | None) -> Prepared:
         src.open()
         try:
             out = open_index(src, mtime_wall_us=mtime_wall_us, path=p,
-                             root=Path(root) if root else None)
+                             root=Path(root) if root else None,
+                             force_format=force_format)
             got = Prepared(path=path, status=out.status, reason=out.reason,
                            indexed_bytes=out.indexed_bytes, entries=out.index.n)
             # Drop the mappings before the process exits: on Windows an open
@@ -161,6 +169,7 @@ def prepare(
     workers: int | None = None,
     progress: Progress | None = None,
     cancelled: Callable[[], bool] | None = None,
+    formats: dict[str, str] | None = None,
 ) -> PrepareResult:
     """
     Ensure every path has a sidecar, in parallel where that pays.
@@ -168,6 +177,10 @@ def prepare(
     `cancelled` is consulted between files. Stopping mid-file would mean
     abandoning a partial index, and a file indexes in seconds even when the set
     takes minutes, so the granularity is honest rather than ideal.
+
+    `formats` maps a path to a forced timestamp format (FR-13), for the files
+    a profile has an opinion about. Keyed by the string of the path because it
+    crosses a process boundary.
 
     With the cache off there is nothing to warm and this returns immediately --
     the session will index on the calling thread, which is the documented cost
@@ -185,21 +198,23 @@ def prepare(
 
     if result.parallel:
         _run_pooled(todo, result, root=root, progress=progress,
-                    cancelled=cancelled)
+                    cancelled=cancelled, formats=formats or {})
     else:
         _run_inline(todo, result, root=root, progress=progress,
-                    cancelled=cancelled)
+                    cancelled=cancelled, formats=formats or {})
     return result
 
 
 def _run_inline(todo: list[Path], result: PrepareResult, *, root: Path | None,
                 progress: Progress | None,
-                cancelled: Callable[[], bool] | None) -> None:
+                cancelled: Callable[[], bool] | None,
+                formats: dict[str, str]) -> None:
     for done, path in enumerate(todo, 1):
         if cancelled is not None and cancelled():
             result.cancelled = True
             return
-        got = warm_one(str(path), 0, str(root) if root else None)
+        got = warm_one(str(path), 0, str(root) if root else None,
+                       formats.get(str(path), ""))
         result.files.append(got)
         if progress is not None:
             progress(done, len(todo), got)
@@ -207,7 +222,8 @@ def _run_inline(todo: list[Path], result: PrepareResult, *, root: Path | None,
 
 def _run_pooled(todo: list[Path], result: PrepareResult, *, root: Path | None,
                 progress: Progress | None,
-                cancelled: Callable[[], bool] | None) -> None:
+                cancelled: Callable[[], bool] | None,
+                formats: dict[str, str]) -> None:
     """
     One file per worker, reported as each finishes.
 
@@ -219,7 +235,8 @@ def _run_pooled(todo: list[Path], result: PrepareResult, *, root: Path | None,
     root_s = str(root) if root else None
     try:
         with ProcessPoolExecutor(max_workers=result.workers) as pool:
-            futures = {pool.submit(warm_one, str(p), 0, root_s): p
+            futures = {pool.submit(warm_one, str(p), 0, root_s,
+                                   formats.get(str(p), "")): p
                        for p in ordered}
             done = 0
             for future in as_completed(futures):
@@ -244,7 +261,7 @@ def _run_pooled(todo: list[Path], result: PrepareResult, *, root: Path | None,
         result.workers = 1
         result.files.clear()
         _run_inline(todo, result, root=root, progress=progress,
-                    cancelled=cancelled)
+                    cancelled=cancelled, formats=formats)
         result.files.append(Prepared(path="", status="skipped",
                                      reason=f"no worker pool: {exc}"))
 

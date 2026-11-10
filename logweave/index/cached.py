@@ -67,6 +67,7 @@ def open_index(
     root: Path | None = None,
     ruleset: SeverityRuleset = DEFAULT_RULESET,
     write_back: bool = True,
+    force_format: str = "",
     **build_kwargs,
 ) -> CacheOutcome:
     """
@@ -75,10 +76,16 @@ def open_index(
     `path` identifies the file for cache purposes. Without it -- an in-memory
     or remote source -- there is nothing stable to key on and the cache is
     skipped rather than guessed at.
+
+    `force_format` (FR-13) is passed on to the build *and* to the lookup. Both
+    matter: a sidecar written when the file was detected as something else is
+    a perfectly valid index of the wrong reading, and serving it would make a
+    profile's format override look as though it had been ignored.
     """
     if not use_cache or path is None:
         idx = build_index(source, mtime_wall_us=mtime_wall_us,
-                          ruleset=ruleset, **build_kwargs)
+                          ruleset=ruleset, force_format=force_format,
+                          **build_kwargs)
         return CacheOutcome(index=idx, status="disabled",
                             indexed_bytes=idx.stats.bytes_indexed)
 
@@ -105,7 +112,7 @@ def open_index(
     ruleset_sha = ruleset.fingerprint()
     found = sidecar.lookup(path, size=size, mtime_ns=mtime_ns, head=head,
                            terminator_at=terminator_at, root=root,
-                           ruleset_sha=ruleset_sha)
+                           ruleset_sha=ruleset_sha, want_format=force_format)
 
     if found.full:
         return CacheOutcome(index=found.index, status="hit", reason=found.reason,
@@ -113,7 +120,8 @@ def open_index(
 
     if found.partial:
         outcome = _append(source, found, mtime_wall_us=mtime_wall_us,
-                          ruleset=ruleset, root=root, **build_kwargs)
+                          ruleset=ruleset, root=root,
+                          force_format=force_format, **build_kwargs)
         if outcome is not None:
             if write_back:
                 outcome.wrote = _write(outcome.index, path, size, mtime_ns,
@@ -121,7 +129,7 @@ def open_index(
             return outcome
 
     idx = build_index(source, mtime_wall_us=mtime_wall_us, ruleset=ruleset,
-                      **build_kwargs)
+                      force_format=force_format, **build_kwargs)
     out = CacheOutcome(index=idx, status="miss", reason=found.reason,
                        indexed_bytes=idx.stats.bytes_indexed)
     if write_back:

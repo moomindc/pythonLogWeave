@@ -69,6 +69,7 @@ from pathlib import Path
 from ..index.civil import format_wall_us
 from ..index.severity import Severity
 from .session import Row, Session
+from .timefmt import TimeFormatter
 
 
 class Preset(StrEnum):
@@ -163,6 +164,7 @@ class RowFormatter:
         trim_timestamp: bool = True,
         columns: Columns | None = None,
         template: str = DEFAULT_TEMPLATE,
+        time_fmt: TimeFormatter | None = None,
     ):
         self.session = session
         self.preset = Preset(preset)
@@ -173,6 +175,21 @@ class RowFormatter:
         self.trim_timestamp = trim_timestamp
         self.columns = columns or Columns()
         self.template = template or DEFAULT_TEMPLATE
+        self.time_fmt = time_fmt
+        """
+        The view's timestamp format (FR-35), used by `aligned` **only**.
+
+        `aligned` means "what is on screen", so a reader in delta mode gets
+        `+1:23.456789` in their paste, because that is the column they were
+        looking at and the thing they selected those rows to show.
+
+        Every other preset keeps the canonical absolute rendering whatever the
+        view is set to. A relative offset is meaningless away from the screen
+        it was read on: `+1:23.456789` in a ticket cites nothing a colleague
+        can find, and a CSV column of deltas cannot be sorted back into time
+        order. Attribution exists to be followed, so the formats that attribute
+        print the time the file states.
+        """
 
     # ------------------------------------------------------------------
     # the pieces every preset shares
@@ -332,8 +349,17 @@ class RowFormatter:
         Left to right: line number, source alias, timestamp, message -- and
         only the ones the view is actually showing, because "as displayed" with
         a column the reader cannot see is not as displayed.
+
+        The timestamp is in the view's own format (FR-35), including a relative
+        one: every mode renders to a fixed width, so the columns still line up.
+        A delta needs the row above the selection, which is one `row_to_time`
+        for the whole copy rather than a row fetched per row.
         """
         cols = self.columns
+        fmt = self.time_fmt
+        previous: int | None = None
+        if fmt is not None and fmt.needs_previous and rows[0].row > 0:
+            previous = self.session.row_to_time(rows[0].row - 1)
         out: list[str] = []
         for r in rows:
             prefix: list[str] = []
@@ -343,7 +369,9 @@ class RowFormatter:
                 alias = self.session.sources[r.source].alias
                 prefix.append(f"{alias:<{widths['alias']}}")
             if cols.timestamp:
-                prefix.append(self.stamp(r))
+                prefix.append(fmt.render(r.ts, previous) if fmt
+                              else self.stamp(r))
+            previous = r.ts
             lead = "  ".join(prefix)
             text = self.body(r) if cols.timestamp else r.text
             physical = text.splitlines() or [""]

@@ -45,6 +45,7 @@ from .detect import Detection, detect
 from .fileindex import FileIndex, IndexStats, _Growable
 from .histogram import Histogram
 from .layouts import (
+    CATALOGUE,
     FLAG_MULTILINE,
     FLAG_SCALAR_FALLBACK,
     FLAG_SEVERITY_MASK,
@@ -190,6 +191,7 @@ def build_index(
     start_at: int | None = None,
     limit: int | None = None,
     first_line: int = 1,
+    force_format: str = "",
 ) -> FileIndex:
     """
     Index a source from `start_at` to its current extent.
@@ -207,6 +209,14 @@ def build_index(
 
     `detection` may be supplied to skip re-detection -- which is what a follow
     append does, since a file does not change format mid-stream.
+
+    `force_format` names a catalogue format to read timestamps with instead of
+    detecting one (FR-13). Detection still runs, over a catalogue of that one
+    format, so the layout is still synthesised from the file's own bytes and
+    the confidence still means something -- a forced format that matches
+    nothing reports 0% rather than producing silent nonsense. An unknown name
+    is a note on the index and a fall back to the whole catalogue, because a
+    profile written against a later build must not make a file unopenable.
 
     `first_line` is the 1-based line number of the first line at `start_at`.
     It only matters when resuming: `line_no` is a position within the whole
@@ -227,7 +237,9 @@ def build_index(
     enc = resolve_encoding(source, start_at)
     idx.encoding = enc.name
     if detection is None:
-        detection = _detect_from_head(source, start_at, end, enc, ruleset=ruleset)
+        detection = _detect_from_head(source, start_at, end, enc,
+                                      ruleset=ruleset,
+                                      force_format=force_format)
     idx.format_name = detection.fmt.name if detection.fmt else ""
     idx.fast_path = detection.fast_path
     idx.confidence = detection.confidence
@@ -395,6 +407,7 @@ def _detect_from_head(
     enc: encoding.EncodingInfo,
     *,
     ruleset: SeverityRuleset,
+    force_format: str = "",
 ) -> Detection:
     raw = source.read_range(start_at, min(start_at + DETECT_BYTES, end))
     # Detection must see exactly what extraction will see, or a layout
@@ -402,7 +415,17 @@ def _detect_from_head(
     head = encoding.narrow_for_scan(raw, enc, byte_start=start_at)
     buf = np.frombuffer(head, dtype=np.uint8)
     starts, lens = split_lines(buf)
-    return detect(head, buf, starts, lens, ruleset=ruleset)
+    catalogue = None
+    note = ""
+    if force_format:
+        catalogue = [f for f in CATALOGUE if f.name == force_format]
+        if not catalogue:
+            catalogue, note = None, (
+                f"unknown timestamp format {force_format!r}; detected instead")
+    det = detect(head, buf, starts, lens, ruleset=ruleset, catalogue=catalogue)
+    if note:
+        det.notes.append(note)
+    return det
 
 
 def _finish(

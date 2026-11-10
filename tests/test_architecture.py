@@ -18,7 +18,7 @@ import pytest
 
 ROOT = Path(__file__).resolve().parent.parent
 PACKAGE = ROOT / "logweave"
-ENGINE_LAYERS = ["source", "index", "merge", "session", "highlight"]
+ENGINE_LAYERS = ["source", "index", "merge", "session", "highlight", "profile"]
 """
 `highlight` is here although SPEC 1 numbers it with the UI.
 
@@ -26,6 +26,12 @@ The rules decide that a run of text is "error red"; only the view knows what a
 `QColor` is. Keeping the engine side of that line Qt-free is what lets the rule
 engine be tested headlessly, and what will let the same rules drive an HTML
 export (FR-47) without the exporter importing a widget toolkit.
+
+`profile` is here for the same kind of reason (M8). A profile is a file
+format and a set of globs, and nothing about either needs a window: keeping
+it Qt-free is what lets a future headless mode open a named set of logs and
+export it, and it is why turning a profile into an open session lives in
+`ui.profileio` rather than in the package itself.
 """
 FORBIDDEN_ROOTS = {"PySide6", "PyQt6", "PyQt5", "shiboken6"}
 

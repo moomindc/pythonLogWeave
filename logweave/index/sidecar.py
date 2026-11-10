@@ -353,7 +353,8 @@ def _load(sidecar: Path, header: dict) -> FileIndex:
 
 def lookup(path: Path, *, size: int, mtime_ns: int, head: bytes,
            terminator_at: Callable[[int], bool] | None = None,
-           root: Path | None = None, ruleset_sha: str = "") -> Reuse:
+           root: Path | None = None, ruleset_sha: str = "",
+           want_format: str = "") -> Reuse:
     """
     Decide what, if anything, may be reused for this file (SPEC 5.4).
 
@@ -369,7 +370,7 @@ def lookup(path: Path, *, size: int, mtime_ns: int, head: bytes,
     exact = root / cache_name(path, size, mtime_ns)
     header = read_header(exact)
     if header is not None:
-        bad = _incompatible(header, head, ruleset_sha)
+        bad = _incompatible(header, head, ruleset_sha, want_format)
         if bad:
             return Reuse(reason=bad)
         try:
@@ -398,7 +399,7 @@ def lookup(path: Path, *, size: int, mtime_ns: int, head: bytes,
         # is possible, and cheap to get wrong, so this is not reused.
         return Reuse(reason="mtime changed without growth")
 
-    bad = _incompatible(header, head, ruleset_sha)
+    bad = _incompatible(header, head, ruleset_sha, want_format)
     if bad:
         return Reuse(reason=bad)
 
@@ -416,7 +417,8 @@ def lookup(path: Path, *, size: int, mtime_ns: int, head: bytes,
                  reason=f"reusing {indexed_to:,} of {size:,} bytes")
 
 
-def _incompatible(header: dict, head: bytes, ruleset_sha: str = "") -> str:
+def _incompatible(header: dict, head: bytes, ruleset_sha: str = "",
+                  want_format: str = "") -> str:
     """
     Why this sidecar may not be used, or "" if it may.
 
@@ -435,6 +437,11 @@ def _incompatible(header: dict, head: bytes, ruleset_sha: str = "") -> str:
         return "parser version differs"
     if ruleset_sha and header.get("ruleset_sha", "") != ruleset_sha:
         return "severity ruleset changed"
+    if want_format and header.get("ts_format", "") != want_format:
+        # A sidecar built when this file was detected as something else is a
+        # valid index of the wrong reading (FR-13). Serving it would make a
+        # profile's format override look as though it had been ignored.
+        return "a different timestamp format was forced"
     want = int(header.get("head_len", HEAD_SAMPLE))
     if len(head) < want:
         return "file is shorter than the hashed head"

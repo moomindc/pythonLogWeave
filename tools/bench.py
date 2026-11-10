@@ -68,6 +68,10 @@ from _prototypes import (  # noqa: E402
 )
 
 from logweave.index import extract as _ex  # noqa: E402
+from logweave.index.civil import (  # noqa: E402
+    format_wall_us,
+    wall_us_to_datetime,
+)
 from logweave.index.detect import detect  # noqa: E402
 from logweave.index.fileindex import FileIndex  # noqa: E402
 from logweave.index.histogram import MAX_BUCKETS, Histogram  # noqa: E402
@@ -77,6 +81,19 @@ from logweave.index.severity import (  # noqa: E402
     severity_scan,
 )
 from logweave.merge import MergeIndex, merge_of  # noqa: E402
+
+# By their real modules, not through `logweave.profile`: the package
+# re-exports `resolve` as a *function*, so `profile.resolve` is not the module
+# and `profile.resolve.resolve` does not exist. The same trap caught a test.
+from logweave.profile.model import Bookmark, Profile, SourceSpec  # noqa: E402
+from logweave.profile.resolve import resolve as resolve_profile  # noqa: E402
+from logweave.profile.toml_io import dump as dump_profile  # noqa: E402
+from logweave.profile.toml_io import loads as load_profile  # noqa: E402
+from logweave.session.timefmt import (  # noqa: E402
+    TimeDisplay,
+    TimeFormatter,
+    TimeMode,
+)
 
 
 def fake_index(ts: np.ndarray) -> FileIndex:
@@ -842,6 +859,110 @@ def run_follow_benches(b: Bench, rows: int, sources: int) -> None:
                        f"of watching, every 150ms, on its own thread")
 
 
+def run_time_benches(b: Bench, rows: int = 60) -> None:
+    """
+    The timestamp column, per painted frame -- FR-35, SPEC 9.6, 14.1h.
+
+    A frame's worth of calls rather than one, because that is the quantity with
+    a budget: NFR-5 allows 16 ms for everything a scroll step does, and this
+    column is rendered once per visible row per frame. The fixed M3 formatter is
+    the row to beat -- the question M8 had to answer is what a *configurable*
+    format costs over the one it replaces.
+
+    The timestamps are one second apart from a fixed instant, so every row is
+    on the same day. That is the common case and it is also the one the per-day
+    template cache exists for; the uncached row below is the same work with the
+    cache defeated, which is what makes the cache's value visible instead of
+    assumed.
+    """
+    base = 1_793_124_128_113_456
+    stamps = [base + i * 1_000_000 for i in range(rows)]
+
+    fixed = TimeFormatter(TimeDisplay(mode=TimeMode.ABSOLUTE))
+    time_only = TimeFormatter(TimeDisplay(mode=TimeMode.ABSOLUTE,
+                                          pattern="%H:%M:%S.%f"))
+    delta = TimeFormatter(TimeDisplay(mode=TimeMode.DELTA))
+    elapsed = TimeFormatter(TimeDisplay(mode=TimeMode.ELAPSED,
+                                        zero_us=base))
+
+    def frame(formatter, relative: bool = False):
+        def run():
+            previous = None
+            for wall in stamps:
+                formatter.render(wall, previous)
+                if relative:
+                    previous = wall
+        return run
+
+    # One row per day, so the pre-rendered date template misses on every row.
+    # The formatter is the same one: what is defeated is the cache, not the
+    # pattern compile, which no frame ever pays for.
+    #
+    # This row measures the same as the cached one, and that is the finding --
+    # see SPEC 14.1i. The template cache earns its keep against the *original*
+    # per-row calendar implementation, which is gone; rebuilding a template is
+    # itself cheap, so the miss path costs nothing worth having a cache for.
+    # Kept as a row because the day boundary is the one input that changes
+    # which path runs, and a regression there should be visible.
+    daily = [base + i * 86_400_000_000 for i in range(rows)]
+
+    def uncached():
+        for wall in daily:
+            fixed.render(wall, None)
+
+    def strftimed():
+        for wall in stamps:
+            wall_us_to_datetime(wall).strftime("%Y-%m-%d %H:%M:%S.%f")
+
+    b.latency("timestamp column, fixed (M3)",
+              lambda: [format_wall_us(x) for x in stamps], rows)
+    b.latency("timestamp column, absolute", frame(fixed), rows)
+    b.latency("timestamp column, time only", frame(time_only), rows)
+    b.latency("timestamp column, delta", frame(delta, relative=True), rows)
+    b.latency("timestamp column, elapsed", frame(elapsed), rows)
+    b.latency("timestamp column, a new day every row", uncached, rows,
+              note="the per-day template cache missing on every row")
+
+
+def run_profile_benches(b: Bench, files: int = 2000) -> None:
+    """
+    Opening and saving a profile -- FR-49 to FR-52, SPEC 12.
+
+    Not in the frame budget: this runs once, on a menu command, and the open it
+    starts is dominated by indexing. It is measured because the two parts that
+    could surprise someone are both proportional to something a *user* controls
+    and not to the log -- a glob over a log directory that nobody prunes, and a
+    profile carrying a bookmark per incident for a year.
+
+    The directory is written once and resolved repeatedly, so what is measured
+    is the resolve and not the writes.
+    """
+    profile = Profile(
+        name="bench",
+        sources=[SourceSpec(path=f"C:/logs/service-{i}.log", alias=f"s{i}")
+                 for i in range(12)],
+        bookmarks=[Bookmark(source="s0", wall_us=1_793_124_128_113_456 + i,
+                            line_no=i + 1, note="looked at this one")
+                   for i in range(100)],
+    )
+    text = dump_profile(profile)
+    b.latency("profile dump (12 sources, 100 bookmarks)",
+              lambda: dump_profile(profile), 1)
+    b.latency("profile load (12 sources, 100 bookmarks)",
+              lambda: load_profile(text), 1)
+
+    with tempfile.TemporaryDirectory(prefix="logweave-profile-bench-") as tmp:
+        folder = Path(tmp)
+        for i in range(files):
+            (folder / f"gateway-{i:05d}.log").write_bytes(b"x")
+        one = Profile(sources=[SourceSpec(glob=f"{folder.as_posix()}/gateway-*.log")])
+        newest = Profile(sources=[SourceSpec(glob=f"{folder.as_posix()}/gateway-*.log",
+                                             select="newest", count=3)])
+        b.latency(f"profile resolve, glob over {files} files",
+                  lambda: resolve_profile(one), 1)
+        b.latency(f"profile resolve, newest 3 of {files}",
+                  lambda: resolve_profile(newest), 1)
+
 def report(results: list[Result], baseline: dict | None, tolerance: float) -> list[str]:
     name_w = max(len(r.name) for r in results) + 1
     print(f"\n{'benchmark':<{name_w}} {'value':>12} {'unit':<9} {'time':>9}  "
@@ -884,6 +1005,12 @@ def main(argv: list[str] | None = None) -> int:
                     help="skip the find/filter scan benchmarks (SPEC 11, "
                          "FR-44, FR-45); the in-place row writes the subject "
                          "to a temporary file")
+    ap.add_argument("--skip-profile", action="store_true",
+                    help="skip the profile benchmarks (SPEC 12, FR-49 to "
+                         "FR-52); the glob resolve writes a directory of "
+                         "empty files to a temporary directory")
+    ap.add_argument("--profile-files", type=int, default=2000,
+                    help="how many files the resolved glob matches")
     ap.add_argument("--gate", action="store_true", help="exit non-zero on regression")
     ap.add_argument("--tolerance", type=float, default=0.25)
     ap.add_argument("--cores", type=int, default=0,
@@ -915,6 +1042,9 @@ def main(argv: list[str] | None = None) -> int:
         run_scan_benches(b, chunk)
         if not args.skip_merge:
             run_filter_benches(b, args.merge_rows, args.merge_sources)
+    run_time_benches(b)
+    if not args.skip_profile:
+        run_profile_benches(b, args.profile_files)
 
     # A baseline is only comparable to a run of the same shape. Several
     # benchmarks (histogram, build_cumulative) scale with bucket count rather

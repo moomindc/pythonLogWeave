@@ -31,7 +31,6 @@ from PySide6.QtGui import QColor, QFont, QFontMetrics, QGuiApplication, QPainter
 from PySide6.QtWidgets import QAbstractScrollArea, QWidget
 
 from ..highlight import RowStyle, Ruleset, Span, Style, default_ruleset
-from ..index.civil import format_wall_us
 from ..session import Session
 from ..session import palette as pal
 from ..session.find import Query
@@ -42,6 +41,7 @@ from ..session.rowformat import (
     RowFormatter,
     SourceNaming,
 )
+from ..session.timefmt import TimeFormatter
 from . import theme
 
 SCROLL_UNITS_MAX = 1_000_000_000
@@ -170,6 +170,17 @@ class MergedLogView(QAbstractScrollArea):
         hex strings the rules carry.
         """
 
+        self._time = TimeFormatter()
+        """
+        How the timestamp column is rendered (FR-35).
+
+        Held as a built formatter rather than as a `TimeDisplay`, because the
+        relative modes need the session's span to settle their width and the
+        view is not the thing that knows when that has changed -- the window
+        builds one with `timefmt.for_span` and hands it over. Set before the
+        font, since the column's width is measured from `sample`.
+        """
+
         self._font_point = theme.FONT_POINT
         self._apply_font(theme.FONT_POINT)
 
@@ -215,9 +226,10 @@ class MergedLogView(QAbstractScrollArea):
         self._metrics = QFontMetrics(base)
         self._char_w = max(1, self._metrics.horizontalAdvance("0"))
         self._row_h = self._metrics.height() + theme.ROW_PADDING
-        # The timestamp column is a fixed width because the format is fixed;
-        # measuring the widest rendered stamp once avoids reflow while scrolling.
-        self._ts_w = self._metrics.horizontalAdvance("2026-10-04 14:22:08.113456") + PAD
+        # The timestamp column is a fixed width because every format renders to
+        # a fixed width (FR-35); measuring the widest rendered stamp once
+        # avoids reflow while scrolling.
+        self._ts_w = self._metrics.horizontalAdvance(self._time.sample) + PAD
 
         bold = QFont(base)
         bold.setBold(True)
@@ -429,6 +441,22 @@ class MergedLogView(QAbstractScrollArea):
         self._show_timestamp = show
         self.refresh()
         self.timestampVisibilityChanged.emit(show)
+
+    @property
+    def time_format(self) -> TimeFormatter:
+        return self._time
+
+    def set_time_format(self, formatter: TimeFormatter) -> None:
+        """
+        Change how the timestamp column reads (FR-35).
+
+        Re-measures the column, because a format is allowed to be a different
+        width from the last one -- that is most of the reason to change it --
+        and the message column starts where this one ends.
+        """
+        self._time = formatter
+        self._ts_w = self._metrics.horizontalAdvance(formatter.sample) + PAD
+        self.refresh()
 
     def trims_timestamp(self) -> bool:
         """
@@ -755,7 +783,8 @@ class MergedLogView(QAbstractScrollArea):
             naming=naming or SourceNaming.BASENAME,
             micros=True, trim_timestamp=self.trims_timestamp(),
             columns=self.displayed_columns(),
-            template=template or None)
+            template=template or None,
+            time_fmt=self._time)
         text = formatter.format(rows)
         if text:
             QGuiApplication.clipboard().setText(text)
@@ -983,11 +1012,21 @@ class MergedLogView(QAbstractScrollArea):
             painter.setClipRect(QRect(0, 0, msg_left, height))
             stamp_x = self._left_gutter
             normal, inferred = self._stamp, self._stamp_inferred
+            # Delta mode (FR-35) reads the row above the band being painted,
+            # which for the top of a damaged band is a row this paint did not
+            # fetch. One `row_to_time` for the whole band, served by the merge's
+            # block cache, rather than a row of rows nobody is going to draw.
+            previous = None
+            start_row = top + first
+            if self._time.needs_previous and start_row > 0:
+                previous = self.session.row_to_time(start_row - 1)
             for i, r in enumerate(rows, start=first):
                 painter.setPen(inferred if r.inferred else normal)
                 painter.drawText(
-                    stamp_x, i * row_h + baseline_adjust, format_wall_us(r.ts),
+                    stamp_x, i * row_h + baseline_adjust,
+                    self._time.render(r.ts, previous),
                 )
+                previous = r.ts
 
         # Pass 4 -- messages, the only thing that scrolls horizontally (FR-36a),
         # styled by the highlight rules (FR-30).

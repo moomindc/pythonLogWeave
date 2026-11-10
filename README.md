@@ -179,6 +179,10 @@ like logs, one level deep.
 | F8 / Shift+F8 | Next / previous ERROR or worse (Ctrl+F8 for WARNING or worse) |
 | Alt+Down / Alt+Up | Next / previous row from the file the cursor is on |
 | Ctrl+T | Hide the timestamp column — see below |
+| View ▸ Timestamps | Clock time, elapsed from a zero point, or the gap since the previous row — see below |
+| Ctrl+Shift+Z | Make this row the zero point for elapsed time |
+| Ctrl+F2 | Bookmark this row, or clear its bookmark — see below |
+| F2 / Shift+F2 | Next / previous bookmark |
 | Ctrl+M / Ctrl+L | Collapse the minimap / the timeline — see below |
 | Ctrl+Shift+F | Follow new lines: watch every open file and keep the view at the end — see below |
 | Ctrl++ / Ctrl+- / Ctrl+0 | Text size, also Ctrl+wheel; remembered between runs |
@@ -192,6 +196,9 @@ like logs, one level deep.
 | View ▸ Highlighting | Which rule sets are in force, plus **Edit Rules** — see below |
 | Right-click a dock row | Follow that one file, or stop — independently of the others |
 | Double-click a dock row | Rename that source; clear the name to go back to the default |
+| Ctrl+Shift+O | Open a profile: a saved session, with its files, names, colours, filter and bookmarks — see below |
+| Ctrl+S / Ctrl+Shift+S | Save this session as a profile / save it as a new one |
+| File ▸ Recent Logs / Recent Profiles | The last ten of each, checked against the disk before they are offered |
 | File ▸ Clear Index Cache | Delete the saved indexes — see below |
 
 **The index cache.** The first open of a large log has to read all of it; after
@@ -441,6 +448,97 @@ timestamp anyway. Hiding it also stops the trimming, so the time never
 disappears from the row entirely: you are choosing which copy to keep, not
 whether to have one.
 
+**What the column shows is configurable, in three modes.** `View ▸ Timestamps`
+switches between them while you read; the pattern each uses is in
+`Edit ▸ Settings ▸ Appearance`, because a format is something you set up once
+and a mode is something you flip mid-investigation.
+
+- **Clock time** — the parsed timestamp, in a `strftime` pattern you choose.
+  Eight presets, from the full date down to `%H:%M:%S`, and a box to type your
+  own. `%L` is milliseconds, which C's `strftime` has no directive for although
+  nearly every logging framework emits them.
+- **Elapsed** — `+00:04:12.318` from a zero point. **Ctrl+Shift+Z** makes the
+  row you are on the zero, which is how you answer "how long after the deploy
+  did this start".
+- **Delta** — the gap since the row above. This is the mode that pays for the
+  other two: a forty-second stall between two lines is invisible in clock time
+  and unmissable as a number in its own column.
+
+The relative columns are sized from the span of what is open and blank their
+unused leading groups rather than zero-filling, so `4.512` and `1:02:33.004`
+line up and a long gap stands out by how far left it starts. The absolute time
+of the current row stays in the status bar in both relative modes, because
+"twelve seconds after the zero" is not a thing you can paste into a ticket. The
+zero point itself is deliberately not remembered between runs: it is a row in
+the log that was open, not a preference.
+
+**Bookmarks.** **Ctrl+F2** marks the row you are on, **F2** and **Shift+F2**
+step to the next and previous, and **Ctrl+Shift+F2** clears them all. A count
+sits in the status bar and every mark gets a violet tick in its own column on
+both overview strips — the same mechanism a highlight rule's marks and the
+find's hits use, so three kinds of mark are three columns rather than three
+behaviours.
+
+Stepping does not wrap. A reader walking down a set of marks needs to be told
+they have reached the last one, not quietly returned to the first.
+
+A bookmark is held against the file and entry it was put on, never the row
+number, because a row number is derived from what is open and what is filtered —
+open another file and every row below the first entry of it moves. Saved into a
+profile it becomes the source's name, the timestamp *and* the line number: a log
+that writes four lines in the same millisecond is ordinary, and a timestamp
+alone would come back on the first of them.
+
+**Profiles (Ctrl+Shift+O, Ctrl+S).** A profile is one TOML file that says how
+to open a set of logs: which files, what to call them, which colours, which
+format and encoding overrides, each file's ± clock offset and follow state, the
+filter in force, your bookmarks, the timestamp mode, which columns and strips
+show, and the highlight rules this investigation needs. Opening one closes
+what is open first, because a profile is a session rather than an import.
+
+It is a file you can read, diff and commit, and that is the point — a profile
+is how a team shares "these are the eight logs you need to look at, and here is
+what we have learnt to look for in them". Windows paths are written in TOML's
+literal strings, so they are not doubled.
+
+**A source can be a glob**, and that is the feature profiles exist for:
+`C:/Acme/logs/gateway-*.log` is not a list of files, it is a question asked
+again every time the profile opens, and the answer is different on Tuesday.
+A glob can take all its matches, the newest *N*, or only those written within a
+window (`within = "7d"`).
+
+**An open that could not do all of it says so, and opens the rest.** A missing
+file, a glob that matched nothing, a relative path — each is reported in one
+strip across the top of the view with a **Retry**, and never in a modal: a
+profile written for a rotating set of logs legitimately has an unmatched glob
+most mornings, and the session that opened around it is perfectly usable. Retry
+re-resolves and adds whatever has appeared since to the session you are already
+reading, rather than rebuilding it and losing where you had got to.
+
+Saving over a profile you have hand-edited loses the comments you put in it, and
+the status bar says how many lines went. The profile's own filters stay on
+`Search ▸ Saved Filters`, so a profile can carry the four views a team always
+looks at.
+
+**Your own highlight rules are not touched by opening someone else's profile.**
+The profile's rules are merged by name with yours for as long as that window is
+open, the profile's version winning where both have a rule of the same name, and
+nothing is written back to your own list.
+
+**Recent lists, and double-click (FR-53, FR-54).** `File ▸ Recent Logs` and
+`File ▸ Recent Profiles` are two lists of ten rather than one, because reopening
+a profile and glancing at a single log are different errands and mixing them
+puts the one you want behind nine of the other. Both are checked against the
+disk as the menu opens, so nothing is offered that has gone.
+
+A tick in `Edit ▸ Settings ▸ Session` makes `.lwprofile` files open in LogWeave
+when double-clicked. It writes one key under `HKEY_CURRENT_USER`, so it needs no
+administrator rights and changes nothing for other accounts, and unticking
+removes it again. Nothing is claimed on first run. The same page has *Reopen the
+most recent profile* on start, off by default — opening yesterday's logs because
+LogWeave was once pointed at them is a slow start nobody asked for — and
+anything named on the command line wins over it.
+
 Larger corpora, generated on demand and never committed:
 
 ```bash
@@ -475,8 +573,8 @@ living record — updated as each lands.
 | **M6** | Follow engine; rotation matrix green | ✅ **done** |
 | **M6a** | Settings screen, the highlight-rule editor, rule marks on both strips | ✅ **done** |
 | **M7** | Search, filters, selection, copy, export, navigation keys | ✅ **done** |
-| **M8** | Profiles, file association, recent lists — plus the TOML ruleset import/export still outstanding on FR-31 | ⬜ next |
-| **M9** | Packaging, signing, cold-start tuning — **v1.0** | ⬜ |
+| **M8** | Profiles, bookmarks, configurable timestamps, file association, recent lists | ✅ **done** |
+| **M9** | Packaging, signing, cold-start tuning, the TOML ruleset import/export — **v1.0** | ⬜ next |
 
 Then: phase 2 Windows Event Log, phase 3 syslog listener.
 
@@ -1548,6 +1646,39 @@ complaint never arrived: the box sat there looking like a search that had found
 nothing. It now refreshes on every keystroke, which is also what stops a stale
 count describing a term you have already changed.
 
+### Colouring everything is colouring nothing
+
+Reported after M7 was called done, and the fix is worth recording because the
+first attempt at it was half a fix. The shipped rules coloured all eight
+severity classes, so in a healthy log — almost nothing but INFO — every row was
+coloured, and a view in which everything is coloured is one in which nothing
+stands out.
+
+The default now stops at WARNING. The quiet classes keep their rules and their
+`severity`, so the severity filter, the jump-to-next-error keys and the band
+proportions on the strips are untouched; what stops is the paint. The syslog set
+ships `<0>`–`<4>` and drops `<5>`–`<7>` outright rather than shipping them
+uncoloured, because a syslog rule is a regex and so cannot carry a severity — an
+uncoloured one would do nothing at all while still costing a branch in the one
+regex every row is scanned with.
+
+**The half fix is the interesting part.** Dimming the message text left the
+minimap still drawing INFO in saturated blue, because the strips derive their
+bands from the palette directly. The floor was a constant in
+`highlight/builtins.py`, and `session/overview.py` cannot read it — `highlight`
+imports `session.palette`, so a constant on that side can only reach the strips
+by inverting the dependency. It now lives in the palette as `COLOUR_FROM`, where
+all three surfaces that colour by severity read it: the message text, the
+severity mark in the gutter, and the bands. A floor that disagreed between them
+would have been worse than no floor at all.
+
+The gutter mark went quiet with the minimap deliberately: it is the per-row form
+of a minimap band, so the two have to agree. It is still *drawn* for those rows,
+in the strips' own ordinary-traffic grey, so "this line states its level" is
+still visible — it just stops shouting. The message text falls back to the
+ordinary foreground rather than that grey, because a message is read, not
+scanned, and dimming most of a file would make it look disabled.
+
 ### Export is on the UI thread on purpose
 
 Reading rows means `session.rows()`, which mutates the decoded-text LRU and the
@@ -1575,6 +1706,177 @@ clipboard ownership again sends the previous owner — this same process — a
 `WM_DESTROYCLIPBOARD`, which arrives as a posted message and drops the data Qt is
 holding. The application always has an event loop, so only a test can see it;
 `copied_text` is the helper that pumps one, with the explanation attached.
+
+## M8 — what it delivers and what it found
+
+Coming back to the same investigation tomorrow. A profile that remembers which
+files, under what names, in what colours, with which filter and which
+bookmarks, and resolves its globs again against whatever rotated overnight; the
+timestamp column made configurable, including the two relative modes that make a
+stall visible; and the recent lists and file association that make a profile
+something you double-click.
+
+| Key | What it does |
+|---|---|
+| **Ctrl+Shift+O** | Open a profile |
+| **Ctrl+S** / **Ctrl+Shift+S** | Save this session as a profile / as a new one |
+| **Ctrl+F2** | Bookmark this row, or clear it |
+| **F2** / **Shift+F2** | Next / previous bookmark (no wrap) |
+| **Ctrl+Shift+F2** | Clear every bookmark |
+| **Ctrl+Shift+Z** | Make this row the zero point for elapsed time |
+| **View ▸ Timestamps** | Clock time, elapsed, or delta from the previous row |
+| **File ▸ Recent Logs / Recent Profiles** | The last ten of each |
+| **Search ▸ Saved Filters** | The filters the open profile carries |
+
+**FR-35 came in with it, unscheduled, because it had to.** The profile schema
+and FR-49's list of what a profile saves both name a timestamp format, and
+there was no such thing to name: the column had been a fixed
+`%Y-%m-%d %H:%M:%S.%f` since M3. Building the profile first would have meant
+writing a key for a feature that did not exist.
+
+### Delta is the mode that pays for the other two
+
+Clock time with a chosen pattern is the obvious half of FR-35 and the least
+interesting. The reason to do the work is the other two: **elapsed** from a row
+you pick, and **delta** from the row above.
+
+A forty-second stall between two log lines is invisible in clock time. The
+timestamps differ in the seconds field and nothing about the row says that one
+of these gaps is forty times the others. As a number in its own column it is
+the first thing you see.
+
+Two decisions in that column are worth recording. **Its leading groups are
+blanked rather than zero-filled** — `4.512` and `1:02:33.004` line up on the
+right, and a long gap announces itself by starting further left, where
+`00:00:04.512` would hide it in a wall of zeros. And **it widens rather than
+truncating**: the first version sized the column from the log's span and then
+silently printed 83 seconds as `23.456789`, which is a wrong number that looks
+like a right one. The width is now a floor, not a cap.
+
+The absolute time of the current row stays in the status bar in both relative
+modes, because "+12.318" is not something you can paste into a ticket.
+
+### The date half of a timestamp is rendered once a day
+
+A configurable format is rendered per visible row per frame, so the first
+version — build a dict of fields, run the pattern over it — cost **15.6 µs a
+row**, which is worse than `datetime.strftime`, the thing it exists to beat.
+
+Consecutive log rows are nearly always on the same day, and a pattern's date
+fields cannot change within one. So the date half is pre-rendered into a
+`str.format` template once per day and a row is one `format` over the clock
+fields: **7.0 µs**, against 6.0 µs for the fixed column it replaced. A
+configurable format costs 0.06 ms of a 16 ms frame.
+
+The relative modes had their own version of the same mistake. Checking whether
+an offset still fits the column by recomputing the column's shape, per row, cost
+22.2 µs — three times the absolute path, for a branch no row should ever take.
+The shape now carries the largest offset it covers, so the check is one integer
+comparison.
+
+### `tomlkit` was a 400 KB dependency for comments in a file we write whole
+
+SPEC §12.1 specified `tomlkit` so that a user's comments and key order survive a
+save. The engine's only hard dependency is numpy, deliberately, and that is what
+makes the "no Qt below layer 5" rule testable — so adding a parser to preserve
+comments wanted more justification than it had.
+
+Profiles are read with stdlib `tomllib` and written by a 120-line emitter with a
+fixed section order, which writes *its own* explanatory comments into every
+profile it produces. A saved profile is a better document than a round-tripped
+one, and a hand-edited profile still reads fine because `tomllib` does not care.
+
+What it costs is honest and visible: your own comments do not survive a Save.
+`comments_at_risk` counts them before the write and the status bar says how many
+went. That is the one thing that must not be a surprise, and the decision is
+cheap to revisit — with a user who has lost a comment, rather than a guess now.
+
+The same section now writes Windows paths as TOML **literal** strings
+(`'C:\Acme\logs\a.log'`) rather than basic ones. Both are valid; a basic string
+doubles every separator, and FR-53 asks for a file a person can read and diff. A
+doubled path is the first thing a reader would try to "fix".
+
+### `settings.toml` was promised for M8, and should not be built
+
+SPEC §12.3 said a global `settings.toml` would arrive with the profiles, holding
+the global rules, the theme, the cache cap and the recent lists. Every user of
+that file turned out to belong on the other side of its own argument:
+
+- the global highlight rules are already in `QSettings`, and a profile now
+  carries its own — which is how a team shares a ruleset today, in the file that
+  names the logs it is for;
+- the recent lists are the clearest case of "where this person left a window" in
+  the whole application: per machine, per user, and nobody would review them in
+  a pull request;
+- the cache cap, the poll intervals and the default copy format have no UI. A
+  format to maintain with no reader.
+
+So what the file is actually for is **sharing a ruleset without sharing a
+profile**, and that is an import and an export of a ruleset — not a second store
+with precedence rules against the first. It moved to M9 as that feature, which
+is also where the TOML ruleset import/export owed since M4 has been sitting.
+
+### Four defects, each of which looked like working code
+
+**A bookmark cannot be `(file, timestamp)`.** SPEC §12.2 said it could, for a
+good reason — a row number is derived from what is open and what is filtered, so
+a bookmark stored as one moves the moment another file is opened. But a
+timestamp is not unique either. A log that writes four lines in the same
+millisecond is ordinary, and restoring by file and timestamp landed on the first
+of that run every time. A test caught it before a user could; a bookmark is now
+saved with the line number inside its own file, which is a coordinate in a file
+rather than in a merge and is therefore as stable as the timestamp.
+
+**Deduplicating a resolve cost half a second.** A profile's files are
+deduplicated — a file named by a glob and by a path, or by two overlapping
+globs, must open once, or every one of its rows appears twice in the merge and
+the log looks like it is repeating itself. `Path.resolve()` is the obvious call
+and asks the filesystem: roughly 0.25 ms a path on Windows, so **0.55 s for one
+glob over 2000 files**. It is now `normcase(normpath(abspath(path)))`, string
+work, and the whole resolve is 46 ms — cheaper than reading the profile that
+asked for it. What that gives up is seeing through a junction, which would open
+those files twice; that is a rare way to write a profile and a visible one when
+it happens, against half a second of lag on every open, which is neither.
+
+**`logweave.profile.resolve` is not the module.** The package re-exports
+`resolve` as a function, so `from logweave.profile import resolve as r` binds
+the function and `r.resolve` does not exist. It caught a test first and then the
+benchmark harness, both of which failed in a way that pointed at the wrong
+thing. Both now import from the real module, with the reason written next to the
+import.
+
+**Installing a saved filter ran five scans nobody wanted.** The filter bar could
+be told a severity, or a source set, or a time window — one at a time, each
+emitting `filterChanged`, each starting a background scan of every open file. A
+profile's saved filter sets six things, so applying one meant six scans with
+five of them thrown away before the sixth was the answer. `set_filter` installs
+the lot with the widgets blocked and emits once.
+
+### What the window does while a profile is opening
+
+Indexing happens on a worker thread, so opening a profile cannot be one call. The
+view preferences go on **before** the files — a session that appeared in your
+columns and then rearranged itself into the profile's would look like a fault —
+and everything that names a source by alias (the filter, the bookmarks, the
+per-source follow state) goes on at the end of the open, when there is something
+to name. Tests run the synchronous path, which takes the same two steps, so it is
+not a special case that nobody exercises.
+
+An open that could not do all of it reports in one non-modal strip with a Retry,
+and **Retry re-resolves rather than reopening**. A glob that matched nothing at
+09:00 usually matches at 09:05 because the writer rotated; what you want then is
+the missing file added to the session you are already reading, not that session
+torn down and rebuilt around it.
+
+### The file association is a tick, not a first run
+
+`.lwprofile` opening in LogWeave is one checkbox in `Edit ▸ Settings ▸ Session`,
+which writes a single key under `HKEY_CURRENT_USER` — no administrator rights,
+nothing decided for other accounts on the machine, and unticking removes it
+again. Nothing is claimed on first run. An application that quietly takes an
+extension is the behaviour everyone has learnt to resent, and a log viewer has
+no business doing it. An extension already claimed by something else is
+reported, never overwritten silently.
 
 ## Layout
 

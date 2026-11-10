@@ -140,6 +140,34 @@ class SessionSource:
 
 
 @dataclass
+class OpenOptions:
+    """
+    What a profile knows about a file before it is opened -- FR-49, SPEC 12.1.
+
+    Everything here is something the session would otherwise work out for
+    itself: the alias from the paths, the colour from the position, the format
+    and the encoding from the bytes. A profile supplies them when a reader has
+    already decided, and leaving a field empty means "work it out" rather than
+    "use nothing" -- which is why the two text overrides default to the empty
+    string and not to a sentinel.
+
+    `alias` arrives as a *custom* alias (`alias_custom`), because a name in a
+    profile is a name somebody typed. Recomputing it on the next open would
+    undo their decision the first time another file joined the set.
+    """
+
+    alias: str = ""
+    colour: str = ""
+    skew_us: int = 0
+    enabled: bool = True
+    follow: bool = True
+    encoding: str = ""
+    """FR-5 override. Empty detects, which is almost always right."""
+    ts_format: str = ""
+    """FR-13 override: a catalogue format name. Empty detects."""
+
+
+@dataclass
 class OpenResult:
     """What happened when files were added -- the UI reports this (FR-19)."""
 
@@ -202,22 +230,29 @@ class Session:
     # opening
     # ------------------------------------------------------------------
 
-    def add_files(self, paths: list[Path | str]) -> OpenResult:
+    def add_files(self, paths: list[Path | str],
+                  options: list[OpenOptions] | None = None) -> OpenResult:
         """
         Open and index files, then rebuild the merge once for the whole batch.
 
         Batched on purpose: dropping twelve files should cost one checkpoint
         build, not twelve.
+
+        `options` is one `OpenOptions` per path, or None for the ordinary case
+        where the session works everything out itself. A profile supplies them
+        (FR-49); a drag-and-drop never does.
         """
         from ..source.file import FileSource
 
         result = OpenResult()
-        for raw in paths:
+        for i, raw in enumerate(paths):
             path = Path(raw)
+            opts = options[i] if options and i < len(options) else None
             try:
-                src = FileSource(path)
+                src = FileSource(path,
+                                 encoding_override=opts.encoding if opts else "")
                 src.open()
-                self._add_source(src, path, result)
+                self._add_source(src, path, result, opts)
             except (SourceError, OSError) as exc:
                 result.failed.append((str(path), str(exc)))
 
@@ -225,7 +260,8 @@ class Session:
         self._rebuild()
         return result
 
-    def _add_source(self, src: LogSource, path: Path, result: OpenResult) -> None:
+    def _add_source(self, src: LogSource, path: Path, result: OpenResult,
+                    opts: OpenOptions | None = None) -> None:
         from ..index.civil import epoch_us_to_wall_us
 
         order = len(self.sources)
@@ -235,12 +271,26 @@ class Session:
             mtime = 0
 
         outcome = open_index(src, mtime_wall_us=mtime, path=path,
-                             use_cache=self.use_cache, root=self.cache_root)
+                             use_cache=self.use_cache, root=self.cache_root,
+                             force_format=opts.ts_format if opts else "")
         index = outcome.index
         meta = src.meta
         meta.alias = meta.alias or path.stem
         meta.origin = meta.origin or str(path)
         meta.colour = meta.colour or palette.lane_colour(order)
+        if opts is not None:
+            # A profile's decisions, applied before the merge is built so the
+            # first paint is already what the reader saved -- a source that
+            # appeared and then jumped to a different colour, or flickered into
+            # the merge before being hidden, would look like a bug in the open.
+            if opts.alias:
+                meta.alias = opts.alias
+                meta.alias_custom = True
+            if opts.colour:
+                meta.colour = opts.colour
+            meta.skew_us = int(opts.skew_us)
+            meta.enabled = bool(opts.enabled)
+            meta.follow = bool(opts.follow)
 
         self.sources.append(SessionSource(source=src, index=index, meta=meta,
                                           cache=outcome))

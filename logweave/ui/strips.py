@@ -117,6 +117,16 @@ class OverviewStrip(QWidget):
         unreadable even when every pixel in it is right.
         """
         self._find_time: int | None = None
+        self._bookmarks = None
+        """
+        The reader's bookmarks as a `MarkLayer` (FR-37), or None.
+
+        Its own column, between the rules and the find, and held apart from
+        both for the reason `_find` is: a bookmark outlives every search and
+        most rule toggles, so its column must not move when either changes. A
+        mark that moves for an unrelated reason is unreadable even when every
+        pixel in it is right.
+        """
         self._top_row = 0
         self._page_rows = 1
         self._marker_time: int | None = None
@@ -199,6 +209,13 @@ class OverviewStrip(QWidget):
         self._find = layer
         self.update()
 
+    def set_bookmark_marks(self, layer) -> None:
+        """The rows this reader has marked (FR-37), as their own column."""
+        if layer is self._bookmarks:
+            return
+        self._bookmarks = layer
+        self.update()
+
     def set_find_current(self, wall_us: int | None) -> None:
         """Merged time of the hit the user is standing on, or None."""
         if wall_us == self._find_time:
@@ -207,7 +224,12 @@ class OverviewStrip(QWidget):
         self.update()
 
     def _gutter_layers(self) -> tuple:
-        return self._marks + ((self._find,) if self._find is not None else ())
+        # Rules, then bookmarks, then the find: left to right in order of how
+        # long each has been true. The find is always rightmost because it is
+        # the most transient; the bookmarks sit inside it because they belong
+        # to the session and outlive any one search.
+        extra = tuple(x for x in (self._bookmarks, self._find) if x is not None)
+        return self._marks + extra
 
     def _paint_find_current(self, painter: QPainter, strip: Strip) -> None:
         """

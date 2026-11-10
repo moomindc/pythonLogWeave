@@ -37,6 +37,7 @@ from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
+    QComboBox,
     QDialog,
     QDialogButtonBox,
     QFormLayout,
@@ -44,6 +45,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QHeaderView,
     QLabel,
+    QLineEdit,
     QPushButton,
     QSpinBox,
     QTabWidget,
@@ -53,9 +55,12 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from .. import profile as pf
 from ..highlight.builtins import USER_SET
 from ..highlight.rules import HighlightRule, Ruleset, RulesetGroup
-from . import theme
+from ..session import timefmt
+from ..session.timefmt import TimeDisplay, TimeMode
+from . import association, theme
 from .mergedview import FONT_MAX, FONT_MIN
 from .ruledialog import RuleDialog, colour_swatch, where_label
 
@@ -88,6 +93,22 @@ class Settled:
     show_line_no: bool = False
     show_minimap: bool = True
     show_timeline: bool = True
+    time_display: TimeDisplay = field(default_factory=TimeDisplay)
+    """
+    FR-35. Carried whole rather than as a mode and a pattern, so the dialog
+    cannot settle one without the other and the window has one thing to install.
+    """
+    reopen_last: bool = False
+    """FR-54: reopen the most recent profile on start."""
+    associate: bool | None = None
+    """
+    FR-53: whether `.lwprofile` should open this LogWeave.
+
+    Three-valued, and `None` means "do not touch it": the association is an
+    operating-system fact rather than a preference of this window, and a
+    platform that has none must settle something the window can tell apart
+    from "the reader unticked it".
+    """
     active_sets: set[str] = field(default_factory=set)
     user_rules: list[HighlightRule] = field(default_factory=list)
 
@@ -320,8 +341,10 @@ class SettingsDialog(QDialog):
 
         self.tabs = QTabWidget()
         self.appearance = _AppearancePage(current)
+        self.session = _SessionPage(current)
         self.highlight = HighlightPage(group)
         self.tabs.addTab(self.appearance, "&Appearance")
+        self.tabs.addTab(self.session, "&Session")
         self.tabs.addTab(self.highlight, "&Highlighting")
 
         self.buttons = QDialogButtonBox(
@@ -339,6 +362,7 @@ class SettingsDialog(QDialog):
 
     def settled(self) -> Settled:
         got = self.appearance.settled()
+        self.session.settle_into(got)
         got.active_sets = self.highlight.active_sets()
         got.user_rules = self.highlight.rules
         return got
@@ -394,6 +418,9 @@ class _AppearancePage(QWidget):
             cols.addWidget(box)
         form.addRow(columns)
 
+        self.time = _TimePage(current.time_display)
+        form.addRow(self.time)
+
         strips = QGroupBox("Overview strips")
         box = QVBoxLayout(strips)
         self.show_minimap = QCheckBox("Minimap (severity across the rows)")
@@ -420,7 +447,216 @@ class _AppearancePage(QWidget):
             show_line_no=self.show_line_no.isChecked(),
             show_minimap=self.show_minimap.isChecked(),
             show_timeline=self.show_timeline.isChecked(),
+            time_display=self.time.settled(),
         )
+
+
+class _SessionPage(QWidget):
+    """
+    What happens to profiles outside this window -- FR-53, FR-54.
+
+    Two settings that are neither about how the log looks nor about what gets
+    coloured, which is why they are a tab and not another group box on
+    Appearance: one decides what the application does *before* there is a
+    window to look at, and the other reaches outside the application
+    altogether.
+
+    Like every other page here, it settles plain data and touches nothing. The
+    association is written by `MainWindow`, because the dialog does not get to
+    edit the registry on an Apply the reader may still cancel.
+    """
+
+    def __init__(self, current: Settled, parent: QWidget | None = None):
+        super().__init__(parent)
+        layout = QVBoxLayout(self)
+
+        start = QGroupBox("On start")
+        box = QVBoxLayout(start)
+        self.reopen_last = QCheckBox("Reopen the most recent profile")
+        self.reopen_last.setChecked(bool(current.reopen_last))
+        self.reopen_last.setToolTip(
+            "Off by default: opening yesterday's logs because LogWeave was "
+            "once pointed at them is a slow start nobody asked for (FR-54).")
+        box.addWidget(self.reopen_last)
+        hint = QLabel(
+            "Files named on the command line, or a profile opened by "
+            "double-click, win over this.")
+        hint.setWordWrap(True)
+        hint.setStyleSheet(f"color: {theme.DIM};")
+        box.addWidget(hint)
+        layout.addWidget(start)
+
+        files = QGroupBox("Profile files")
+        inner = QVBoxLayout(files)
+        self.associate = QCheckBox(
+            f"Open {pf.SUFFIX} files in LogWeave when double-clicked")
+        self.associate.setChecked(current.associate is True)
+        self.associate.setEnabled(current.associate is not None)
+        self.associate.setToolTip(
+            "Writes one key under HKEY_CURRENT_USER: no administrator rights, "
+            "no change for other accounts, and unticking removes it (FR-53).")
+        inner.addWidget(self.associate)
+        self.state = QLabel(association.describe())
+        self.state.setWordWrap(True)
+        self.state.setStyleSheet(f"color: {theme.DIM};")
+        inner.addWidget(self.state)
+        layout.addWidget(files)
+
+        layout.addStretch(1)
+        self._had = current.associate
+
+    def settle_into(self, got: Settled) -> None:
+        """
+        Add this page's answers to the dialog's.
+
+        `associate` settles `None` -- "leave it alone" -- unless the reader
+        actually moved the box. An Apply that rewrote the association every
+        time would hit the registry on every OK, and on a platform with no
+        association at all it would have nothing to write.
+        """
+        got.reopen_last = self.reopen_last.isChecked()
+        now = self.associate.isChecked()
+        got.associate = (None if self._had is None or now == self._had else now)
+
+
+class _TimePage(QGroupBox):
+    """
+    The timestamp column's format -- FR-35.
+
+    A mode, and for the absolute mode a pattern with presets behind a combo
+    box. The custom field is always visible rather than revealed by a "custom"
+    entry, because a reader who wants to adjust a preset slightly should be
+    able to see what the preset *is*: choosing one fills the field, and editing
+    the field is what makes it custom.
+
+    The two relative modes grey the pattern out rather than hiding it, so the
+    window does not change shape as the radio buttons move, and because the
+    pattern is still what comes back if absolute is chosen again.
+    """
+
+    def __init__(self, current: TimeDisplay, parent: QWidget | None = None):
+        super().__init__("Timestamp column", parent)
+        layout = QVBoxLayout(self)
+
+        self.mode = QComboBox()
+        for mode, label, tip in (
+            (TimeMode.ABSOLUTE, "Clock time",
+             "The time each line was written."),
+            (TimeMode.ELAPSED, "Elapsed from a zero point",
+             "Signed offset from a row you choose with View ▸ Timestamps "
+             "▸ Set zero point here. An incident reads as a timeline: the "
+             "deploy is +0 and the first timeout is +1:04.882."),
+            (TimeMode.DELTA, "Difference from the row above",
+             "How long passed since the previous row. A stall between two "
+             "lines is invisible in clock time and unmissable here."),
+        ):
+            self.mode.addItem(label, mode.value)
+            self.mode.setItemData(self.mode.count() - 1, tip,
+                                  Qt.ItemDataRole.ToolTipRole)
+        self.mode.setCurrentIndex(
+            max(0, self.mode.findData(current.mode.value)))
+        self.mode.currentIndexChanged.connect(self._mode_changed)
+
+        form = QFormLayout()
+        form.addRow("&Shows", self.mode)
+
+        self.preset = QComboBox()
+        for pattern, label in timefmt.PRESETS:
+            self.preset.addItem(f"{label}  —  {pattern}", pattern)
+        self.preset.addItem("Custom", "")
+        self.preset.currentIndexChanged.connect(self._preset_chosen)
+        form.addRow("&Format", self.preset)
+
+        self.pattern = QLineEdit(current.pattern)
+        self.pattern.setToolTip(
+            "%Y %y %m %d  %H %I %M %S  %f microseconds  %L milliseconds  "
+            "%b %a %p %j  %% a literal percent")
+        self.pattern.textEdited.connect(self._pattern_edited)
+        form.addRow("&Pattern", self.pattern)
+        layout.addLayout(form)
+
+        self.advice = QLabel()
+        self.advice.setWordWrap(True)
+        layout.addWidget(self.advice)
+
+        self._sync_preset()
+        self._mode_changed()
+
+    # ------------------------------------------------------------------
+
+    def _preset_chosen(self) -> None:
+        pattern = self.preset.currentData()
+        if pattern:
+            self.pattern.setText(pattern)
+        self._revalidate()
+
+    def _pattern_edited(self) -> None:
+        self._sync_preset()
+        self._revalidate()
+
+    def _sync_preset(self) -> None:
+        """Put the combo on the preset this pattern is, or on Custom."""
+        index = self.preset.findData(self.pattern.text())
+        self.preset.blockSignals(True)
+        self.preset.setCurrentIndex(index if index >= 0
+                                    else self.preset.count() - 1)
+        self.preset.blockSignals(False)
+
+    def _mode_changed(self) -> None:
+        absolute = self.mode.currentData() == TimeMode.ABSOLUTE.value
+        self.preset.setEnabled(absolute)
+        self.pattern.setEnabled(absolute)
+        self._revalidate()
+
+    def _revalidate(self) -> None:
+        """
+        Say what is wrong, or what the result will look like.
+
+        A preview rather than a bare "valid": the question a reader actually
+        has about `%j` is not whether it parses.
+        """
+        if self.mode.currentData() != TimeMode.ABSOLUTE.value:
+            relative = (
+                "Offsets are signed and fixed width; the column is sized "
+                "from the span of the open files. Other copy formats keep "
+                "clock time, because an offset cites nothing a colleague "
+                "can find.")
+            self.advice.setStyleSheet(f"color: {theme.DIM};")
+            self.advice.setText(relative)
+            return
+        problem = timefmt.validate_pattern(self.pattern.text())
+        if problem:
+            self.advice.setStyleSheet(f"color: {theme.STATUS_ERROR};")
+            self.advice.setText(problem)
+            return
+        shown = timefmt.TimeFormatter(
+            TimeDisplay(pattern=self.pattern.text())).render(_PREVIEW_US)
+        self.advice.setStyleSheet(f"color: {theme.DIM};")
+        self.advice.setText(f"Rows will read:  {shown}")
+
+    def settled(self) -> TimeDisplay:
+        """
+        What the page decided -- falling back to the shipped pattern.
+
+        A pattern that will not render is refused here rather than carried
+        outward, because `Settled` is installed wholesale and an invalid one
+        would reach the paint sixty times a second.
+        """
+        pattern = self.pattern.text()
+        if timefmt.validate_pattern(pattern):
+            pattern = timefmt.FULL
+        return TimeDisplay(mode=TimeMode(self.mode.currentData()),
+                           pattern=pattern)
+
+
+_PREVIEW_US = 1_793_124_128_113_456
+"""
+A fixed sample instant for the format preview: 2026-10-27 at 18:02:08.113456.
+
+Fixed rather than "now", so the preview does not change under the reader while
+they are editing a pattern, and so a screenshot of this dialog means the same
+thing tomorrow.
+"""
 
 
 _SET_HELP = {

@@ -157,6 +157,17 @@ The hit the cursor is on, as against the others. One step warmer than
 without a second mechanism.
 """
 
+BOOKMARK = "#b48ead"
+"""
+A bookmarked row -- on both strips and in the status bar (FR-37).
+
+Violet, which nothing else in this window uses. A bookmark has to be told from
+a find hit at a glance, because the two are used together: a reader searches,
+marks the three lines that matter, and then searches again. If the marks and
+the hits were both amber the second search would erase the record of the first
+without changing a pixel.
+"""
+
 FILTER_ACTIVE = "#5fa8d3"
 """
 The status-bar colour for "a filter is in force" (FR-45).

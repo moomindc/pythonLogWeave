@@ -224,6 +224,36 @@ class FilterBar(QWidget):
             case_sensitive=self._case.isChecked(),
         )
 
+    def set_filter(self, filt: Filter) -> None:
+        """
+        Show a whole filter at once -- a profile's saved view (FR-45, FR-49).
+
+        One emission, not six. Setting the pieces individually would signal
+        after each, and each of those signals starts a scan of every open file:
+        a saved filter with a severity, two sources and both text boxes would
+        kick off five scans that are thrown away before the sixth is the one
+        the reader asked for.
+        """
+        self._severities = ({int(x) for x in filt.severities}
+                            if set(filt.severities) != ALL_SEVERITIES else set())
+        self._sources = {int(x) for x in filt.sources}
+        self._since, self._until = filt.since, filt.until
+        for level, act in self._severity_acts.items():
+            with _blocked(act):
+                act.setChecked(level in self._severities)
+        for i, act in enumerate(self._source_acts):
+            with _blocked(act):
+                act.setChecked(i in self._sources)
+        for box, text in ((self._include, filt.include),
+                          (self._exclude, filt.exclude)):
+            with _blocked(box):
+                box.setText(text)
+        for button, on in ((self._case, filt.case_sensitive),
+                           (self._regex, filt.regex)):
+            with _blocked(button):
+                button.setChecked(bool(on))
+        self._emit_now()
+
     def set_severities(self, severities) -> None:
         wanted = {int(s) for s in severities}
         if wanted == ALL_SEVERITIES:

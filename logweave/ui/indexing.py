@@ -42,12 +42,21 @@ class IndexWorker(QObject):
     """The `PrepareResult`. Emitted on cancellation too, with `cancelled` set."""
 
     def __init__(self, paths: list[Path], *, root: Path | None = None,
-                 use_cache: bool = True, workers: int | None = None):
+                 use_cache: bool = True, workers: int | None = None,
+                 formats: dict[str, str] | None = None):
         super().__init__()
         self._paths = list(paths)
         self._root = root
         self._use_cache = use_cache
         self._workers = workers
+        self._formats = dict(formats or {})
+        """
+        Forced timestamp formats per path (FR-13), from a profile.
+
+        Carried into the warm so the sidecar it writes is one the session can
+        actually reuse; without it a file with a format override is indexed
+        once here and again on the GUI thread.
+        """
         self._cancel = False
 
     def cancel(self) -> None:
@@ -63,6 +72,7 @@ class IndexWorker(QObject):
                 workers=self._workers,
                 progress=self._on_file,
                 cancelled=lambda: self._cancel,
+                formats=self._formats,
             )
         except Exception as exc:                        # noqa: BLE001
             # Warming is an optimisation. Whatever went wrong here, the window

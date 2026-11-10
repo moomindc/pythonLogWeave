@@ -80,8 +80,16 @@ the field that makes the distinction matter.
 """
 
 
-def dump(rules: list[HighlightRule]) -> str:
-    """The user's rules as a JSON string, stable enough to diff."""
+def rules_to_dicts(rules) -> list[dict]:
+    """
+    The rules as plain dictionaries -- the shape every store writes.
+
+    Separate from `dump` because there are three stores now, not one: the
+    JSON in `QSettings`, a profile's `[[highlight.rule]]` tables (FR-49) and
+    an exported TOML ruleset (SPEC 10.1). All three want the same rows, and
+    one place deciding what a row contains is what stops them drifting into
+    three subtly different schemas.
+    """
     out = []
     for r in rules:
         row: dict[str, object] = {}
@@ -98,7 +106,33 @@ def dump(rules: list[HighlightRule]) -> str:
         if r.severity is not None:
             row["severity"] = Severity(r.severity).name
         out.append(row)
-    return json.dumps({"version": VERSION, "rules": out},
+    return out
+
+
+def rules_from_dicts(rows) -> tuple[list[HighlightRule], list[str]]:
+    """Rules from plain dictionaries, plus a complaint per row dropped."""
+    rules: list[HighlightRule] = []
+    notes: list[str] = []
+    seen: set[str] = set()
+    for i, row in enumerate(rows):
+        rule, why = _one(row, i)
+        if rule is None:
+            notes.append(why)
+            continue
+        if rule.name in seen:
+            # Names are the handle `Ruleset.remove`, `replace_rule` and
+            # `set_enabled` all take, so a duplicate would make an edit land on
+            # whichever copy came first and look like it had done nothing.
+            notes.append(f"rule {i + 1}: duplicate name {rule.name!r}, dropped")
+            continue
+        seen.add(rule.name)
+        rules.append(rule)
+    return rules, notes
+
+
+def dump(rules: list[HighlightRule]) -> str:
+    """The user's rules as a JSON string, stable enough to diff."""
+    return json.dumps({"version": VERSION, "rules": rules_to_dicts(rules)},
                       indent=1, sort_keys=True)
 
 
@@ -131,23 +165,7 @@ def load(text: object) -> tuple[list[HighlightRule], list[str]]:
     if not isinstance(raw, list):
         return [], ["highlight rules contain no rule list"]
 
-    rules: list[HighlightRule] = []
-    notes: list[str] = []
-    seen: set[str] = set()
-    for i, row in enumerate(raw):
-        rule, why = _one(row, i)
-        if rule is None:
-            notes.append(why)
-            continue
-        if rule.name in seen:
-            # Names are the handle `Ruleset.remove`, `replace_rule` and
-            # `set_enabled` all take, so a duplicate would make an edit land on
-            # whichever copy came first and look like it had done nothing.
-            notes.append(f"rule {i + 1}: duplicate name {rule.name!r}, dropped")
-            continue
-        seen.add(rule.name)
-        rules.append(rule)
-    return rules, notes
+    return rules_from_dicts(raw)
 
 
 def _one(row: object, i: int) -> tuple[HighlightRule | None, str]:
